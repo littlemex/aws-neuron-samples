@@ -33,3 +33,12 @@ venv/
 # Local state produced by scripts
 /tmp/task-state-*.json
 state.json
+
+# Environment files with image URIs, credentials, or local overrides.
+# These must never be committed; the repo ships only
+# setup/single-node/docs/dlc.env.example with placeholders.
+.env
+.env.*
+!*.env.example
+!*.env.sample
+*.private.*

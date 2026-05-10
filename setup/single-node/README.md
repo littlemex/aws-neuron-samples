@@ -302,98 +302,35 @@ runs the idempotent setup tasks again.
 AWS_REGION=us-west-2 bash scripts/recover.sh --stack-name neuron-ws
 ```
 
-## Choosing an AMI
+## Using a non-GA or private AMI
 
-The CDK stack resolves the AMI in this order:
-
-1. `NEURON_AMI_ID=ami-xxxxxxxxxxxxxxxxx` - pin an exact AMI id. Highest
-   priority, skips SSM resolution entirely. Use this if you copied an AMI
-   into your region with `aws ec2 copy-image` (for example, a workshop
-   image) and want the stack to boot from that specific id.
-2. `NEURON_AMI_SSM_PARAMETER=<parameter-name>` - resolve at deploy time
-   via a user-supplied SSM parameter. Useful for private or pre-release
-   channels that your account has access to.
-3. (default) the public GA Neuron multi-framework DLAMI for Ubuntu 24.04,
-   defined in `cdk/config.json` per region.
+The CDK stack resolves the AMI through an SSM parameter. The public
+default is the latest Neuron multi-framework DLAMI for Ubuntu 24.04. To
+pin a different parameter - for example a private image or a pre-release
+channel that your account has access to - set
+`NEURON_AMI_SSM_PARAMETER` before running `deploy.sh`:
 
 ```bash
-# Example: pin a specific copy of a workshop AMI in sa-east-1
-export NEURON_AMI_ID=ami-xxxxxxxxxxxxxxxxx
-AWS_REGION=sa-east-1 bash scripts/deploy.sh --stack-name neuron-workshop
-
-# Example: pick up a custom SSM parameter your account manages
 export NEURON_AMI_SSM_PARAMETER=/my-org/neuron/dlami/preview/image_id
-AWS_REGION=us-west-2 bash scripts/deploy.sh --stack-name neuron-preview
+bash scripts/deploy.sh --stack-name neuron-preview
 ```
 
-The repository does not ship any private or pre-release parameter names
-or AMI ids.
+The repository does not ship any private or beta parameter names.
 
-## End-to-end example: workshop-style launch with a copied AMI and a Capacity Block
+## Running a Neuron DLC instead of (or alongside) the DLAMI
 
-This section shows the full flow for a common workshop scenario where
-the organizer publishes an AMI in one region, you copy it into a region
-where you can reserve Capacity Blocks, purchase the reservation, and
-launch the instance through this tooling. The steps below use
-`sa-east-1` as the Capacity Block region, but any region that offers
-Capacity Blocks for your instance type works the same way.
-
-```bash
-# 1. Copy the workshop AMI into your target region. This returns a new
-#    AMI id in the destination region; use that for the rest of the flow.
-aws ec2 copy-image \
-  --source-image-id ami-SOURCE1234567890 \
-  --source-region us-west-2 \
-  --name workshop-ami-copy \
-  --region sa-east-1
-
-# 2. Discover Capacity Block offerings in the target region.
-aws ec2 describe-capacity-block-offerings \
-  --instance-type trn2.3xlarge \
-  --instance-count 1 \
-  --capacity-duration-hours 168 \
-  --region sa-east-1
-
-# 3. Pick an offering id from the response and purchase it. This returns
-#    a CapacityReservationId (cr-xxxxxxxxxxxxxxxxx).
-aws ec2 purchase-capacity-block \
-  --capacity-block-offering-id <CapacityBlockOfferingId> \
-  --instance-platform Linux/UNIX \
-  --region sa-east-1
-
-# 4. Persist the reservation id and a subnet id that is in the same AZ
-#    into SSM Parameter Store so deploy.sh picks them up automatically.
-bash scripts/manage-capacity-block.sh save-params \
-  --reservation-id cr-xxxxxxxxxxxxxxxxx \
-  --subnet-id subnet-xxxxxxxxxxxxxxxxx \
-  -r sa-east-1
-
-# 5. Wait for the Capacity Block to transition to 'active'. Until then,
-#    run-instances will fail with InvalidCapacityReservationState.
-aws ec2 describe-capacity-reservations \
-  --filters Name=instance-type,Values=trn2.3xlarge \
-  --region sa-east-1
-
-# 6. Deploy. NEURON_AMI_ID pins the copied workshop AMI; the stack
-#    automatically opens NFS on the EFS mount target for the new SG and
-#    runs the SSM-driven setup tasks.
-export AWS_REGION=sa-east-1
-export NEURON_AMI_ID=ami-COPY1234567890
-bash scripts/deploy.sh \
-  --use-capacity-block \
-  --stack-name neuron-workshop \
-  --efs-id fs-xxxxxxxxxxxxxxxxx \
-  --efs-subpath /neuron-workspace/workshop
-
-# 7. Once deploy.sh prints "deploy complete", open a port forward and
-#    browse to http://localhost:8080. See the 'Connect' section above.
-bash scripts/deploy.sh --port-forward --stack-name neuron-workshop -p 8080:80
-```
-
-If the custom AMI ships a preconfigured Python virtualenv under the
-`ubuntu` user's home directory, activate it from the code-server
-terminal as usual. The code-server user created by this setup is `coder`,
-but other users such as `ubuntu` remain available on the AMI.
+The scripts under `scripts/` provision an instance that runs the public
+Neuron DLAMI. If you instead want to run a Neuron Deep Learning
+Container pulled from ECR - for example, to pin a specific SDK build or
+to run a pre-release image distributed through a private repository -
+see [`docs/dlc-container-setup.md`](docs/dlc-container-setup.md). The
+companion script [`scripts/setup-neuron-dlc.sh`](scripts/setup-neuron-dlc.sh)
+handles ECR login, `docker pull`, extracting `/workspace` from the
+image, creating a matching Python venv, and optionally updating the
+on-host runtime from the image's `.deb` artifacts. Every identifier the
+script needs - image URI, region, wheel layout - is supplied through
+environment variables, so no image names are committed to this
+repository.
 
 ## Limitations
 
