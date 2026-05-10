@@ -51,8 +51,17 @@
 #                            resolved from IMDSv2 on the running EC2
 #                            instance, then AWS_REGION, then us-west-2.
 #
-#   NEURON_DLC_WORKSPACE_DIR Host path to extract /workspace into.
+#   NEURON_DLC_WORKSPACE_DIR Host path to extract the image subtree into.
 #                            Default: $HOME/neuron-dlc-workspace
+# Source path inside the container image used by `extract`, `venv`, and
+# `runtime` modes is controlled by the --extract-path CLI argument (see
+# the argument parser below). When --extract-path is not given, extract
+# probes a short list of common Neuron DLC layouts (/workspace,
+# /home/ubuntu/workspace, /home/ubuntu, /opt/aws_neuronx_venv_pytorch_2_9,
+# /opt/aws_neuron_venv_pytorch, /opt) and uses the first one that exists
+# in the image. If none match it warns and skips instead of failing, so
+# plain `docker pull` / `shell` usage remains possible against images
+# that do not ship a workspace tree.
 #   NEURON_DLC_VENV_DIR      Host path to create a Python venv in.
 #                            Default: $HOME/neuron-dlc-venv
 #   NEURON_DLC_VENV_PYTHON   Python binary to build the venv with.
@@ -113,24 +122,45 @@ warn()    { echo -e "${YELLOW}[dlc]${NC} $*" >&2; }
 die()     { echo -e "${RED}[dlc]${NC} $*" >&2; exit 1; }
 
 # ---- arguments --------------------------------------------------------
-MODE="${1:-}"
-if [[ -z "$MODE" ]]; then
+# Usage:
+#   setup-neuron-dlc.sh MODE [--extract-path PATH]
+#
+# MODE is one of login|pull|shell|extract|venv|runtime|all. Options can
+# appear before or after MODE. The only currently supported option is
+# --extract-path, which pins the absolute path inside the image used by
+# the `extract`, `venv`, and `runtime` modes. When it is not set,
+# `extract` auto-detects a reasonable source directory by probing a
+# list of common Neuron DLC layouts.
+MODE=""
+EXTRACT_PATH=""
+
+print_usage() {
     cat <<'EOF' >&2
-Usage: setup-neuron-dlc.sh {login|pull|shell|extract|venv|runtime|all}
+Usage: setup-neuron-dlc.sh MODE [--extract-path PATH]
 
-Defaults pull the latest GA AWS Neuron DLC (pytorch-training-neuronx).
-Override any of the following environment variables to pin a different
-image, including private or pre-release builds:
+MODE: login | pull | shell | extract | venv | runtime | all
 
-  NEURON_DLC_IMAGE_URI          Full ECR image URI including tag. If set,
-                                takes precedence over the composed URI.
+Options:
+  --extract-path PATH           Absolute path inside the container image to copy out
+                                during `extract` (and consumed by `venv` / `runtime`).
+                                When omitted, `extract` probes a small list of common
+                                Neuron DLC layouts (/workspace, /home/ubuntu/workspace,
+                                /opt/aws_neuronx_venv_pytorch_2_9, /opt) and uses the
+                                first one that exists. If none match, extract warns
+                                and skips instead of failing.
+  -h, --help                    Print this help and exit.
+
+Image selection is controlled by environment variables. Defaults pull the latest GA AWS
+Neuron DLC (pytorch-training-neuronx):
+
+  NEURON_DLC_IMAGE_URI          Full ECR image URI including tag. If set, takes precedence
+                                over the composed URI below.
   NEURON_DLC_ACCOUNT            ECR account id (default: 763104351884).
-  NEURON_DLC_REPO               ECR repository (default:
-                                pytorch-training-neuronx).
-  NEURON_DLC_TAG                Image tag (see PUBLIC_DEFAULT_TAG in this
-                                file for the current default).
-  NEURON_DLC_REGION             ECR region (default: IMDSv2 -> AWS_REGION
-                                -> us-west-2).
+  NEURON_DLC_REPO               ECR repository (default: pytorch-training-neuronx).
+  NEURON_DLC_TAG                Image tag (see PUBLIC_DEFAULT_TAG in this file).
+  NEURON_DLC_REGION             ECR region (default: IMDSv2 -> AWS_REGION -> us-west-2).
+
+Host-side paths:
 
   NEURON_DLC_WORKSPACE_DIR      Default: $HOME/neuron-dlc-workspace
   NEURON_DLC_VENV_DIR           Default: $HOME/neuron-dlc-venv
@@ -138,8 +168,43 @@ image, including private or pre-release builds:
   NEURON_DLC_WHEEL_GLOBS        Colon-separated wheel globs (no default).
   NEURON_DLC_RUNTIME_DEB_DIR    Default: runtime_artifacts
 
-See header of this script for a full explanation.
+See the header of this script for full documentation.
 EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --extract-path)
+            if [[ $# -lt 2 ]]; then
+                die "--extract-path requires an argument"
+            fi
+            EXTRACT_PATH="$2"
+            shift 2
+            ;;
+        --extract-path=*)
+            EXTRACT_PATH="${1#--extract-path=}"
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        login|pull|shell|extract|venv|runtime|all)
+            if [[ -n "$MODE" ]]; then
+                die "multiple modes given: $MODE and $1"
+            fi
+            MODE="$1"
+            shift
+            ;;
+        *)
+            print_usage
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+if [[ -z "$MODE" ]]; then
+    print_usage
     exit 1
 fi
 
@@ -255,16 +320,65 @@ do_extract() {
         warn "Skipping extract. Remove or rename it to force a fresh extract."
         return 0
     fi
-    mkdir -p "$NEURON_DLC_WORKSPACE_DIR"
+
     local cname
     cname="dlc-extract-$$-$(date +%s)"
-    log "Creating temporary container to copy /workspace out..."
+    log "Creating temporary container to inspect image ..."
     docker create --name "$cname" "$image_id" >/dev/null
     trap 'docker rm -f "'"$cname"'" >/dev/null 2>&1 || true' EXIT
-    docker cp "$cname":/workspace/. "$NEURON_DLC_WORKSPACE_DIR"/
+
+    # Resolve the source path. Priority:
+    #   1. explicit --extract-path from the CLI
+    #   2. auto-detection against a short list of common Neuron DLC layouts
+    # If neither yields an existing path inside the image we warn and
+    # skip instead of failing, because a plain `docker pull` still works
+    # and the user can fall back to `bash setup-neuron-dlc.sh shell`.
+    local src_path=""
+    if [[ -n "$EXTRACT_PATH" ]]; then
+        if docker cp "$cname":"$EXTRACT_PATH" - >/dev/null 2>&1; then
+            src_path="$EXTRACT_PATH"
+        else
+            warn "Requested --extract-path $EXTRACT_PATH not found in image"
+            docker rm -f "$cname" >/dev/null 2>&1 || true
+            trap - EXIT
+            return 0
+        fi
+    else
+        local candidate
+        for candidate in \
+            /workspace \
+            /home/ubuntu/workspace \
+            /home/ubuntu \
+            /opt/aws_neuronx_venv_pytorch_2_9 \
+            /opt/aws_neuron_venv_pytorch \
+            /opt
+        do
+            if docker cp "$cname":"$candidate" - >/dev/null 2>&1; then
+                src_path="$candidate"
+                log "Auto-detected extract source: $src_path"
+                break
+            fi
+        done
+    fi
+
+    if [[ -z "$src_path" ]]; then
+        docker rm -f "$cname" >/dev/null 2>&1 || true
+        trap - EXIT
+        warn "No known extract source was found inside the image."
+        warn "Most public Neuron DLCs do not ship a /workspace tree, so this is"
+        warn "expected. To inspect the image interactively run:"
+        warn "  bash $(basename "$0") shell"
+        warn "Or re-run with an explicit path:"
+        warn "  bash $(basename "$0") extract --extract-path /path/inside/image"
+        return 0
+    fi
+
+    mkdir -p "$NEURON_DLC_WORKSPACE_DIR"
+    log "Copying $src_path/. to $NEURON_DLC_WORKSPACE_DIR ..."
+    docker cp "$cname":"${src_path%/}/." "$NEURON_DLC_WORKSPACE_DIR"/
     docker rm -f "$cname" >/dev/null
     trap - EXIT
-    success "Extracted /workspace -> $NEURON_DLC_WORKSPACE_DIR"
+    success "Extracted $src_path -> $NEURON_DLC_WORKSPACE_DIR"
     log "Top-level contents:"
     ls -1 "$NEURON_DLC_WORKSPACE_DIR" | sed 's/^/  /'
 }
