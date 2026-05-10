@@ -1,0 +1,28 @@
+{
+  "name": "neuron-code-server-cdk",
+  "version": "0.1.0",
+  "description": "AWS CDK app that provisions a single Neuron DLAMI EC2 instance fronted by code-server and nginx with SSM-only access.",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "diff": "cdk diff",
+    "destroy": "cdk destroy"
+  },
+  "license": "MIT-0",
+  "type": "commonjs",
+  "dependencies": {
+    "aws-cdk": "^2.1102.0",
+    "aws-cdk-lib": "^2.235.1",
+    "constructs": "^10.4.5",
+    "source-map-support": "^0.5.21"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,13 @@
+*.js
+!jest.config.js
+*.d.ts
+
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Account-specific context cache from `cdk deploy`. Do not commit -
+# it records VPC/subnet lookups from the account you deployed against.
+cdk.context.json
