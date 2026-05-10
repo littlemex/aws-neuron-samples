@@ -38,12 +38,25 @@ HOME_DIR="${HOME_DIR:-/work}"
 REGION="${AWS_REGION:-}"
 NEFF_RESTORE_FROM_EFS="${NEFF_RESTORE_FROM_EFS:-yes}"
 
+# If AWS_REGION is not provided, fall back to IMDSv2. SSM Run Command does not
+# populate AWS_REGION by default, so this guarantees the script works both from
+# an interactive shell and through SSM.
+if [ -z "$REGION" ]; then
+    TOKEN=$(curl -sSfX PUT http://169.254.169.254/latest/api/token \
+        -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+    if [ -n "$TOKEN" ]; then
+        REGION=$(curl -sSf -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
+    fi
+fi
+
 if [ -z "$EFS_ID" ]; then
     echo "[setup-persistence] ERROR: EFS_ID is required (export EFS_ID=fs-xxxx before running)" >&2
     exit 1
 fi
 if [ -z "$REGION" ]; then
-    echo "[setup-persistence] ERROR: AWS_REGION is required (export AWS_REGION=<region>)" >&2
+    echo "[setup-persistence] ERROR: AWS_REGION not set and IMDS lookup failed." >&2
+    echo "[setup-persistence]        export AWS_REGION=<region> before running." >&2
     exit 1
 fi
 
