@@ -23,8 +23,9 @@ Commands:
     list                                 List purchased Capacity Blocks
     describe                             Show detailed information about a Capacity Block
     cancel                               Cancel a Capacity Block
-    save-params                          Save parameters to Parameter Store
-    load-params                          Load parameters from Parameter Store
+    save-params                          Save parameters to Parameter Store (per --slot)
+    load-params                          Load parameters from Parameter Store (per --slot)
+    list-params                          List every Capacity Block slot stored in Parameter Store
 
 Options:
     -r, --region REGION                  AWS region (default: sa-east-1)
@@ -35,6 +36,9 @@ Options:
     --offering-id ID                     Capacity Block Offering ID (required for purchase)
     --reservation-id ID                  Capacity Reservation ID (required for describe/cancel)
     --subnet-id ID                       Subnet ID (used with save-params)
+    --slot NAME                          Named Parameter Store slot for save-params/load-params.
+                                         Lets you keep multiple reservations side by side.
+                                         Default: "default".
     -h, --help                           Show this help message
 
 Examples:
@@ -53,11 +57,15 @@ Examples:
     # Cancel a Capacity Block
     $0 cancel --reservation-id cr-06670284d2d99ffea
 
-    # Save parameters to Parameter Store
-    $0 save-params --reservation-id cr-06670284d2d99ffea --subnet-id subnet-03bc087b5513f8134
+    # Save parameters to Parameter Store under a named slot
+    $0 save-params --slot training-a \\
+       --reservation-id cr-AAAAAAAA --subnet-id subnet-AAAAAAAA
 
     # Load parameters from Parameter Store
-    $0 load-params
+    $0 load-params --slot training-a
+
+    # List every slot in the current region
+    $0 list-params
 EOF
 }
 
@@ -71,9 +79,24 @@ START_TIME=""
 OFFERING_ID=""
 RESERVATION_ID=""
 SUBNET_ID=""
+SLOT="default"
 
 # Parameter Store key prefix
 PARAM_PREFIX="/capacity-block"
+
+# Resolve Parameter Store keys for a given slot. The legacy layout
+# ("/capacity-block/<region>/reservation-id") is preserved for the
+# default slot so existing deployments keep working without migration,
+# while named slots live under ".../slots/<slot>/".
+cb_param_path() {
+    # $1 = region, $2 = slot, $3 = key ("reservation-id" | "subnet-id")
+    local region="$1" slot="$2" key="$3"
+    if [[ "$slot" == "default" ]]; then
+        echo "${PARAM_PREFIX}/${region}/${key}"
+    else
+        echo "${PARAM_PREFIX}/${region}/slots/${slot}/${key}"
+    fi
+}
 
 # Get command
 if [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]]; then
@@ -114,6 +137,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --subnet-id)
             SUBNET_ID="$2"
+            shift 2
+            ;;
+        --slot)
+            SLOT="$2"
             shift 2
             ;;
         -h|--help)
@@ -277,8 +304,9 @@ case "$COMMAND" in
                 read -p "Subnet ID: " SAVE_SUBNET_ID
             fi
 
-            # Save to Parameter Store
+            # Save to Parameter Store under the selected slot.
             $0 save-params \
+                --slot "$SLOT" \
                 --reservation-id "$CAPACITY_RESERVATION_ID" \
                 --subnet-id "$SAVE_SUBNET_ID" \
                 -r "$REGION"
@@ -447,30 +475,34 @@ case "$COMMAND" in
             exit 1
         fi
 
+        SAVE_RES_PATH=$(cb_param_path "$REGION" "$SLOT" "reservation-id")
+        SAVE_SUB_PATH=$(cb_param_path "$REGION" "$SLOT" "subnet-id")
+
         echo -e "${BLUE}=========================================${NC}"
         echo -e "${BLUE}Parameter Store Save${NC}"
         echo -e "${BLUE}=========================================${NC}"
+        echo "Slot:           $SLOT"
         echo "Reservation ID: $RESERVATION_ID"
         echo "Subnet ID:      $SUBNET_ID"
         echo "Region:         $REGION"
         echo -e "${BLUE}=========================================${NC}"
         echo ""
 
-        # Check for existing parameters
+        # Check for existing parameters in this slot
         EXISTING_RESERVATION=$(aws ssm get-parameter \
-            --name "${PARAM_PREFIX}/${REGION}/reservation-id" \
+            --name "$SAVE_RES_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
             --output text 2>/dev/null)
 
         EXISTING_SUBNET=$(aws ssm get-parameter \
-            --name "${PARAM_PREFIX}/${REGION}/subnet-id" \
+            --name "$SAVE_SUB_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
             --output text 2>/dev/null)
 
         if [[ -n "$EXISTING_RESERVATION" ]] || [[ -n "$EXISTING_SUBNET" ]]; then
-            echo -e "${YELLOW}⚠️  Existing parameters found:${NC}"
+            echo -e "${YELLOW}⚠️  Existing parameters found in slot '$SLOT':${NC}"
             if [[ -n "$EXISTING_RESERVATION" ]]; then
                 echo "  Reservation ID: $EXISTING_RESERVATION"
             fi
@@ -478,7 +510,7 @@ case "$COMMAND" in
                 echo "  Subnet ID: $EXISTING_SUBNET"
             fi
             echo ""
-            echo -e "${YELLOW}Overwrite?${NC}"
+            echo -e "${YELLOW}Overwrite this slot? (use a different --slot NAME to keep it)${NC}"
             read -p "(yes/no): " -r
             if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
                 echo "Cancelled"
@@ -491,7 +523,7 @@ case "$COMMAND" in
 
         # Save Reservation ID
         aws ssm put-parameter \
-            --name "${PARAM_PREFIX}/${REGION}/reservation-id" \
+            --name "$SAVE_RES_PATH" \
             --value "$RESERVATION_ID" \
             --type String \
             --region "$REGION" \
@@ -499,40 +531,44 @@ case "$COMMAND" in
 
         # Save Subnet ID
         aws ssm put-parameter \
-            --name "${PARAM_PREFIX}/${REGION}/subnet-id" \
+            --name "$SAVE_SUB_PATH" \
             --value "$SUBNET_ID" \
             --type String \
             --region "$REGION" \
             --overwrite > /dev/null
 
         echo ""
-        echo -e "${GREEN}✅ Parameters saved to Parameter Store${NC}"
+        echo -e "${GREEN}✅ Parameters saved to slot '$SLOT'${NC}"
         echo ""
         echo "Saved parameters:"
-        echo "  ${PARAM_PREFIX}/${REGION}/reservation-id = $RESERVATION_ID"
-        echo "  ${PARAM_PREFIX}/${REGION}/subnet-id = $SUBNET_ID"
+        echo "  $SAVE_RES_PATH = $RESERVATION_ID"
+        echo "  $SAVE_SUB_PATH = $SUBNET_ID"
         echo ""
         echo -e "${YELLOW}💡 To load:${NC}"
-        echo "  $0 load-params -r $REGION"
+        echo "  $0 load-params --slot $SLOT -r $REGION"
         ;;
 
     load-params)
+        LOAD_RES_PATH=$(cb_param_path "$REGION" "$SLOT" "reservation-id")
+        LOAD_SUB_PATH=$(cb_param_path "$REGION" "$SLOT" "subnet-id")
+
         echo -e "${BLUE}=========================================${NC}"
         echo -e "${BLUE}Parameter Store Load${NC}"
         echo -e "${BLUE}=========================================${NC}"
+        echo "Slot:   $SLOT"
         echo "Region: $REGION"
         echo -e "${BLUE}=========================================${NC}"
         echo ""
 
         # Load parameters
         LOADED_RESERVATION=$(aws ssm get-parameter \
-            --name "${PARAM_PREFIX}/${REGION}/reservation-id" \
+            --name "$LOAD_RES_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
             --output text 2>/dev/null)
 
         LOADED_SUBNET=$(aws ssm get-parameter \
-            --name "${PARAM_PREFIX}/${REGION}/subnet-id" \
+            --name "$LOAD_SUB_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
             --output text 2>/dev/null)
@@ -564,11 +600,68 @@ case "$COMMAND" in
         echo -e "${YELLOW}💡 Deploy command:${NC}"
         if [[ -n "$LOADED_RESERVATION" ]] && [[ -n "$LOADED_SUBNET" ]]; then
             echo "  cd $(dirname "$(dirname "$(realpath "$0")")")"
-            echo "  bash scripts/deploy.sh --use-capacity-block \\"
-            echo "    --capacity-reservation-id $LOADED_RESERVATION \\"
-            echo "    --subnet-id $LOADED_SUBNET \\"
-            echo "    -r $REGION"
+            if [[ "$SLOT" == "default" ]]; then
+                echo "  bash scripts/deploy.sh --use-capacity-block -r $REGION"
+            else
+                echo "  bash scripts/deploy.sh --use-capacity-block --slot $SLOT -r $REGION"
+            fi
         fi
+        ;;
+
+    list-params)
+        echo -e "${BLUE}=========================================${NC}"
+        echo -e "${BLUE}Parameter Store Slots${NC}"
+        echo -e "${BLUE}=========================================${NC}"
+        echo "Region: $REGION"
+        echo -e "${BLUE}=========================================${NC}"
+        echo ""
+
+        # 1) Legacy default slot (pre-slots layout).
+        LEGACY_RES=$(aws ssm get-parameter \
+            --name "${PARAM_PREFIX}/${REGION}/reservation-id" \
+            --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)
+        LEGACY_SUB=$(aws ssm get-parameter \
+            --name "${PARAM_PREFIX}/${REGION}/subnet-id" \
+            --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)
+        if [[ -n "$LEGACY_RES" ]] || [[ -n "$LEGACY_SUB" ]]; then
+            echo -e "${GREEN}[slot] default${NC}"
+            echo "  reservation-id: ${LEGACY_RES:-unset}"
+            echo "  subnet-id:      ${LEGACY_SUB:-unset}"
+            echo ""
+        fi
+
+        # 2) Named slots under "${PARAM_PREFIX}/${REGION}/slots/".
+        NAMED_SLOTS=$(aws ssm get-parameters-by-path \
+            --path "${PARAM_PREFIX}/${REGION}/slots/" --recursive \
+            --region "$REGION" \
+            --query 'Parameters[].Name' --output text 2>/dev/null \
+            | tr '\t' '\n' \
+            | sed -nE "s|^${PARAM_PREFIX}/${REGION}/slots/([^/]+)/.*|\1|p" \
+            | sort -u)
+
+        if [[ -z "$NAMED_SLOTS" ]] && [[ -z "$LEGACY_RES" ]] && [[ -z "$LEGACY_SUB" ]]; then
+            echo -e "${YELLOW}No Capacity Block slots found in ${PARAM_PREFIX}/${REGION}/${NC}"
+            echo ""
+            echo "Save one with:"
+            echo "  $0 save-params --slot NAME --reservation-id <id> --subnet-id <id> -r $REGION"
+            exit 0
+        fi
+
+        for name in $NAMED_SLOTS; do
+            NS_RES_PATH=$(cb_param_path "$REGION" "$name" "reservation-id")
+            NS_SUB_PATH=$(cb_param_path "$REGION" "$name" "subnet-id")
+            NS_RES=$(aws ssm get-parameter --name "$NS_RES_PATH" --region "$REGION" \
+                --query 'Parameter.Value' --output text 2>/dev/null || true)
+            NS_SUB=$(aws ssm get-parameter --name "$NS_SUB_PATH" --region "$REGION" \
+                --query 'Parameter.Value' --output text 2>/dev/null || true)
+            echo -e "${GREEN}[slot] $name${NC}"
+            echo "  reservation-id: ${NS_RES:-unset}"
+            echo "  subnet-id:      ${NS_SUB:-unset}"
+            echo ""
+        done
+
+        echo -e "${YELLOW}💡 Deploy with:${NC}"
+        echo "  bash scripts/deploy.sh --use-capacity-block --slot NAME -r $REGION"
         ;;
 
     "")

@@ -132,6 +132,9 @@ die()     { echo -e "${RED}[dlc]${NC} $*" >&2; exit 1; }
 # the `extract`, `venv`, and `runtime` modes. When it is not set,
 # `extract` auto-detects a reasonable source directory by probing a
 # list of common Neuron DLC layouts.
+# Preserve the original CLI so ensure_docker() can re-exec under
+# `sg docker` if the current shell's group set is stale.
+ORIG_ARGS=("$@")
 MODE=""
 EXTRACT_PATH=""
 
@@ -284,10 +287,46 @@ need_cmd() {
 
 ensure_docker() {
     need_cmd docker
-    if ! docker info >/dev/null 2>&1; then
-        die "Docker is not running or the current user cannot talk to the daemon. Add your user to the docker group or use sudo."
+    if docker info >/dev/null 2>&1; then
+        return 0
     fi
+    # The current process may have been started before the user was added
+    # to the docker group, so the supplementary group set is stale. If we
+    # can see that the user IS in the docker group on /etc/group but NOT
+    # in the current process, transparently re-exec this script under
+    # `sg docker`, which applies the group for the single invocation
+    # without requiring the user to log out and back in.
+    local user
+    user=$(id -un)
+    local has_group_now=0 has_group_on_disk=0
+    if id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+        has_group_now=1
+    fi
+    if getent group docker 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | grep -qx "$user"; then
+        has_group_on_disk=1
+    fi
+    if [[ -z "${SETUP_DLC_REEXEC:-}" ]] \
+       && [[ $has_group_now -eq 0 ]] \
+       && [[ $has_group_on_disk -eq 1 ]]; then
+        warn "docker daemon reachable only under the docker group; re-executing with sg docker ..."
+        export SETUP_DLC_REEXEC=1
+        exec sg docker -c "bash $(readlink -f "$0") ${ORIG_ARGS[*]}"
+    fi
+    # Last resort: fall back to sudo for the individual docker commands.
+    # sudo docker works as long as the user has passwordless sudo (which
+    # the workstation's 06-configure-sudo task grants to coder).
+    if sudo -n docker info >/dev/null 2>&1; then
+        warn "docker daemon is reachable only via sudo; using sudo docker for this session."
+        warn "Open a new login shell (or run: newgrp docker) to use docker without sudo."
+        DOCKER="sudo docker"
+        return 0
+    fi
+    die "Docker is not running or the current user cannot talk to the daemon. Open a new shell, run 'newgrp docker', or use sudo."
 }
+
+# Resolved docker command. Populated by ensure_docker(); default is
+# plain `docker` so interactive invocations stay clean when groups work.
+DOCKER="${DOCKER:-docker}"
 
 ecr_login() {
     ensure_docker

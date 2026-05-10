@@ -21,6 +21,10 @@ Options:
     -t, --instance-type TYPE             EC2 instance type (default: trn2.3xlarge)
     --use-capacity-block                 Launch against a Capacity Block reservation
     --capacity-reservation-id ID         Capacity Reservation id (implies --use-capacity-block)
+    --slot NAME                          Named Capacity Block slot in SSM Parameter Store
+                                         (see manage-capacity-block.sh save-params --slot).
+                                         Use this when you manage multiple reservations side by side.
+                                         Default: "default" (legacy flat layout).
     --use-spot                           Launch as a Spot instance (mutually exclusive with Capacity Block)
     --spot-max-price PRICE               Spot max price in USD/hr (default: on-demand price)
     --spot-interruption-behavior BEHAVIOR
@@ -102,6 +106,10 @@ REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 INSTANCE_TYPE="trn2.3xlarge"
 USE_CAPACITY_BLOCK=false
 CAPACITY_RESERVATION_ID=""
+# Named Capacity Block slot inside SSM Parameter Store. "default" reads
+# the legacy /capacity-block/<region>/reservation-id key; any other
+# value reads /capacity-block/<region>/slots/<name>/.
+CB_SLOT="default"
 USE_SPOT=false
 SPOT_MAX_PRICE=""
 SPOT_INTERRUPTION_BEHAVIOR="terminate"
@@ -138,6 +146,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --capacity-reservation-id)
             CAPACITY_RESERVATION_ID="$2"
+            USE_CAPACITY_BLOCK=true
+            shift 2
+            ;;
+        --slot)
+            CB_SLOT="$2"
             USE_CAPACITY_BLOCK=true
             shift 2
             ;;
@@ -661,16 +674,34 @@ fi
 if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
     CDK_PARAMS+=("-c" "useCapacityBlock=true")
 
-    # Pick up reservation id / subnet id from SSM Parameter Store if the
-    # user did not pass them on the command line. This mirrors what
-    # manage-capacity-block.sh save-params writes.
+    # Resolve reservation id / subnet id from SSM Parameter Store if the
+    # user did not pass them on the command line. `--slot NAME` selects
+    # among multiple reservations; the default slot falls back to the
+    # legacy flat layout so existing deployments keep working.
+    if [[ "$CB_SLOT" == "default" ]]; then
+        CB_RES_PATH="/capacity-block/${REGION}/reservation-id"
+        CB_SUB_PATH="/capacity-block/${REGION}/subnet-id"
+    else
+        CB_RES_PATH="/capacity-block/${REGION}/slots/${CB_SLOT}/reservation-id"
+        CB_SUB_PATH="/capacity-block/${REGION}/slots/${CB_SLOT}/subnet-id"
+    fi
+
     if [[ -z "$CAPACITY_RESERVATION_ID" ]]; then
-        echo -e "${BLUE}[FETCH] Reading Capacity Reservation id from SSM Parameter Store...${NC}"
+        echo -e "${BLUE}[FETCH] Reading Capacity Reservation id from SSM (slot=${CB_SLOT})...${NC}"
         CAPACITY_RESERVATION_ID=$(aws ssm get-parameter \
-            --name "/capacity-block/${REGION}/reservation-id" \
+            --name "$CB_RES_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
             --output text 2>/dev/null)
+
+        # For non-default slots, silently fall back to the legacy flat
+        # key as a convenience only if nothing was found AND the slot
+        # looks unset. Explicit named slots should not leak into default.
+        if [[ -z "$CAPACITY_RESERVATION_ID" || "$CAPACITY_RESERVATION_ID" == "None" ]] \
+           && [[ "$CB_SLOT" != "default" ]]; then
+            echo -e "${YELLOW}  [WARN] Slot '${CB_SLOT}' not found under ${CB_RES_PATH}${NC}"
+            CAPACITY_RESERVATION_ID=""
+        fi
 
         if [[ -n "$CAPACITY_RESERVATION_ID" ]] && [[ "$CAPACITY_RESERVATION_ID" != "None" ]]; then
             echo "  Found: $CAPACITY_RESERVATION_ID"
@@ -680,9 +711,9 @@ if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
     fi
 
     if [[ -z "$SUBNET_ID" ]]; then
-        echo -e "${BLUE}[FETCH] Reading Subnet id from SSM Parameter Store...${NC}"
+        echo -e "${BLUE}[FETCH] Reading Subnet id from SSM (slot=${CB_SLOT})...${NC}"
         SUBNET_ID=$(aws ssm get-parameter \
-            --name "/capacity-block/${REGION}/subnet-id" \
+            --name "$CB_SUB_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
             --output text 2>/dev/null)
