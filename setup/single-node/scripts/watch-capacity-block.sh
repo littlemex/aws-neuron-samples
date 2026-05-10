@@ -1,11 +1,12 @@
 #!/bin/bash
 # Capacity Block availability monitoring script
 #
-# Background: The AWS CB pool is exhausted and searches return 0 results.
-#       The CB API's start-date-range only accepts values within the next 48 hours,
-#       so the search window expands as time progresses. This script periodically
-#       polls the API to catch a CB that becomes available (returned to the pool)
-#       when it matches the desired conditions.
+# Background: The AWS Capacity Block API's start-date-range filter only accepts
+#       values within the next 48 hours, so the visible search window rolls forward
+#       as time progresses. This script polls the API at a configurable interval
+#       and prints matches (optionally firing a notifier hook). Useful when a
+#       desired combination of instance type / duration / region is not currently
+#       available and you want to catch it as capacity is returned to the pool.
 #
 # Usage:
 #   1) Specify desired conditions (list of duration hour candidates, AZ, minimum duration, etc.)

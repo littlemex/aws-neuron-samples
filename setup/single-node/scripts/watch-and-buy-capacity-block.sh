@@ -1,29 +1,29 @@
 #!/bin/bash
-# Capacity Block pool monitoring + automatic purchase on condition match.
+# Capacity Block pool monitoring + automatic purchase when an offering matches.
 #
-# Background (as of 2026-05-10):
-#   - Existing CB cr-EXAMPLE1234567890 expires at 5/14 11:30Z
-#   - A bridge CB covering 5/14 to 5/18 needs to be reserved in advance,
-#     but the pool is exhausted and returning 0 results
-#   - AWS CB API constraints:
-#       * start-date-range can only be set up to "now + 48h"
-#       * end-date-range can only be set up to "now + 9 days"
-#       * A 5/14-start CB will not appear in the search window until after 5/12 11:30Z
-#   - The pool changes over time as other tenants release CBs or AWS adds capacity,
-#     so periodic polling is necessary
+# Background:
+#   - The AWS Capacity Block API only lets you filter start-date-range up to
+#     now+48h and end-date-range up to now+9 days, so offerings for a future
+#     date only become visible as the window rolls forward.
+#   - When the pool is temporarily empty, a loop that polls every N minutes
+#     is often the easiest way to catch capacity as other tenants release it
+#     or as AWS adds inventory.
 #
 # How this script works:
-#   - Runs describe-capacity-block-offerings every N minutes
+#   - Runs describe-capacity-block-offerings every N minutes.
 #   - When an offering matching the conditions (duration >= MIN_HOURS,
 #     start time constraint, end <= MAX_END_DATE, lowest cost) is found:
-#       * If --auto-purchase is ON: purchases immediately -> saves to Parameter Store
-#       * If --auto-purchase is OFF: notifies only (stdout + log file), prints manual purchase command
+#       * If --auto-purchase is ON: purchases immediately and saves the
+#         resulting reservation id + subnet to SSM Parameter Store so
+#         deploy.sh can pick it up automatically.
+#       * If --auto-purchase is OFF: notifies only (stdout + log file) and
+#         prints the manual purchase command.
 #
-# Absolute rules:
-#   - CB purchase is a financial commitment (upfront fee) -> default is dry-run;
-#     use --auto-purchase to explicitly enable purchasing
-#   - To prevent duplicate purchases, a state file (/tmp/cb-watch-state) stops the
-#     script after a successful purchase
+# Safety:
+#   - Capacity Block purchase is a financial commitment (upfront fee), so
+#     the default behavior is notify-only. --auto-purchase opts in explicitly.
+#   - A state file (/tmp/cb-watch-state) stops the script after a successful
+#     purchase so it cannot double-buy on the next polling cycle.
 #
 # Usage:
 #   # Dry run (notify only, no purchase - default)
@@ -31,14 +31,14 @@
 #
 #   # Auto purchase (buy as soon as a match is found)
 #   AWS_PROFILE=<your-profile> ./watch-and-buy-capacity-block.sh --auto-purchase \
-#       --min-hours 96 --target-start-after 2026-05-14T00:00:00Z --max-end 2026-05-19T12:00:00Z
+#       --min-hours 96 --target-start-after 2030-01-01T00:00:00Z --max-end 2030-01-08T00:00:00Z
 #
 #   # Single check (run once without looping)
 #   ./watch-and-buy-capacity-block.sh --once
 #
 #   # Custom conditions
 #   ./watch-and-buy-capacity-block.sh --instance-type trn2.3xlarge --interval 300 \
-#       --min-hours 120 --target-start-after 2026-05-14T00:00:00Z --region sa-east-1
+#       --min-hours 120 --target-start-after 2030-01-01T00:00:00Z --region us-west-2
 
 set -euo pipefail
 

@@ -74,13 +74,15 @@ Spot usage, and multi-stack hygiene, is documented in
   or replaced, `/home/coder`, `/work`, and the Neuron NEFF compile cache
   are restored from EFS on the next start. The NVMe instance store is
   treated as a cache tier, not storage of record.
-- **Public defaults, with an opt-in for pre-release AMIs.** By default the
-  tooling resolves the latest GA Neuron multi-framework DLAMI for Ubuntu
-  24.04 via the public SSM parameter
+- **Public defaults, with an opt-in for custom or pre-release AMIs.**
+  By default the tooling resolves the latest GA Neuron multi-framework
+  DLAMI for Ubuntu 24.04 via the public SSM parameter
   `/aws/service/neuron/dlami/multi-framework/ubuntu-24.04/latest/image_id`.
-  To use an alternative image (custom AMI, private or beta DLAMI), export
-  `NEURON_AMI_SSM_PARAMETER=<parameter-name>` before running `cdk deploy`.
-  No non-GA SSM parameter names are hard-coded into the repository.
+  To pin a specific AMI (for example a workshop image copied into your
+  region), export `NEURON_AMI_ID=ami-xxxxxxxxxxxxxxxxx`. To resolve via a
+  private or pre-release SSM parameter, export
+  `NEURON_AMI_SSM_PARAMETER=<parameter-name>`. The repository does not
+  hard-code any non-GA AMI ids or SSM parameter names.
 - **Least surprise IAM.** The instance role attaches
   `AmazonSSMManagedInstanceCore` and `CloudWatchAgentServerPolicy` and
   nothing else. Extend it explicitly for your workload; do not add

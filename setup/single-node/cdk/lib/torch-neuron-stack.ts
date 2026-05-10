@@ -66,13 +66,16 @@ export class NeuronCodeServerStack extends cdk.Stack {
       throw new Error(`Region ${region} is not configured in config.json`);
     }
 
-    // AMI SSM parameter resolution:
-    //   1. Environment variable NEURON_AMI_SSM_PARAMETER overrides anything
-    //      (opt-in path for pre-release / beta DLAMIs).
-    //   2. Otherwise use the public parameter defined in config.json.
-    // The public default always resolves to the latest GA Neuron DLAMI for
-    // Ubuntu 24.04. To use a different AMI (custom, private, or beta),
-    // export NEURON_AMI_SSM_PARAMETER=<parameter-name> before running cdk.
+    // AMI resolution, in priority order:
+    //   1. NEURON_AMI_ID=ami-xxxxxxxx    pin an exact AMI id (e.g. a copy of
+    //                                    a workshop AMI).
+    //   2. NEURON_AMI_SSM_PARAMETER=...  resolve at deploy time via a user
+    //                                    supplied SSM parameter name (e.g.
+    //                                    a private or pre-release channel).
+    //   3. otherwise                     the public GA Neuron Multi-Framework
+    //                                    DLAMI for Ubuntu 24.04, defined in
+    //                                    config.json per region.
+    const directAmiId = process.env.NEURON_AMI_ID || '';
     const amiSsmParameter =
       process.env.NEURON_AMI_SSM_PARAMETER || regionConfig.amiSsmParameter;
 
@@ -123,9 +126,11 @@ export class NeuronCodeServerStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    const amiId = ec2.MachineImage.fromSsmParameter(amiSsmParameter, {
-      os: ec2.OperatingSystemType.LINUX,
-    }).getImage(this).imageId;
+    const amiId = directAmiId
+      ? directAmiId
+      : ec2.MachineImage.fromSsmParameter(amiSsmParameter, {
+          os: ec2.OperatingSystemType.LINUX,
+        }).getImage(this).imageId;
 
     // Minimal user-data: stamp a log file. Real setup runs later via SSM
     // Run Command (see tasks/code-server-setup.json).

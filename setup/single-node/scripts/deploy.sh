@@ -53,10 +53,14 @@ Options:
     -h, --help                           Show this help
 
 Environment variables:
+    NEURON_AMI_ID                        Pin an exact AMI id (e.g. ami-xxxxxxxxxxxxxxxxx).
+                                         Highest priority - skips SSM parameter resolution
+                                         entirely. Useful when you have copied a workshop AMI
+                                         to your region with aws ec2 copy-image.
     NEURON_AMI_SSM_PARAMETER             Override the SSM parameter used to resolve the AMI.
+                                         Takes effect only when NEURON_AMI_ID is not set.
                                          Defaults to the public Neuron multi-framework DLAMI for
-                                         Ubuntu 24.04. Set to a private/beta SSM parameter to use
-                                         a non-GA AMI.
+                                         Ubuntu 24.04.
     TASK_MAX_WAIT_SECONDS                Per-task SSM completion timeout used by run-tasks.sh
                                          (default: 1800).
 
