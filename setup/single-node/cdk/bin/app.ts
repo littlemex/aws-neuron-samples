@@ -17,6 +17,7 @@ const subnetId = app.node.tryGetContext('subnetId') || '';
 const volumeSize = parseInt(app.node.tryGetContext('volumeSize') || '500');
 const efsId = app.node.tryGetContext('efsId') || '';
 const efsSubpath = app.node.tryGetContext('efsSubpath') || '/neuron-workspace';
+const installClaudeCode = app.node.tryGetContext('installClaudeCode') === 'true';
 const project = app.node.tryGetContext('project') || '';
 const purpose = app.node.tryGetContext('purpose') || '';
 
@@ -41,6 +42,7 @@ new NeuronCodeServerStack(app, stackName, {
   volumeSize,
   efsId,
   efsSubpath,
+  installClaudeCode,
   project: project || undefined,
   purpose: purpose || undefined,
 });

@@ -17,6 +17,13 @@ export interface NeuronCodeServerStackProps extends cdk.StackProps {
   volumeSize: number;
   efsId: string;
   efsSubpath: string;
+  /**
+   * Opt-in: attach a scoped inline policy that lets the instance invoke
+   * Amazon Bedrock foundation models and inference profiles. Enable this
+   * only when you plan to run Bedrock-backed tooling on the instance
+   * (for example Claude Code). Default: false.
+   */
+  installClaudeCode?: boolean;
   /** Optional free-form tag applied to the instance (example: "my-team"). */
   project?: string;
   /** Optional free-form tag applied to the instance (example: "training"). */
@@ -97,32 +104,66 @@ export class NeuronCodeServerStack extends cdk.Stack {
 
     // IAM role for the instance.
     //
-    // Managed policies attached by default:
+    // Managed policies attached by default (narrow, interactive development):
     //   - AmazonSSMManagedInstanceCore : SSM Session Manager / Run Command
     //   - CloudWatchAgentServerPolicy  : log and metric delivery
     //   - AmazonEC2ContainerRegistryReadOnly
     //                                   : docker pull from ECR (public Neuron
     //                                     DLC and any image in this account).
     //
-    // Inline policies attached by default:
-    //   - BedrockInvokeAccess : invoke Amazon Bedrock foundation models and
-    //                           inference profiles, with a narrow aws-market-
-    //                           place subscribe path that Bedrock needs for
-    //                           self-service marketplace models. Scoped to
-    //                           bedrock.amazonaws.com as the CalledViaLast
-    //                           service so marketplace actions cannot be used
-    //                           from other services.
+    // Opt-in (only when installClaudeCode=true):
+    //   - BedrockInvokeAccess (inline policy)
+    //       Grants the minimum Bedrock permissions that Claude Code on EC2
+    //       needs to resolve and invoke foundation models / inference
+    //       profiles. The aws-marketplace subscribe actions are allowed
+    //       only when called via Bedrock (aws:CalledViaLast =
+    //       bedrock.amazonaws.com) so marketplace actions are not usable
+    //       from other services.
+    //       This block is NOT attached by default; pass
+    //       `deploy.sh --install-claude-code` or CDK context
+    //       `-c installClaudeCode=true` to enable it.
     //
-    // These defaults cover the interactive AWS Neuron development workflow
-    // on this instance (SSM shell, CloudWatch metrics, ECR image pulls,
-    // Bedrock-backed tooling such as Claude Code). Grant any additional
-    // permissions your workload needs explicitly - do NOT attach
-    // AdministratorAccess for production use.
-    //
-    // Note on cross-account ECR pulls (for example a DLC image vended by a
-    // different AWS account): AmazonEC2ContainerRegistryReadOnly covers the
-    // caller side, but the repository owner must also grant your account
-    // pull permission through the repository policy on their side.
+    // Note on cross-account ECR pulls (for example a DLC image vended by
+    // a different AWS account): AmazonEC2ContainerRegistryReadOnly covers
+    // the caller side, but the repository owner must also grant your
+    // account pull permission through the repository policy on their side.
+    const inlinePolicies: { [name: string]: iam.PolicyDocument } = {};
+    if (props.installClaudeCode) {
+      inlinePolicies.BedrockInvokeAccess = new iam.PolicyDocument({
+        statements: [
+          new iam.PolicyStatement({
+            sid: 'AllowModelAndInferenceProfileAccess',
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'bedrock:InvokeModel',
+              'bedrock:InvokeModelWithResponseStream',
+              'bedrock:ListInferenceProfiles',
+              'bedrock:GetInferenceProfile',
+            ],
+            resources: [
+              'arn:aws:bedrock:*:*:inference-profile/*',
+              'arn:aws:bedrock:*:*:application-inference-profile/*',
+              'arn:aws:bedrock:*:*:foundation-model/*',
+            ],
+          }),
+          new iam.PolicyStatement({
+            sid: 'AllowMarketplaceSubscription',
+            effect: iam.Effect.ALLOW,
+            actions: [
+              'aws-marketplace:ViewSubscriptions',
+              'aws-marketplace:Subscribe',
+            ],
+            resources: ['*'],
+            conditions: {
+              StringEquals: {
+                'aws:CalledViaLast': 'bedrock.amazonaws.com',
+              },
+            },
+          }),
+        ],
+      });
+    }
+
     const role = new iam.Role(this, 'CodeServerInstanceRole', {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
       managedPolicies: [
@@ -130,41 +171,7 @@ export class NeuronCodeServerStack extends cdk.Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy'),
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEC2ContainerRegistryReadOnly'),
       ],
-      inlinePolicies: {
-        BedrockInvokeAccess: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              sid: 'AllowModelAndInferenceProfileAccess',
-              effect: iam.Effect.ALLOW,
-              actions: [
-                'bedrock:InvokeModel',
-                'bedrock:InvokeModelWithResponseStream',
-                'bedrock:ListInferenceProfiles',
-                'bedrock:GetInferenceProfile',
-              ],
-              resources: [
-                'arn:aws:bedrock:*:*:inference-profile/*',
-                'arn:aws:bedrock:*:*:application-inference-profile/*',
-                'arn:aws:bedrock:*:*:foundation-model/*',
-              ],
-            }),
-            new iam.PolicyStatement({
-              sid: 'AllowMarketplaceSubscription',
-              effect: iam.Effect.ALLOW,
-              actions: [
-                'aws-marketplace:ViewSubscriptions',
-                'aws-marketplace:Subscribe',
-              ],
-              resources: ['*'],
-              conditions: {
-                StringEquals: {
-                  'aws:CalledViaLast': 'bedrock.amazonaws.com',
-                },
-              },
-            }),
-          ],
-        }),
-      },
+      ...(Object.keys(inlinePolicies).length > 0 ? { inlinePolicies } : {}),
     });
 
     const instanceProfile = new iam.CfnInstanceProfile(this, 'CodeServerInstanceProfile', {

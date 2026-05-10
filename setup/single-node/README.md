@@ -116,22 +116,25 @@ By default the stack creates:
   (override with `--instance-type`).
 - A dedicated security group with **no ingress rules** and unrestricted
   outbound (so apt, pip, ECR, and the SSM agent can work).
-- An IAM role with the following permissions attached by default:
+- An IAM role with a narrow default permission set:
   - `AmazonSSMManagedInstanceCore` (SSM Session Manager / Run Command)
   - `CloudWatchAgentServerPolicy` (log and metric delivery)
   - `AmazonEC2ContainerRegistryReadOnly` so the optional DLC workflow
     (`scripts/setup-neuron-dlc.sh`) can `docker pull` images from ECR
-    without extra setup
-  - A scoped inline policy `BedrockInvokeAccess` that allows
+    without extra setup.
+
+  Opt-in additions (only attached when you pass
+  `deploy.sh --install-claude-code`):
+
+  - Inline policy `BedrockInvokeAccess` that allows
     `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`,
     `bedrock:ListInferenceProfiles`, `bedrock:GetInferenceProfile`
     against Bedrock foundation models and (application) inference
     profiles, plus `aws-marketplace:ViewSubscriptions` and
     `aws-marketplace:Subscribe` gated on
-    `aws:CalledViaLast = bedrock.amazonaws.com`. This supports
-    Bedrock-backed tooling such as Claude Code running on the instance
-    with the model identifier passed via `ANTHROPIC_BEDROCK_*` or the
-    equivalent, without opening marketplace actions to unrelated callers.
+    `aws:CalledViaLast = bedrock.amazonaws.com`. This is the minimum
+    Bedrock permission set needed by the Claude Code CLI running on
+    the instance, and is intentionally not granted by default.
 
   Grant any additional permissions your workload needs explicitly; do
   not attach `AdministratorAccess` unless you understand the trade-off.
@@ -346,6 +349,41 @@ on-host runtime from the image's `.deb` artifacts. Every identifier the
 script needs - image URI, region, wheel layout - is supplied through
 environment variables, so no image names are committed to this
 repository.
+
+## Claude Code + neuron-agentic-development (opt-in)
+
+The default deploy does not install any Anthropic-hosted tooling. When
+you pass `--install-claude-code` to `deploy.sh`, three things change:
+
+1. **IAM.** The instance role gets a scoped inline policy
+   `BedrockInvokeAccess` that allows `bedrock:InvokeModel`,
+   `bedrock:InvokeModelWithResponseStream`,
+   `bedrock:ListInferenceProfiles`, and `bedrock:GetInferenceProfile`
+   against Bedrock foundation models and inference profiles, plus the
+   two `aws-marketplace:*` actions Bedrock needs for its self-service
+   marketplace subscription path. The marketplace actions are gated on
+   `aws:CalledViaLast = bedrock.amazonaws.com` so they are unusable
+   outside Bedrock.
+2. **CLI.** The Anthropic Claude Code CLI is installed into the
+   code-server user's npm prefix (`~/.npm-global`). The CLI itself is
+   published by Anthropic under `@anthropic-ai/claude-code`.
+3. **Agents and skills.** The
+   [neuron-agentic-development](https://github.com/aws-neuron/neuron-agentic-development)
+   Python package is installed into a local venv, and its
+   `deploy-neuron-agentic-development-to-claude` entry point populates
+   `~/.claude/agents/` and `~/.claude/skills/` for the code-server user.
+
+Without the flag, none of these are present. The default role stays
+narrow and the repository remains fully usable in accounts that do not
+have Bedrock enabled.
+
+```bash
+# Narrow default (no Bedrock, no Claude Code):
+bash scripts/deploy.sh -r us-west-2 --stack-name neuron-ws
+
+# With Claude Code and Neuron agents/skills:
+bash scripts/deploy.sh -r us-west-2 --stack-name neuron-ws --install-claude-code
+```
 
 ## Limitations
 

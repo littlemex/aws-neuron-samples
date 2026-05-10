@@ -27,10 +27,9 @@ Options:
     --clean-state                   Clear state file and run from the beginning
     --dry-run                       Display tasks without actually executing them
     --reboot                        Reboot the instance after setup completes
-    --install-claude-code           Install the Claude Code CLI for the code-server user
-                                    and append persistent Amazon Bedrock configuration
-                                    (CLAUDE_CODE_USE_BEDROCK=1, AWS_REGION, etc.) to
-                                    ~/.bashrc. Skipped by default.
+    --install-claude-code           Opt-in: install Anthropic Claude Code CLI and
+                                    neuron-agentic-development agents/skills into
+                                    ~/.claude for the code-server user.
     -h, --help                      Show this help message
 
 Examples:
@@ -213,9 +212,10 @@ fi
 if [[ -n "$EFS_SUBPATH" ]]; then
     VARIABLES_JSON=$(echo "$VARIABLES_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["EFS_SUBPATH"]="'"$EFS_SUBPATH"'"; print(json.dumps(d))')
 fi
-if [[ "$INSTALL_CLAUDE_CODE" == true ]]; then
-    VARIABLES_JSON=$(echo "$VARIABLES_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["INSTALL_CLAUDE_CODE"]="yes"; print(json.dumps(d))')
-fi
+# Pass INSTALL_CLAUDE_CODE through so tasks gated on it (for example
+# 18-install-claude-code) can decide at runtime whether to run.
+INSTALL_CLAUDE_CODE_VAL=$([[ "$INSTALL_CLAUDE_CODE" == true ]] && echo "yes" || echo "no")
+VARIABLES_JSON=$(echo "$VARIABLES_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["INSTALL_CLAUDE_CODE"]="'"$INSTALL_CLAUDE_CODE_VAL"'"; print(json.dumps(d))')
 
 # Transfer setup-persistence.sh to the instance (called by tasks/00-setup-persistence)
 # Encode with base64 and place in /tmp via SSM with sudo

@@ -36,12 +36,12 @@ Options:
     --project TAG                        Value for the Project tag on the instance
     --purpose TAG                        Value for the Purpose tag on the instance
     --skip-setup                         Skip the code-server setup tasks after deploy
-    --install-claude-code                Install the Claude Code CLI for the code-server user
-                                         and append Amazon Bedrock environment variables
-                                         (CLAUDE_CODE_USE_BEDROCK=1 etc.) to ~/.bashrc.
-                                         The CLI and bashrc live under \$HOME which is
-                                         symlinked onto EFS, so the configuration persists
-                                         across Spot interruptions and instance replacement.
+    --install-claude-code                Opt-in: install the Anthropic Claude Code CLI on the
+                                         instance and attach a scoped Bedrock inline policy
+                                         so the CLI can invoke Bedrock foundation models.
+                                         Also installs neuron-agentic-development (agents and
+                                         skills) into ~/.claude for the code-server user.
+                                         Default: off.
     --show-info                          Show connection info for an already-deployed stack
     --port-forward                       Open SSM port forwards against an existing stack
     -p, --ports MAP                      Port forward map (comma-separated)
@@ -53,14 +53,10 @@ Options:
     -h, --help                           Show this help
 
 Environment variables:
-    NEURON_AMI_ID                        Pin an exact AMI id (e.g. ami-xxxxxxxxxxxxxxxxx).
-                                         Highest priority - skips SSM parameter resolution
-                                         entirely. Useful when you have copied a workshop AMI
-                                         to your region with aws ec2 copy-image.
     NEURON_AMI_SSM_PARAMETER             Override the SSM parameter used to resolve the AMI.
-                                         Takes effect only when NEURON_AMI_ID is not set.
                                          Defaults to the public Neuron multi-framework DLAMI for
-                                         Ubuntu 24.04.
+                                         Ubuntu 24.04. Set to a private/beta SSM parameter to use
+                                         a non-GA AMI.
     TASK_MAX_WAIT_SECONDS                Per-task SSM completion timeout used by run-tasks.sh
                                          (default: 1800).
 
@@ -91,11 +87,13 @@ Examples:
     $0 -r us-west-2 --port-forward --stack-name neuron-training-a \\
        -p 3000:80,3001:23001,3002:23002
 
+    # Deploy with the Anthropic Claude Code CLI and the neuron-agentic-development
+    # agents and skills preinstalled for the code-server user. This also attaches a
+    # scoped Bedrock inline policy to the instance role (the default deploy does not).
+    $0 -r us-west-2 --stack-name neuron-ws --install-claude-code
+
     # Destroy the stack (revokes cross-SG NFS rule, then cdk destroy)
     $0 -r us-west-2 --destroy --stack-name neuron-training-a
-
-    # Deploy with the Claude Code CLI installed for the code-server user
-    $0 -r us-west-2 --install-claude-code
 EOF
 }
 
@@ -113,9 +111,9 @@ NO_EFS=false
 SUBNET_ID=""
 VOLUME_SIZE="500"
 SKIP_SETUP=false
+INSTALL_CLAUDE_CODE=false
 SHOW_INFO=false
 DESTROY=false
-INSTALL_CLAUDE_CODE=false
 PORT_FORWARD=false
 PORTS=""
 PROFILE_ARG=""
@@ -733,6 +731,10 @@ fi
 
 if [[ -n "$VOLUME_SIZE" ]]; then
     CDK_PARAMS+=("-c" "volumeSize=$VOLUME_SIZE")
+fi
+
+if [[ "$INSTALL_CLAUDE_CODE" == true ]]; then
+    CDK_PARAMS+=("-c" "installClaudeCode=true")
 fi
 
 echo -e "${BLUE}[BUILD] Compiling CDK app...${NC}"
