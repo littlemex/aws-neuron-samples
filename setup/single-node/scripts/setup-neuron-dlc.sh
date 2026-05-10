@@ -56,12 +56,13 @@
 # Source path inside the container image used by `extract`, `venv`, and
 # `runtime` modes is controlled by the --extract-path CLI argument (see
 # the argument parser below). When --extract-path is not given, extract
-# probes a short list of common Neuron DLC layouts (/workspace,
-# /home/ubuntu/workspace, /home/ubuntu, /opt/aws_neuronx_venv_pytorch_2_9,
-# /opt/aws_neuron_venv_pytorch, /opt) and uses the first one that exists
-# in the image. If none match it warns and skips instead of failing, so
-# plain `docker pull` / `shell` usage remains possible against images
-# that do not ship a workspace tree.
+# looks for /workspace at the image root (the convention used by AWS's
+# pre-release / bootcamp-style DLCs) and falls back to a no-op when it
+# is missing. This keeps the script useful against arbitrary Neuron DLC
+# layouts: `pull` and `shell` still work, and if you need to extract a
+# specific subtree you pass it explicitly, for example:
+#
+#   bash setup-neuron-dlc.sh extract --extract-path /opt/aws_neuronx_venv_pytorch_2_9
 #   NEURON_DLC_VENV_DIR      Host path to create a Python venv in.
 #                            Default: $HOME/neuron-dlc-venv
 #   NEURON_DLC_VENV_PYTHON   Python binary to build the venv with.
@@ -143,11 +144,11 @@ MODE: login | pull | shell | extract | venv | runtime | all
 Options:
   --extract-path PATH           Absolute path inside the container image to copy out
                                 during `extract` (and consumed by `venv` / `runtime`).
-                                When omitted, `extract` probes a small list of common
-                                Neuron DLC layouts (/workspace, /home/ubuntu/workspace,
-                                /opt/aws_neuronx_venv_pytorch_2_9, /opt) and uses the
-                                first one that exists. If none match, extract warns
-                                and skips instead of failing.
+                                When omitted, `extract` looks for /workspace at the
+                                image root and uses it if present; otherwise it warns
+                                and skips instead of failing. Pass the flag explicitly
+                                for any other subtree, for example
+                                `--extract-path /opt/aws_neuronx_venv_pytorch_2_9`.
   -h, --help                    Print this help and exit.
 
 Image selection is controlled by environment variables. Defaults pull the latest GA AWS
@@ -344,21 +345,16 @@ do_extract() {
             return 0
         fi
     else
-        local candidate
-        for candidate in \
-            /workspace \
-            /home/ubuntu/workspace \
-            /home/ubuntu \
-            /opt/aws_neuronx_venv_pytorch_2_9 \
-            /opt/aws_neuron_venv_pytorch \
-            /opt
-        do
-            if docker cp "$cname":"$candidate" - >/dev/null 2>&1; then
-                src_path="$candidate"
-                log "Auto-detected extract source: $src_path"
-                break
-            fi
-        done
+        # No --extract-path given. Auto-detection across arbitrary DLC
+        # layouts is unreliable (images differ widely in where they put
+        # venvs, examples, and artifacts), so we only try the single
+        # convention that AWS uses on pre-release / bootcamp-style DLCs:
+        # /workspace at the image root. Everything else should be driven
+        # explicitly by --extract-path PATH.
+        if docker cp "$cname":/workspace - >/dev/null 2>&1; then
+            src_path="/workspace"
+            log "Auto-detected extract source: /workspace"
+        fi
     fi
 
     if [[ -z "$src_path" ]]; then
