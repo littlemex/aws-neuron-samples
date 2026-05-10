@@ -15,11 +15,15 @@
 # interactively, (b) extract its wheels into a venv, or (c) update the
 # on-host Neuron runtime from the DLC's .deb artifacts.
 #
-# The script DOES NOT ship any specific ECR URI, account id, image tag,
-# or wheel name. Everything is provided by the caller via environment
-# variables (see the "Configuration" section below). This means the same
-# script works against the public AWS Neuron DLC gallery as well as any
-# private or pre-release ECR repository your account has access to.
+# By default the script resolves to the public AWS Neuron DLC so it
+# works out of the box on a vanilla AWS account. The default image is
+# composed from the PUBLIC_DEFAULT_* constants below. Every component
+# (account, repo, tag, region) can be overridden by the environment
+# variables documented in the "Configuration" section, and setting
+# NEURON_DLC_IMAGE_URI replaces the composed URI entirely. This means
+# the same script covers the public DLC gallery as well as any private
+# or pre-release ECR repository your account has access to. No secret
+# identifiers are required to ship with the repository.
 #
 # Configuration
 # -------------
@@ -88,9 +92,12 @@
 #
 # Safety
 # ------
-# The script never writes the image URI or any credential into a file under
-# the repository tree. Secrets live in your environment only. It is safe to
-# run this on a host that is later shared or cloned.
+# The only identifiers baked into the repository are the well-known public
+# DLC coordinates (account 763104351884, repo pytorch-training-neuronx,
+# PUBLIC_DEFAULT_TAG above). Any non-default URI must be supplied through
+# the environment at run time. The script never writes user-supplied URIs
+# or credentials to files under the repository tree, so it is safe to run
+# on a host that is later shared or cloned.
 
 set -euo pipefail
 
