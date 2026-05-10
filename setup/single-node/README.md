@@ -390,8 +390,8 @@ bash scripts/deploy.sh \
 bash scripts/deploy.sh --port-forward --stack-name neuron-workshop -p 8080:80
 ```
 
-If the workshop AMI ships a preconfigured Python virtualenv (for example
-`/home/ubuntu/nki_bootcamp_venv`), activate it from the code-server
+If the custom AMI ships a preconfigured Python virtualenv under the
+`ubuntu` user's home directory, activate it from the code-server
 terminal as usual. The code-server user created by this setup is `coder`,
 but other users such as `ubuntu` remain available on the AMI.
 
