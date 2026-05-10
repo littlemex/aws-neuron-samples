@@ -66,16 +66,13 @@ export class NeuronCodeServerStack extends cdk.Stack {
       throw new Error(`Region ${region} is not configured in config.json`);
     }
 
-    // AMI resolution, in priority order:
-    //   1. NEURON_AMI_ID=ami-xxxxxxxx    pin an exact AMI id (e.g. a copy of
-    //                                    a workshop AMI).
-    //   2. NEURON_AMI_SSM_PARAMETER=...  resolve at deploy time via a user
-    //                                    supplied SSM parameter name (e.g.
-    //                                    a private or pre-release channel).
-    //   3. otherwise                     the public GA Neuron Multi-Framework
-    //                                    DLAMI for Ubuntu 24.04, defined in
-    //                                    config.json per region.
-    const directAmiId = process.env.NEURON_AMI_ID || '';
+    // AMI SSM parameter resolution:
+    //   1. Environment variable NEURON_AMI_SSM_PARAMETER overrides anything
+    //      (opt-in path for pre-release / beta DLAMIs).
+    //   2. Otherwise use the public parameter defined in config.json.
+    // The public default always resolves to the latest GA Neuron DLAMI for
+    // Ubuntu 24.04. To use a different AMI (custom, private, or beta),
+    // export NEURON_AMI_SSM_PARAMETER=<parameter-name> before running cdk.
     const amiSsmParameter =
       process.env.NEURON_AMI_SSM_PARAMETER || regionConfig.amiSsmParameter;
 
@@ -100,16 +97,23 @@ export class NeuronCodeServerStack extends cdk.Stack {
 
     // IAM role for the instance.
     //
-    // The default policy set is intentionally narrow: SSM agent registration
-    // and CloudWatch agent. Grant any additional permissions your workload
-    // needs explicitly - do NOT attach AdministratorAccess for production use.
-    // For interactive development it can be convenient to attach broader
-    // policies, but that is left to the operator to decide.
+    // The default policy set is intentionally narrow: SSM agent registration,
+    // CloudWatch agent, and read-only access to Amazon ECR so that the
+    // optional scripts/setup-neuron-dlc.sh flow can `docker pull` the public
+    // Neuron Deep Learning Container (or any image in this account). Grant
+    // any additional permissions your workload needs explicitly - do NOT
+    // attach AdministratorAccess for production use.
+    //
+    // Note on cross-account ECR pulls (for example a DLC image vended by a
+    // different AWS account): AmazonEC2ContainerRegistryReadOnly covers the
+    // caller side, but the repository owner must also grant your account
+    // pull permission through the repository policy on their side.
     const role = new iam.Role(this, 'CodeServerInstanceRole', {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
         iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy'),
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEC2ContainerRegistryReadOnly'),
       ],
     });
 
@@ -126,11 +130,9 @@ export class NeuronCodeServerStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    const amiId = directAmiId
-      ? directAmiId
-      : ec2.MachineImage.fromSsmParameter(amiSsmParameter, {
-          os: ec2.OperatingSystemType.LINUX,
-        }).getImage(this).imageId;
+    const amiId = ec2.MachineImage.fromSsmParameter(amiSsmParameter, {
+      os: ec2.OperatingSystemType.LINUX,
+    }).getImage(this).imageId;
 
     // Minimal user-data: stamp a log file. Real setup runs later via SSM
     // Run Command (see tasks/code-server-setup.json).

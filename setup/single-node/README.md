@@ -116,10 +116,14 @@ By default the stack creates:
   (override with `--instance-type`).
 - A dedicated security group with **no ingress rules** and unrestricted
   outbound (so apt, pip, ECR, and the SSM agent can work).
-- An IAM role with exactly two managed policies:
-  `AmazonSSMManagedInstanceCore` and `CloudWatchAgentServerPolicy`. You
-  should grant additional permissions explicitly for the workload you
-  plan to run; do not attach `AdministratorAccess` unless you need it.
+- An IAM role with three managed policies attached:
+  `AmazonSSMManagedInstanceCore` (SSM Session Manager / Run Command),
+  `CloudWatchAgentServerPolicy` (log and metric delivery), and
+  `AmazonEC2ContainerRegistryReadOnly` so the optional DLC workflow
+  (`scripts/setup-neuron-dlc.sh`) can `docker pull` images from ECR
+  without extra setup. Grant any additional permissions your workload
+  needs explicitly; do not attach `AdministratorAccess` unless you
+  understand the trade-off.
 - A Secrets Manager secret holding an auto-generated code-server password.
 - A gp3-encrypted 500 GB root volume (override with `--volume-size`).
 - A Neuron DLAMI resolved at deploy time from the public SSM parameter
