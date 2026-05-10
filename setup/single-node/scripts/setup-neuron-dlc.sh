@@ -186,6 +186,12 @@ if [[ -z "${NEURON_DLC_REGION:-}" ]]; then
     fi
 fi
 
+# Resolve HOME explicitly so defaults work even when invoked from a
+# non-interactive context (SSM Run Command, cron, etc.) where HOME is
+# sometimes unset.
+if [[ -z "${HOME:-}" ]]; then
+    HOME=$(getent passwd "$(id -un)" | cut -d: -f6)
+fi
 NEURON_DLC_WORKSPACE_DIR="${NEURON_DLC_WORKSPACE_DIR:-$HOME/neuron-dlc-workspace}"
 NEURON_DLC_VENV_DIR="${NEURON_DLC_VENV_DIR:-$HOME/neuron-dlc-venv}"
 NEURON_DLC_VENV_PYTHON="${NEURON_DLC_VENV_PYTHON:-python3}"

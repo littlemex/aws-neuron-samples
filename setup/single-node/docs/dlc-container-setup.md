@@ -13,10 +13,14 @@ pipeline's environment on a real instance.
 
 The companion script is
 [`scripts/setup-neuron-dlc.sh`](../scripts/setup-neuron-dlc.sh).
-It does not contain any image URIs, ECR account ids, or wheel paths; it
-reads them all from the environment so the same script works against
-the public Neuron DLC gallery, any private team repository your account
-has access to, and custom images you build yourself.
+
+By default the script resolves to the public AWS Neuron DLC documented
+at <https://awsdocs-neuron.readthedocs-hosted.com/en/latest/dlc/index.html>,
+so it works out of the box on a vanilla AWS account with no additional
+configuration. Every coordinate (account, repository, tag, region,
+or a fully-specified URI) can be overridden by an environment variable,
+so the same script also works against any private team repository your
+account has access to, or a custom image you built yourself.
 
 ## Prerequisites
 
@@ -35,28 +39,42 @@ has access to, and custom images you build yourself.
 
 ## Configuration via environment variables
 
-`setup-neuron-dlc.sh` is driven by environment variables so that no
-image URI, account id, or tag ever has to live in this repository.
+`setup-neuron-dlc.sh` composes the target image URI from four variables,
+each with a sensible public default:
 
-| Variable | Required | Description |
+| Variable | Default | Description |
 |---|---|---|
-| `NEURON_DLC_IMAGE_URI` | yes | Full ECR image URI including tag. Example: `123456789012.dkr.ecr.us-east-1.amazonaws.com/my-repo:tag` |
-| `NEURON_DLC_REGION` | no | Region of the ECR repository. Derived from the URI if unset. |
-| `NEURON_DLC_WORKSPACE_DIR` | no | Host directory to extract `/workspace` into. Default `$HOME/neuron-dlc-workspace`. |
-| `NEURON_DLC_VENV_DIR` | no | Host path for the Python virtualenv. Default `$HOME/neuron-dlc-venv`. |
-| `NEURON_DLC_VENV_PYTHON` | no | Python binary used to build the venv. Default `python3`. |
-| `NEURON_DLC_WHEEL_GLOBS` | no | Colon-separated list of wheel globs or package directories (relative to the extracted workspace) to `pip install`. Example: `wheels-a/*.whl:wheels-b/*.whl:pkg-c`. No default; set to match the layout of your specific image. |
-| `NEURON_DLC_RUNTIME_DEB_DIR` | no | Subdirectory of the extracted workspace containing host runtime `.deb` packages. Default `runtime_artifacts`. |
+| `NEURON_DLC_ACCOUNT` | `763104351884` | ECR account id. The default is the public AWS Neuron DLC account. |
+| `NEURON_DLC_REPO` | `pytorch-training-neuronx` | ECR repository name. Change for `pytorch-inference-neuronx` or any other repo. |
+| `NEURON_DLC_TAG` | latest GA tag recorded in the script | ECR image tag. Verify against the [DLC release notes](https://github.com/aws-neuron/deep-learning-containers/releases) before pinning a new value. |
+| `NEURON_DLC_REGION` | IMDSv2 → `AWS_REGION` → `us-west-2` | Region of the ECR repository. |
 
-The example file `.env.neuron-dlc.example` shows the shape of a local
-environment file. Copy it to `.env.neuron-dlc`, fill in your own URI,
-and source it before running the script. The `.gitignore` shipped with
-this repository excludes `.env*` so your file stays local.
+If you need to bypass the composition entirely (for example a private
+image at a URI that does not follow the default pattern), set:
+
+| Variable | Description |
+|---|---|
+| `NEURON_DLC_IMAGE_URI` | Full ECR image URI including tag. When set, takes precedence over the four variables above. |
+
+Extraction and venv options:
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEURON_DLC_WORKSPACE_DIR` | `$HOME/neuron-dlc-workspace` | Host directory where `/workspace` from the image is extracted. |
+| `NEURON_DLC_VENV_DIR` | `$HOME/neuron-dlc-venv` | Host path for the Python virtualenv. |
+| `NEURON_DLC_VENV_PYTHON` | `python3` | Python binary used to build the venv. |
+| `NEURON_DLC_WHEEL_GLOBS` | (empty) | Colon-separated list of wheel globs or package directories (relative to the extracted workspace) to `pip install`. Example: `wheels-a/*.whl:wheels-b/*.whl:pkg-c`. Set to match the layout of your image. |
+| `NEURON_DLC_RUNTIME_DEB_DIR` | `runtime_artifacts` | Subdirectory of the extracted workspace containing host runtime `.deb` packages. |
+
+You can either export these directly, or keep a local env file outside
+the repository tree. An annotated template lives at
+[`dlc.env.example`](./dlc.env.example). The `.gitignore` shipped with
+this repository excludes `.env*` so your personal copy stays local.
 
 ```bash
-cp .env.neuron-dlc.example .env.neuron-dlc
-$EDITOR .env.neuron-dlc
-source .env.neuron-dlc
+cp setup/single-node/docs/dlc.env.example ~/.config/neuron-dlc.env
+$EDITOR ~/.config/neuron-dlc.env
+set -a; source ~/.config/neuron-dlc.env; set +a
 ```
 
 ## Modes
@@ -77,19 +95,50 @@ bash scripts/setup-neuron-dlc.sh {login|pull|shell|extract|venv|runtime|all}
 
 ## Typical flows
 
+### Pull the public DLC with no extra configuration
+
+The default environment points at the public AWS Neuron DLC, so:
+
+```bash
+bash scripts/setup-neuron-dlc.sh pull
+```
+
+…just works. The image is tagged and pinned in the script; inspect
+`PUBLIC_DEFAULT_TAG` at the top of `setup-neuron-dlc.sh` to see the
+exact version you will receive.
+
 ### Quick interactive poke
 
 Pull the image and drop into a shell:
 
 ```bash
-export NEURON_DLC_IMAGE_URI=...
+bash scripts/setup-neuron-dlc.sh shell
+```
+
+### Pin a different DLC tag
+
+```bash
+export NEURON_DLC_TAG=<newer-tag-from-release-notes>
+bash scripts/setup-neuron-dlc.sh pull
+```
+
+### Use an inference-only image
+
+```bash
+export NEURON_DLC_REPO=pytorch-inference-neuronx
+bash scripts/setup-neuron-dlc.sh shell
+```
+
+### Pull from a private or pre-release repository
+
+```bash
+export NEURON_DLC_IMAGE_URI=<full-private-uri>
 bash scripts/setup-neuron-dlc.sh shell
 ```
 
 ### Run outside the container using a host-side venv
 
 ```bash
-export NEURON_DLC_IMAGE_URI=...
 export NEURON_DLC_WHEEL_GLOBS="wheels-a/*.whl:wheels-b/*.whl:pkg-c"
 bash scripts/setup-neuron-dlc.sh venv
 source $HOME/neuron-dlc-venv/bin/activate
@@ -98,11 +147,10 @@ python -c "import torch; print(torch.__version__)"
 
 ### Upgrade the on-host Neuron runtime from a DLC
 
-Useful when the DLAMI has a GA runtime but your DLC ships a
-pre-release runtime that the container depends on.
+Useful when the DLAMI has a GA runtime but the DLC you are pulling
+ships a newer runtime that the container depends on.
 
 ```bash
-export NEURON_DLC_IMAGE_URI=...
 bash scripts/setup-neuron-dlc.sh runtime
 # `neuron-ls` will now reflect the upgraded runtime.
 ```
@@ -110,7 +158,6 @@ bash scripts/setup-neuron-dlc.sh runtime
 ### All in one
 
 ```bash
-export NEURON_DLC_IMAGE_URI=...
 export NEURON_DLC_WHEEL_GLOBS="wheels-a/*.whl:wheels-b/*.whl:pkg-c"
 bash scripts/setup-neuron-dlc.sh all
 ```
