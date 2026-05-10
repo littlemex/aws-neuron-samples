@@ -116,14 +116,25 @@ By default the stack creates:
   (override with `--instance-type`).
 - A dedicated security group with **no ingress rules** and unrestricted
   outbound (so apt, pip, ECR, and the SSM agent can work).
-- An IAM role with three managed policies attached:
-  `AmazonSSMManagedInstanceCore` (SSM Session Manager / Run Command),
-  `CloudWatchAgentServerPolicy` (log and metric delivery), and
-  `AmazonEC2ContainerRegistryReadOnly` so the optional DLC workflow
-  (`scripts/setup-neuron-dlc.sh`) can `docker pull` images from ECR
-  without extra setup. Grant any additional permissions your workload
-  needs explicitly; do not attach `AdministratorAccess` unless you
-  understand the trade-off.
+- An IAM role with the following permissions attached by default:
+  - `AmazonSSMManagedInstanceCore` (SSM Session Manager / Run Command)
+  - `CloudWatchAgentServerPolicy` (log and metric delivery)
+  - `AmazonEC2ContainerRegistryReadOnly` so the optional DLC workflow
+    (`scripts/setup-neuron-dlc.sh`) can `docker pull` images from ECR
+    without extra setup
+  - A scoped inline policy `BedrockInvokeAccess` that allows
+    `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`,
+    `bedrock:ListInferenceProfiles`, `bedrock:GetInferenceProfile`
+    against Bedrock foundation models and (application) inference
+    profiles, plus `aws-marketplace:ViewSubscriptions` and
+    `aws-marketplace:Subscribe` gated on
+    `aws:CalledViaLast = bedrock.amazonaws.com`. This supports
+    Bedrock-backed tooling such as Claude Code running on the instance
+    with the model identifier passed via `ANTHROPIC_BEDROCK_*` or the
+    equivalent, without opening marketplace actions to unrelated callers.
+
+  Grant any additional permissions your workload needs explicitly; do
+  not attach `AdministratorAccess` unless you understand the trade-off.
 - A Secrets Manager secret holding an auto-generated code-server password.
 - A gp3-encrypted 500 GB root volume (override with `--volume-size`).
 - A Neuron DLAMI resolved at deploy time from the public SSM parameter

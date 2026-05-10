@@ -97,12 +97,27 @@ export class NeuronCodeServerStack extends cdk.Stack {
 
     // IAM role for the instance.
     //
-    // The default policy set is intentionally narrow: SSM agent registration,
-    // CloudWatch agent, and read-only access to Amazon ECR so that the
-    // optional scripts/setup-neuron-dlc.sh flow can `docker pull` the public
-    // Neuron Deep Learning Container (or any image in this account). Grant
-    // any additional permissions your workload needs explicitly - do NOT
-    // attach AdministratorAccess for production use.
+    // Managed policies attached by default:
+    //   - AmazonSSMManagedInstanceCore : SSM Session Manager / Run Command
+    //   - CloudWatchAgentServerPolicy  : log and metric delivery
+    //   - AmazonEC2ContainerRegistryReadOnly
+    //                                   : docker pull from ECR (public Neuron
+    //                                     DLC and any image in this account).
+    //
+    // Inline policies attached by default:
+    //   - BedrockInvokeAccess : invoke Amazon Bedrock foundation models and
+    //                           inference profiles, with a narrow aws-market-
+    //                           place subscribe path that Bedrock needs for
+    //                           self-service marketplace models. Scoped to
+    //                           bedrock.amazonaws.com as the CalledViaLast
+    //                           service so marketplace actions cannot be used
+    //                           from other services.
+    //
+    // These defaults cover the interactive AWS Neuron development workflow
+    // on this instance (SSM shell, CloudWatch metrics, ECR image pulls,
+    // Bedrock-backed tooling such as Claude Code). Grant any additional
+    // permissions your workload needs explicitly - do NOT attach
+    // AdministratorAccess for production use.
     //
     // Note on cross-account ECR pulls (for example a DLC image vended by a
     // different AWS account): AmazonEC2ContainerRegistryReadOnly covers the
@@ -115,6 +130,41 @@ export class NeuronCodeServerStack extends cdk.Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName('CloudWatchAgentServerPolicy'),
         iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonEC2ContainerRegistryReadOnly'),
       ],
+      inlinePolicies: {
+        BedrockInvokeAccess: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              sid: 'AllowModelAndInferenceProfileAccess',
+              effect: iam.Effect.ALLOW,
+              actions: [
+                'bedrock:InvokeModel',
+                'bedrock:InvokeModelWithResponseStream',
+                'bedrock:ListInferenceProfiles',
+                'bedrock:GetInferenceProfile',
+              ],
+              resources: [
+                'arn:aws:bedrock:*:*:inference-profile/*',
+                'arn:aws:bedrock:*:*:application-inference-profile/*',
+                'arn:aws:bedrock:*:*:foundation-model/*',
+              ],
+            }),
+            new iam.PolicyStatement({
+              sid: 'AllowMarketplaceSubscription',
+              effect: iam.Effect.ALLOW,
+              actions: [
+                'aws-marketplace:ViewSubscriptions',
+                'aws-marketplace:Subscribe',
+              ],
+              resources: ['*'],
+              conditions: {
+                StringEquals: {
+                  'aws:CalledViaLast': 'bedrock.amazonaws.com',
+                },
+              },
+            }),
+          ],
+        }),
+      },
     });
 
     const instanceProfile = new iam.CfnInstanceProfile(this, 'CodeServerInstanceProfile', {
