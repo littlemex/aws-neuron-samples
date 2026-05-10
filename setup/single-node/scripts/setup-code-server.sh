@@ -27,6 +27,10 @@ Options:
     --clean-state                   Clear state file and run from the beginning
     --dry-run                       Display tasks without actually executing them
     --reboot                        Reboot the instance after setup completes
+    --install-claude-code           Install the Claude Code CLI for the code-server user
+                                    and append persistent Amazon Bedrock configuration
+                                    (CLAUDE_CODE_USE_BEDROCK=1, AWS_REGION, etc.) to
+                                    ~/.bashrc. Skipped by default.
     -h, --help                      Show this help message
 
 Examples:
@@ -65,6 +69,7 @@ START_FROM=""
 CLEAN_STATE=false
 DRY_RUN=false
 REBOOT=false
+INSTALL_CLAUDE_CODE=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -123,6 +128,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --reboot)
             REBOOT=true
+            shift
+            ;;
+        --install-claude-code)
+            INSTALL_CLAUDE_CODE=true
             shift
             ;;
         -h|--help)
@@ -203,6 +212,9 @@ if [[ -n "$EFS_ID" ]]; then
 fi
 if [[ -n "$EFS_SUBPATH" ]]; then
     VARIABLES_JSON=$(echo "$VARIABLES_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["EFS_SUBPATH"]="'"$EFS_SUBPATH"'"; print(json.dumps(d))')
+fi
+if [[ "$INSTALL_CLAUDE_CODE" == true ]]; then
+    VARIABLES_JSON=$(echo "$VARIABLES_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["INSTALL_CLAUDE_CODE"]="yes"; print(json.dumps(d))')
 fi
 
 # Transfer setup-persistence.sh to the instance (called by tasks/00-setup-persistence)

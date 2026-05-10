@@ -36,6 +36,12 @@ Options:
     --project TAG                        Value for the Project tag on the instance
     --purpose TAG                        Value for the Purpose tag on the instance
     --skip-setup                         Skip the code-server setup tasks after deploy
+    --install-claude-code                Install the Claude Code CLI for the code-server user
+                                         and append Amazon Bedrock environment variables
+                                         (CLAUDE_CODE_USE_BEDROCK=1 etc.) to ~/.bashrc.
+                                         The CLI and bashrc live under \$HOME which is
+                                         symlinked onto EFS, so the configuration persists
+                                         across Spot interruptions and instance replacement.
     --show-info                          Show connection info for an already-deployed stack
     --port-forward                       Open SSM port forwards against an existing stack
     -p, --ports MAP                      Port forward map (comma-separated)
@@ -83,6 +89,9 @@ Examples:
 
     # Destroy the stack (revokes cross-SG NFS rule, then cdk destroy)
     $0 -r us-west-2 --destroy --stack-name neuron-training-a
+
+    # Deploy with the Claude Code CLI installed for the code-server user
+    $0 -r us-west-2 --install-claude-code
 EOF
 }
 
@@ -102,6 +111,7 @@ VOLUME_SIZE="500"
 SKIP_SETUP=false
 SHOW_INFO=false
 DESTROY=false
+INSTALL_CLAUDE_CODE=false
 PORT_FORWARD=false
 PORTS=""
 PROFILE_ARG=""
@@ -182,6 +192,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --skip-setup)
             SKIP_SETUP=true
+            shift
+            ;;
+        --install-claude-code)
+            INSTALL_CLAUDE_CODE=true
             shift
             ;;
         --show-info)
@@ -824,6 +838,9 @@ if [[ "$SKIP_SETUP" == false ]]; then
     fi
     if [[ -n "$EFS_SUBPATH" ]]; then
         SETUP_ARGS+=(--efs-subpath "$EFS_SUBPATH")
+    fi
+    if [[ "$INSTALL_CLAUDE_CODE" == true ]]; then
+        SETUP_ARGS+=(--install-claude-code)
     fi
     SETUP_CMD="bash $SCRIPT_DIR/setup-code-server.sh ${SETUP_ARGS[*]}"
 
