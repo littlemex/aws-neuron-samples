@@ -206,24 +206,19 @@
     {
       "id": "10-configure-code-server",
       "name": "Configure Code Server",
-      "description": "Write the code-server configuration file (bind address, port, password)",
+      "description": "Write the code-server configuration file. Uses auth: none because authentication is handled upstream (CloudFront cf_session HMAC + Cognito Hosted UI per ADR-005/011). The instance is locked behind an empty-ingress security group; localhost:8080 is reached only via SSM port-forward or the ALB+CloudFront chain. A second password layer here would conflict with cf_session SSO and is intentionally disabled.",
       "commands": [
-        "echo '==> Configuring Code Server'",
+        "echo '==> Configuring Code Server (auth: none, gated by CloudFront cf_session)'",
         "mkdir -p /home/{{USER}}/.config/code-server",
         "",
-        "# Generate hashed password",
-        "SALT=$(openssl rand -base64 12)",
-        "HASHED_PASSWORD=$(echo -n '{{PASSWORD}}' | argon2 $SALT -e)",
-        "",
         "# Create config file",
-        "cat > /home/{{USER}}/.config/code-server/config.yaml << EOF",
+        "cat > /home/{{USER}}/.config/code-server/config.yaml << 'EOF'",
         "cert: false",
-        "auth: password",
-        "hashed-password: \"$HASHED_PASSWORD\"",
+        "auth: none",
         "EOF",
         "",
         "chown -R {{USER}}:{{USER}} /home/{{USER}}/.config",
-        "echo 'Code Server configuration created'"
+        "echo 'Code Server configuration created (auth=none)'"
       ]
     },
     {
@@ -433,12 +428,6 @@
         "# Install AWS Toolkit",
         "sudo -u {{USER}} --login code-server --install-extension AmazonWebServices.aws-toolkit-vscode --force || echo 'AWS Toolkit installation skipped'",
         "",
-        "# Install Amazon Q",
-        "sudo -u {{USER}} --login code-server --install-extension AmazonWebServices.amazon-q-vscode --force || echo 'Amazon Q installation skipped'",
-        "",
-        "# Install Cline (Claude Dev)",
-        "sudo -u {{USER}} --login code-server --install-extension saoudrizwan.claude-dev --force || echo 'Cline installation skipped'",
-        "",
         "chown -R {{USER}}:{{USER}} /home/{{USER}}",
         "echo 'VS Code extensions installation completed'"
       ]
@@ -507,6 +496,12 @@
         "fi",
         "set -e",
         "CODER_USER='{{USER}}'",
+        "CODER_HOME=$(getent passwd \"$CODER_USER\" | cut -d: -f6)",
+        "# Some code-server packagings drop ~/.bashrc as root:root which blocks the user",
+        "# from appending PATH. Make sure dotfiles are owned by the user before we touch them.",
+        "sudo touch \"$CODER_HOME/.bashrc\"",
+        "sudo chown \"$CODER_USER:$CODER_USER\" \"$CODER_HOME/.bashrc\"",
+        "sudo chmod 0644 \"$CODER_HOME/.bashrc\"",
         "# Install Claude Code CLI globally for the code-server user.",
         "# Uses ~/.npm-global as the npm prefix to avoid sudo.",
         "sudo -u \"$CODER_USER\" bash -lc '",

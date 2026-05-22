@@ -1,0 +1,40 @@
+# Phase E minimal compose.
+#
+# Only Whisper-tiny (CPU) is enabled here so we can exercise the ALB
+# Whisper target group on a 3xlarge sandbox without engaging Trainium.
+# Other services (LLM :8090, VTON :8081, Avatar :8770) are listed below
+# as commented stubs — uncomment + populate as their containers land.
+#
+# How to use (on the EC2 host, run as the user who owns docker):
+#   cd /home/coder/storeai
+#   docker compose build whisper
+#   docker compose up -d whisper
+#
+# ALB target group `storea-Whisp-...` (port 8765) becomes healthy after
+# the model finishes downloading + first /health succeeds (≈ 60-120s).
+
+services:
+  whisper:
+    build:
+      context: ./storeai-whisper-sample
+      dockerfile: Dockerfile
+    image: storeai-whisper-sample:latest
+    container_name: storeai-whisper
+    restart: unless-stopped
+    # ALB registers the EC2 instance, port 8765, against the Whisper TG.
+    # The container must publish 8765 on the host so the ALB health check
+    # hitting <ec2-private-ip>:8765/ reaches uvicorn.
+    ports:
+      - "8765:8765"
+    environment:
+      WHISPER_MODEL: openai/whisper-tiny
+    volumes:
+      # Cache HuggingFace downloads on EFS so a Spot reclaim doesn't
+      # re-download the model. /mnt/efs is the EFS mount on the host.
+      - /mnt/efs/neuron-workspace/hf-cache:/cache/hf
+    # whisper-tiny needs ~1 GB RAM. trn2.3xl has plenty.
+    mem_limit: 4g
+
+  # llm:        # Qwen3-8B vLLM, port 8090     (Phase E next iteration)
+  # vton:       # Qwen-Image-Edit, port 8081  (Phase E next iteration)
+  # avatar:     # MuseTalk port 8770          (later phase)
