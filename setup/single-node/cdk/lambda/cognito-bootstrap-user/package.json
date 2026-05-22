@@ -1,0 +1,7 @@
+{
+  "name": "cognito-bootstrap-user",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs"
+}
