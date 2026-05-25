@@ -83,7 +83,12 @@ export class CloudFrontFrontendStack extends cdk.Stack {
       path.join(__dirname, '..', 'cf-functions', 'viewer-request.template.js'),
       'utf8',
     );
-    const cfFunctionCode = cfFunctionTemplate.replace('__HMAC_SECRET__', hmacSecretValue);
+    // String.replace は最初の 1 回だけ置換する仕様。template の line 14 にも
+    // コメントとして __HMAC_SECRET__ が出てくるので、global replace にしないと
+    // line 22 の var HMAC_SECRET 側が placeholder のまま残り、CF Function が
+    // ランタイムで 503 を返す (cookie 検証が無効な secret で走り、結果として
+    // viewer-request stage 全体が壊れる)。
+    const cfFunctionCode = cfFunctionTemplate.split('__HMAC_SECRET__').join(hmacSecretValue);
     const viewerRequestFn = new cloudfront.Function(this, 'ViewerRequestFn', {
       code: cloudfront.FunctionCode.fromInline(cfFunctionCode),
       runtime: cloudfront.FunctionRuntime.JS_2_0,

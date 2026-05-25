@@ -220,6 +220,16 @@ async function handleCallback(event) {
   if (!code || !state) return albText(400, '400 Bad Request', 'missing code/state');
   const qs = { code, state };
   if (cookies.cf_oauth_state !== qs.state) {
+    // Diagnostic: state nonce は CSRF 防御目的で短命、ログ出力しても被害無し。
+    // cookie 名一覧と長さのみ出して原因特定（cookie 未着 / 値ズレ / 期限切れ）を切り分ける。
+    console.warn('state mismatch', JSON.stringify({
+      cookieNames: Object.keys(cookies),
+      cookieStateLen: cookies.cf_oauth_state ? cookies.cf_oauth_state.length : 0,
+      qsStateLen: qs.state.length,
+      cookieEq: cookies.cf_oauth_state === qs.state,
+      cookieHeaderPresent: cookieHeader.length > 0,
+      cookieHeaderLen: cookieHeader.length,
+    }));
     return albText(400, '400 Bad Request', 'state mismatch');
   }
 
