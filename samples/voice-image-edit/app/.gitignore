@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node / Next.js
+node_modules/
+.next/
+.turbo/
+out/
+dist/
+*.tsbuildinfo
+
+# CDK
+infra/cdk.out/
+infra/.cdk.staging/
+
+# 一時運用スクリプトが書き出すバックアップ (環境固有 ID を含むので track しない)
+infra/scripts/.cf-backup/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Local env
+.env
+.env.local
+.env.*.local

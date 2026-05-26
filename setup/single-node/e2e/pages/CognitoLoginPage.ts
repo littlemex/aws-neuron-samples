@@ -15,9 +15,13 @@ export class CognitoLoginPage {
   readonly forceChangeBanner: Locator;
 
   constructor(public readonly page: Page) {
-    this.username = page.locator('input[name=username]');
-    this.password = page.locator('input[name=password]');
-    this.submit = page.locator('input[type=submit], button[type=submit]').first();
+    // Hosted UI now ships two duplicate signIn forms in the same DOM
+    // (visible + accessibility-only hidden). Filter to the visible
+    // variant so strict-mode locator queries don't bind to the
+    // off-screen one.
+    this.username = page.locator('input[name=username]:visible').first();
+    this.password = page.locator('input[name=password]:visible').first();
+    this.submit = page.locator('input[type=submit]:visible, button[type=submit]:visible').first();
     // Cognito shows a "Change password" form on the first login when
     // admin-create-user used a temporary password. We detect it so the
     // test can either fail-fast or self-heal via admin-set-user-password.

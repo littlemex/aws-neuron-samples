@@ -1,0 +1,119 @@
+{
+  "name": "voice-image-edit Frontend (Next.js standalone) on EC2",
+  "description": "Stage 1 で立てた既存 EC2 上に voice-image-edit の Next.js standalone server (port 3000) を systemd で常駐起動する。Frontend tarball は presigned S3 URL から取得 (EC2 IAM に S3 不要)。冪等なので再実行で安全に更新可能。",
+  "variables": {
+    "FRONTEND_TARBALL_URL": "",
+    "FRONTEND_DIR": "/opt/voice-image-edit/frontend",
+    "FRONTEND_USER": "ubuntu",
+    "FRONTEND_PORT": "3000",
+    "EDIT_API_PATH": "/api/edit"
+  },
+  "tasks": [
+    {
+      "id": "00-precheck",
+      "name": "Precheck Node.js + curl + tar",
+      "description": "Node.js >= 18, curl, tar が居ることを確認。Next.js 14.2.5 の standalone は Node 18+ で動作する。",
+      "commands": [
+        "set -e",
+        "command -v node >/dev/null || { echo '[NG] node missing'; exit 1; }",
+        "node --version",
+        "node -e 'process.exit(process.versions.node.split(\".\")[0] >= 18 ? 0 : 1)' || { echo '[NG] node < 18'; exit 1; }",
+        "command -v curl >/dev/null || { echo '[NG] curl missing'; exit 1; }",
+        "command -v tar >/dev/null || { echo '[NG] tar missing'; exit 1; }",
+        "id {{FRONTEND_USER}} >/dev/null 2>&1 || { echo '[NG] user {{FRONTEND_USER}} missing'; exit 1; }",
+        "echo '[OK] precheck'"
+      ]
+    },
+    {
+      "id": "10-stop-service",
+      "name": "Stop existing voice-image-edit-frontend service (if any)",
+      "description": "systemd unit があれば一旦止める。冪等性のため失敗しても続行。",
+      "commands": [
+        "systemctl stop voice-image-edit-frontend.service 2>/dev/null || true",
+        "echo '[OK] stop attempted'"
+      ]
+    },
+    {
+      "id": "20-deploy-tarball",
+      "name": "Download + extract Next.js standalone tarball",
+      "description": "presigned URL で tarball を取得し /opt/voice-image-edit/frontend に展開 (一旦旧版を消して clean install)。",
+      "commands": [
+        "set -e",
+        "test -n '{{FRONTEND_TARBALL_URL}}' || { echo '[NG] FRONTEND_TARBALL_URL is empty'; exit 1; }",
+        "mkdir -p /opt/voice-image-edit",
+        "rm -rf {{FRONTEND_DIR}}",
+        "mkdir -p {{FRONTEND_DIR}}",
+        "tmp=$(mktemp /tmp/voice-image-edit-frontend.XXXXXX.tar.gz)",
+        "trap 'rm -f $tmp' EXIT",
+        "curl -fsSL '{{FRONTEND_TARBALL_URL}}' -o $tmp",
+        "tar -C {{FRONTEND_DIR}} -xzf $tmp",
+        "chown -R {{FRONTEND_USER}}:{{FRONTEND_USER}} {{FRONTEND_DIR}}",
+        "test -f {{FRONTEND_DIR}}/server.js || { echo '[NG] server.js missing after extract'; exit 1; }",
+        "echo '[OK] deployed'"
+      ]
+    },
+    {
+      "id": "30-install-systemd-unit",
+      "name": "Install voice-image-edit-frontend.service systemd unit",
+      "description": "Restart=always で常駐。HOSTNAME=0.0.0.0 PORT=3000 で internal ALB から到達可能にする。NEXT_PUBLIC_EDIT_API_PATH は build-time 注入だが、Next.js の env.ts は process.env から実行時にも読むためここで指定。",
+      "commands": [
+        "set -e",
+        "cat > /etc/systemd/system/voice-image-edit-frontend.service <<'EOF'",
+        "[Unit]",
+        "Description=voice-image-edit Next.js frontend (standalone)",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "User={{FRONTEND_USER}}",
+        "WorkingDirectory={{FRONTEND_DIR}}",
+        "Environment=NODE_ENV=production",
+        "Environment=HOSTNAME=0.0.0.0",
+        "Environment=PORT={{FRONTEND_PORT}}",
+        "Environment=NEXT_PUBLIC_EDIT_API_PATH={{EDIT_API_PATH}}",
+        "ExecStart=/usr/bin/node {{FRONTEND_DIR}}/server.js",
+        "Restart=always",
+        "RestartSec=5s",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "EOF",
+        "echo '[OK] unit installed'"
+      ]
+    },
+    {
+      "id": "40-enable-start",
+      "name": "daemon-reload + enable + start",
+      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "commands": [
+        "set -e",
+        "systemctl daemon-reload",
+        "systemctl enable voice-image-edit-frontend.service",
+        "systemctl restart voice-image-edit-frontend.service",
+        "echo '[OK] service started'"
+      ]
+    },
+    {
+      "id": "50-health-check",
+      "name": "Local HTTP health check on 127.0.0.1:{{FRONTEND_PORT}}",
+      "description": "Next.js が listen するまで最大 30s 待ち、200 系を返すかを確認する。",
+      "commands": [
+        "set -e",
+        "for i in $(seq 1 30); do",
+        "  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{FRONTEND_PORT}}/ || echo 000)",
+        "  case \"$code\" in",
+        "    2*|3*) echo \"[OK] http=$code (attempt=$i)\"; exit 0;;",
+        "  esac",
+        "  sleep 1",
+        "done",
+        "echo '[NG] frontend did not become healthy in 30s' >&2",
+        "systemctl status voice-image-edit-frontend.service --no-pager || true",
+        "journalctl -u voice-image-edit-frontend.service -n 50 --no-pager || true",
+        "exit 1"
+      ]
+    }
+  ]
+}
