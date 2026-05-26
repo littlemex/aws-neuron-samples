@@ -71,6 +71,8 @@
 #   --stream-rule-priority N      ALB Listener rule priority (default: 150)
 #   --stream-path-pattern PATTERN ALB rule path (default: /stream/*)
 #   --deploy-bucket BUCKET        tarball 配置用 S3 bucket (default: CDK bootstrap asset bucket を自動解決)
+#   --reset-app-stacks            base ALB と紐づかない既存 VoiceImageEdit*Stack を deploy 前に強制 destroy。
+#                                 base stack 再作成後の orphan stack を正規に作り直す唯一のパス。
 #   --destroy                     全 stack を destroy する
 #   -h, --help                    このヘルプ
 #
@@ -131,6 +133,7 @@ STREAM_PORT="8800"
 STREAM_RULE_PRIORITY="150"
 STREAM_PATH_PATTERN="/stream/*"
 
+RESET_APP_STACKS=false
 DESTROY=false
 
 usage() {
@@ -174,6 +177,7 @@ while [[ $# -gt 0 ]]; do
         --stream-port)                  STREAM_PORT="$2"; shift 2 ;;
         --stream-rule-priority)         STREAM_RULE_PRIORITY="$2"; shift 2 ;;
         --stream-path-pattern)          STREAM_PATH_PATTERN="$2"; shift 2 ;;
+        --reset-app-stacks)             RESET_APP_STACKS=true; shift ;;
         --destroy)                      DESTROY=true; shift ;;
         -h|--help)                      usage; exit 0 ;;
         *)
@@ -280,6 +284,142 @@ if ! aws secretsmanager get-secret-value \
         "${PROFILE_ARG[@]}" >/dev/null 2>&1; then
     echo -e "${RED}[NG] OriginVerifySecret から値を取得できませんでした。secretsmanager:GetSecretValue 権限と ARN を確認してください${NC}"
     exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# base-stack identity drift detection
+#
+# Stage 2 stack (VoiceImageEdit{Api,Frontend,Stream}Stack) は CDK 上 base stack
+# を import せず ALB ARN / Listener ARN を context 経由で受け取る。base stack を
+# 作り直すと既存 Stage 2 stack は古い ALB ARN を参照したまま残る orphan になり、
+# 次の cdk deploy で stale ARN を Secrets Manager / ListenerRule から触りに行って
+# 醜い UPDATE_ROLLBACK_FAILED に落ちる。
+#
+# ここで既存 stack の ListenerRule ARN を覗いて ALB 名が現在の base ALB と
+# 一致するかを事前検証する。不一致なら abort し、--reset-app-stacks で
+# 明示的に再作成させる。
+# -----------------------------------------------------------------------------
+ALB_NAME="${ALB_ARN##*loadbalancer/app/}"
+ALB_NAME="${ALB_NAME%%/*}"  # storea-Alb16-IF7NAZUgkkSP のような形式
+
+stack_alb_name() {
+    # 引数 stack の ListenerRule または TargetGroup の ARN を抽出して ALB 名を返す。
+    # ListenerRule ARN: .../app/<alb-name>/<lb-id>/<listener-id>/<rule-id>
+    # ALB が解決できない場合は空文字を返す。
+    local stack="$1"
+    local rule_arn
+    rule_arn="$(aws cloudformation describe-stack-resources \
+        --stack-name "$stack" \
+        --region "$REGION" \
+        --query "StackResources[?ResourceType=='AWS::ElasticLoadBalancingV2::ListenerRule'].PhysicalResourceId | [0]" \
+        --output text \
+        "${PROFILE_ARG[@]}" 2>/dev/null || true)"
+    if [[ -z "$rule_arn" || "$rule_arn" == "None" ]]; then
+        printf '%s' ""
+        return 0
+    fi
+    local stripped="${rule_arn##*listener-rule/app/}"
+    printf '%s' "${stripped%%/*}"
+}
+
+stack_exists() {
+    local stack="$1"
+    aws cloudformation describe-stacks \
+        --stack-name "$stack" \
+        --region "$REGION" \
+        --query 'Stacks[0].StackStatus' \
+        --output text \
+        "${PROFILE_ARG[@]}" >/dev/null 2>&1
+}
+
+destroy_stack_if_present() {
+    local stack="$1"
+    if ! stack_exists "$stack"; then
+        echo -e "${BLUE}[INFO] $stack は存在しないので skip${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}[WARN] destroying orphan stack $stack${NC}"
+    aws cloudformation delete-stack \
+        --stack-name "$stack" \
+        --region "$REGION" \
+        "${PROFILE_ARG[@]}"
+    if aws cloudformation wait stack-delete-complete \
+            --stack-name "$stack" \
+            --region "$REGION" \
+            "${PROFILE_ARG[@]}"; then
+        return 0
+    fi
+
+    # DELETE_FAILED に落ちた場合: orphan ALB Listener / TargetGroup / Rule は親 ALB ごと
+    # 既に消えていることが多く、CFn から見ると外部削除済リソースになっている。
+    # DELETE_FAILED のリソース一覧を取って --retain-resources で再 delete する。
+    local failed_ids
+    failed_ids="$(aws cloudformation describe-stack-resources \
+        --stack-name "$stack" \
+        --region "$REGION" \
+        --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+        --output text \
+        "${PROFILE_ARG[@]}" 2>/dev/null || true)"
+    if [[ -z "$failed_ids" ]]; then
+        echo -e "${RED}[NG] $stack の削除に失敗 (DELETE_FAILED リソース無し)。${NC}" >&2
+        exit 1
+    fi
+    echo -e "${YELLOW}[WARN] $stack: DELETE_FAILED リソース ($failed_ids) を retain して再 delete${NC}"
+    # shellcheck disable=SC2086
+    aws cloudformation delete-stack \
+        --stack-name "$stack" \
+        --region "$REGION" \
+        --retain-resources $failed_ids \
+        "${PROFILE_ARG[@]}"
+    if ! aws cloudformation wait stack-delete-complete \
+            --stack-name "$stack" \
+            --region "$REGION" \
+            "${PROFILE_ARG[@]}"; then
+        echo -e "${RED}[NG] $stack の retain 付き削除も失敗。${NC}" >&2
+        exit 1
+    fi
+}
+
+# (詳細チェック実行) - 全 app stack について ALB 名を調べる
+APP_STACK_NAMES=(VoiceImageEditApiStack VoiceImageEditFrontendStack VoiceImageEditStreamStack)
+DRIFTED_STACKS=()
+for s in "${APP_STACK_NAMES[@]}"; do
+    if ! stack_exists "$s"; then
+        continue
+    fi
+    existing_alb="$(stack_alb_name "$s")"
+    if [[ -z "$existing_alb" ]]; then
+        # ListenerRule が見つからない (rollback などで一部リソースだけが残っている異常状態)。
+        echo -e "${YELLOW}[WARN] $s に ListenerRule が見つかりませんでした。drift 判定を保留。${NC}"
+        continue
+    fi
+    if [[ "$existing_alb" != "$ALB_NAME" ]]; then
+        echo -e "${YELLOW}[DRIFT] $s は ALB '${existing_alb}' を参照していますが、現在の base ALB は '${ALB_NAME}' です。${NC}"
+        DRIFTED_STACKS+=("$s")
+    fi
+done
+
+if [[ ${#DRIFTED_STACKS[@]} -gt 0 ]]; then
+    echo
+    echo -e "${RED}[NG] base ALB 不一致の orphan stack を検出しました:${NC}" >&2
+    for s in "${DRIFTED_STACKS[@]}"; do
+        echo -e "${RED}     - ${s}${NC}" >&2
+    done
+    echo -e "${RED}原因: base stack (${BASE_STACK_NAME}-alb) を作り直したが Stage 2 stack を destroy していないため。${NC}" >&2
+    echo -e "${RED}対処: --reset-app-stacks を付けて再実行すると上記 orphan stack を destroy してから deploy します。${NC}" >&2
+    if [[ "$RESET_APP_STACKS" != "true" ]]; then
+        exit 1
+    fi
+    echo -e "${YELLOW}[INFO] --reset-app-stacks 指定: orphan stack を削除します${NC}"
+    # 削除順は Frontend → Stream → Api (TG が ALB rule を保持する構造の逆順)。
+    for s in VoiceImageEditFrontendStack VoiceImageEditStreamStack VoiceImageEditApiStack; do
+        for d in "${DRIFTED_STACKS[@]}"; do
+            if [[ "$s" == "$d" ]]; then
+                destroy_stack_if_present "$s"
+                break
+            fi
+        done
+    done
 fi
 
 # -----------------------------------------------------------------------------

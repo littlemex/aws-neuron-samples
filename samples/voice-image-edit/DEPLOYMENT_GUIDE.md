@@ -275,6 +275,15 @@ cd <repo>/setup/single-node/scripts
 bash deploy.sh -r sa-east-1 --stack-name neuron-ws --destroy
 ```
 
+> **重要**: 基盤層を **作り直す**前 (=既存基盤を一度 `--destroy` する前) には、必ず先にアプリ層を
+> `--destroy` で片付けてください。アプリ層スタック (VoiceImageEdit{Api,Frontend,Stream}Stack) は
+> 基盤 ALB ARN / Listener ARN / OriginVerifySecret ARN を context 経由で焼き込んでいるため、
+> 基盤だけ消して再作成すると、アプリ層は古い ARN を参照する **orphan** になります。
+>
+> orphan のまま再 `deploy` すると `Secrets Manager can't find the specified secret` /
+> `instance does not exist` 等で UPDATE_ROLLBACK_FAILED に落ちます。誤って orphan を作って
+> しまった場合は §4.7 を参照してください。
+
 ---
 
 ## 4. トラブルシュート
@@ -321,6 +330,41 @@ aws elbv2 describe-rules --listener-arn <listener-arn> \
 
 `neuron-ws-efs` は `RemovalPolicy.RETAIN`、Spot 再収容でも EFS は別ライフサイクル。
 NFS ingress は `setup/single-node/scripts/deploy.sh` が冪等に再付与します。
+
+### 4.7 `[NG] base ALB 不一致の orphan stack を検出しました`
+
+基盤層を作り直したのにアプリ層を destroy していなかった場合に出ます。
+症状: 既存 VoiceImageEdit*Stack の ListenerRule が古い ALB 名 (例: `storea-Alb16-XXXXXX`)
+を含んでおり、現在 base から解決した ALB 名と一致しないため deploy.sh が abort します。
+
+```text
+[DRIFT] VoiceImageEditFrontendStack は ALB 'storea-Alb16-1CFevyQuH35R' を参照していますが、
+        現在の base ALB は 'storea-Alb16-IF7NAZUgkkSP' です。
+[NG] base ALB 不一致の orphan stack を検出しました:
+     - VoiceImageEditFrontendStack
+原因: base stack (...-alb) を作り直したが Stage 2 stack を destroy していないため。
+対処: --reset-app-stacks を付けて再実行すると上記 orphan stack を destroy してから deploy します。
+```
+
+復旧:
+
+```bash
+cd <repo>/samples/voice-image-edit/app/infra
+bash deploy.sh --base-stack-name neuron-ws -r sa-east-1 --reset-app-stacks
+```
+
+`--reset-app-stacks` は drift 判定に該当した orphan stack だけを Frontend → Stream → Api の順で
+`delete-stack` した上で通常の deploy を続行します。drift していない既存 stack には触りません。
+
+なお、対象 stack が `UPDATE_ROLLBACK_FAILED` で詰まっている場合は先に手動で
+`continue-update-rollback` を実行してから上記コマンドを叩いてください:
+
+```bash
+aws cloudformation continue-update-rollback \
+  --stack-name VoiceImageEditFrontendStack \
+  --region <region> \
+  --resources-to-skip <FailedLogicalId1> <FailedLogicalId2>
+```
 
 ---
 
