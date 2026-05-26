@@ -1,0 +1,163 @@
+{
+  "name": "voice-image-edit API (FastAPI/uvicorn) on EC2",
+  "description": "P10 で Lambda 退役後の /api/edit/* を担う FastAPI/uvicorn を EC2 上に systemd で常駐させる。 Stage 1 の既存 EC2 (frontend / stream と同居) で port 8801 listen。Tarball は presigned S3 URL から取得。venv は /opt/voice-image-edit/api/venv に作る。冪等なので再実行で安全に更新可能。 Bedrock / Transcribe / S3 は EC2 IAM role 経由 (ApiStack が attach)。 ALB listener rule (priority 100, /api/edit/*, X-Origin-Verify 完全一致) は ApiStack が IP target で振り向ける。",
+  "variables": {
+    "API_TARBALL_URL": "",
+    "API_DIR": "/opt/voice-image-edit/api",
+    "API_USER": "ubuntu",
+    "API_PORT": "8801",
+    "BEDROCK_REGION": "us-east-1",
+    "EDIT_RESULT_BUCKET": "",
+    "EDIT_RESULT_TTL_SECONDS": "900",
+    "EDIT_RESULT_PREFIX": "edit-results/",
+    "ASR_ENGINE_DEFAULT": "bedrock_transcribe",
+    "VLM_ENGINE_DEFAULT": "bedrock_nova_lite",
+    "EDIT_ENGINE_DEFAULT": "bedrock_nova_canvas",
+    "BEDROCK_ASR_BACKEND": "transcribe",
+    "BEDROCK_CLAUDE_SONNET_MODEL_ID": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+    "BEDROCK_NOVA_PRO_MODEL_ID": "amazon.nova-pro-v1:0",
+    "BEDROCK_NOVA_LITE_MODEL_ID": "amazon.nova-lite-v1:0",
+    "BEDROCK_NOVA_CANVAS_MODEL_ID": "amazon.nova-canvas-v1:0",
+    "BEDROCK_EDIT_MODEL_ID": "amazon.nova-canvas-v1:0",
+    "BEDROCK_VLM_MODEL_ID": "amazon.nova-lite-v1:0",
+    "TRAINIUM_ASR_URL": "",
+    "TRAINIUM_VLM_URL": "",
+    "TRAINIUM_EDIT_URL": ""
+  },
+  "tasks": [
+    {
+      "id": "00-precheck",
+      "name": "Precheck python3 + curl + tar",
+      "description": "Python 3.10+ (Ubuntu 22.04 / 24.04 default) と curl/tar が入っていることを確認する。",
+      "commands": [
+        "set -e",
+        "command -v python3 >/dev/null || { echo '[NG] python3 missing'; exit 1; }",
+        "python3 --version",
+        "command -v curl >/dev/null || { echo '[NG] curl missing'; exit 1; }",
+        "command -v tar >/dev/null || { echo '[NG] tar missing'; exit 1; }",
+        "id {{API_USER}} >/dev/null 2>&1 || { echo '[NG] user {{API_USER}} missing'; exit 1; }",
+        "echo '[OK] precheck'"
+      ]
+    },
+    {
+      "id": "10-stop-service",
+      "name": "Stop existing voice-image-edit-api service (if any)",
+      "description": "systemd unit があれば一旦止める。冪等性のため失敗しても続行。",
+      "commands": [
+        "systemctl stop voice-image-edit-api.service 2>/dev/null || true",
+        "echo '[OK] stop attempted'"
+      ]
+    },
+    {
+      "id": "20-deploy-tarball",
+      "name": "Download + extract api backend tarball",
+      "description": "presigned URL で tarball を取得し /opt/voice-image-edit/api に展開する。",
+      "commands": [
+        "set -e",
+        "test -n '{{API_TARBALL_URL}}' || { echo '[NG] API_TARBALL_URL is empty'; exit 1; }",
+        "mkdir -p /opt/voice-image-edit",
+        "rm -rf {{API_DIR}}",
+        "mkdir -p {{API_DIR}}",
+        "tmp=$(mktemp /tmp/voice-image-edit-api.XXXXXX.tar.gz)",
+        "trap 'rm -f $tmp' EXIT",
+        "curl -fsSL '{{API_TARBALL_URL}}' -o $tmp",
+        "tar -C {{API_DIR}} -xzf $tmp",
+        "test -f {{API_DIR}}/app.py || { echo '[NG] app.py missing after extract'; exit 1; }",
+        "test -f {{API_DIR}}/requirements.txt || { echo '[NG] requirements.txt missing'; exit 1; }",
+        "test -f {{API_DIR}}/contracts.py || { echo '[NG] contracts.py missing'; exit 1; }",
+        "test -d {{API_DIR}}/engines || { echo '[NG] engines/ missing'; exit 1; }",
+        "echo '[OK] deployed'"
+      ]
+    },
+    {
+      "id": "30-create-venv",
+      "name": "Create venv + install dependencies",
+      "description": "system python は触らない。venv を作って FastAPI / uvicorn / boto3 / amazon-transcribe を pip install。",
+      "commands": [
+        "set -e",
+        "apt-get -y install python3-venv >/dev/null 2>&1 || true",
+        "python3 -m venv {{API_DIR}}/venv",
+        "{{API_DIR}}/venv/bin/pip install --upgrade pip --quiet",
+        "{{API_DIR}}/venv/bin/pip install --quiet -r {{API_DIR}}/requirements.txt",
+        "chown -R {{API_USER}}:{{API_USER}} {{API_DIR}}",
+        "echo '[OK] venv ready'"
+      ]
+    },
+    {
+      "id": "40-install-systemd-unit",
+      "name": "Install voice-image-edit-api.service systemd unit",
+      "description": "Restart=always で常駐。0.0.0.0:{{API_PORT}} で listen し、ALB から到達可能にする。 全エンジン設定は systemd Environment 経由で渡す (Bedrock / Trainium / EDIT 結果 S3 を含む)。",
+      "commands": [
+        "set -e",
+        "cat > /etc/systemd/system/voice-image-edit-api.service <<'EOF'",
+        "[Unit]",
+        "Description=voice-image-edit API backend (FastAPI/uvicorn)",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "User={{API_USER}}",
+        "WorkingDirectory={{API_DIR}}",
+        "Environment=PYTHONUNBUFFERED=1",
+        "Environment=LOG_LEVEL=INFO",
+        "Environment=BEDROCK_REGION={{BEDROCK_REGION}}",
+        "Environment=EDIT_RESULT_BUCKET={{EDIT_RESULT_BUCKET}}",
+        "Environment=EDIT_RESULT_TTL_SECONDS={{EDIT_RESULT_TTL_SECONDS}}",
+        "Environment=EDIT_RESULT_PREFIX={{EDIT_RESULT_PREFIX}}",
+        "Environment=ASR_ENGINE_DEFAULT={{ASR_ENGINE_DEFAULT}}",
+        "Environment=VLM_ENGINE_DEFAULT={{VLM_ENGINE_DEFAULT}}",
+        "Environment=EDIT_ENGINE_DEFAULT={{EDIT_ENGINE_DEFAULT}}",
+        "Environment=BEDROCK_ASR_BACKEND={{BEDROCK_ASR_BACKEND}}",
+        "Environment=BEDROCK_CLAUDE_SONNET_MODEL_ID={{BEDROCK_CLAUDE_SONNET_MODEL_ID}}",
+        "Environment=BEDROCK_NOVA_PRO_MODEL_ID={{BEDROCK_NOVA_PRO_MODEL_ID}}",
+        "Environment=BEDROCK_NOVA_LITE_MODEL_ID={{BEDROCK_NOVA_LITE_MODEL_ID}}",
+        "Environment=BEDROCK_NOVA_CANVAS_MODEL_ID={{BEDROCK_NOVA_CANVAS_MODEL_ID}}",
+        "Environment=BEDROCK_EDIT_MODEL_ID={{BEDROCK_EDIT_MODEL_ID}}",
+        "Environment=BEDROCK_VLM_MODEL_ID={{BEDROCK_VLM_MODEL_ID}}",
+        "Environment=TRAINIUM_ASR_URL={{TRAINIUM_ASR_URL}}",
+        "Environment=TRAINIUM_VLM_URL={{TRAINIUM_VLM_URL}}",
+        "Environment=TRAINIUM_EDIT_URL={{TRAINIUM_EDIT_URL}}",
+        "ExecStart={{API_DIR}}/venv/bin/uvicorn app:app --host 0.0.0.0 --port {{API_PORT}} --proxy-headers --no-server-header --timeout-keep-alive 75",
+        "Restart=always",
+        "RestartSec=5s",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "EOF",
+        "echo '[OK] unit installed'"
+      ]
+    },
+    {
+      "id": "50-enable-start",
+      "name": "daemon-reload + enable + start",
+      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "commands": [
+        "set -e",
+        "systemctl daemon-reload",
+        "systemctl enable voice-image-edit-api.service",
+        "systemctl restart voice-image-edit-api.service",
+        "echo '[OK] service started'"
+      ]
+    },
+    {
+      "id": "60-health-check",
+      "name": "Local HTTP health check on 127.0.0.1:{{API_PORT}}/api/edit/health",
+      "description": "uvicorn が listen するまで最大 30s 待ち、200 を返すかを確認する。",
+      "commands": [
+        "set -e",
+        "for i in $(seq 1 30); do",
+        "  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{API_PORT}}/api/edit/health || echo 000)",
+        "  if [ \"$code\" = \"200\" ]; then echo \"[OK] http=$code (attempt=$i)\"; exit 0; fi",
+        "  sleep 1",
+        "done",
+        "echo '[NG] api did not become healthy in 30s' >&2",
+        "systemctl status voice-image-edit-api.service --no-pager || true",
+        "journalctl -u voice-image-edit-api.service -n 50 --no-pager || true",
+        "exit 1"
+      ]
+    }
+  ]
+}

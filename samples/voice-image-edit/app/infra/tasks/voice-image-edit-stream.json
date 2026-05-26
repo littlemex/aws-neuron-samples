@@ -1,0 +1,133 @@
+{
+  "name": "voice-image-edit Stream (FastAPI/uvicorn) on EC2",
+  "description": "Stage 1 で立てた既存 EC2 上に voice-image-edit の SSE backend (FastAPI/uvicorn, port 8800) を systemd で常駐起動する。Backend tarball は presigned S3 URL から取得 (EC2 IAM に S3 不要)。venv は /opt/voice-image-edit/stream/venv に作る。冪等なので再実行で安全に更新可能。P9 から /stream/pipeline 用に EDIT_API_BASE_URL / X-Origin-Verify 値を systemd Environment で渡す。",
+  "variables": {
+    "STREAM_TARBALL_URL": "",
+    "STREAM_DIR": "/opt/voice-image-edit/stream",
+    "STREAM_USER": "ubuntu",
+    "STREAM_PORT": "8800",
+    "EDIT_API_BASE_URL": "",
+    "ORIGIN_VERIFY_HEADER_NAME": "X-Origin-Verify",
+    "ORIGIN_VERIFY_HEADER_VALUE": ""
+  },
+  "tasks": [
+    {
+      "id": "00-precheck",
+      "name": "Precheck python3 + curl + tar",
+      "description": "Python 3.10+ (Ubuntu 22.04 / 24.04 default) と curl/tar が入っていることを確認する。",
+      "commands": [
+        "set -e",
+        "command -v python3 >/dev/null || { echo '[NG] python3 missing'; exit 1; }",
+        "python3 --version",
+        "command -v curl >/dev/null || { echo '[NG] curl missing'; exit 1; }",
+        "command -v tar >/dev/null || { echo '[NG] tar missing'; exit 1; }",
+        "id {{STREAM_USER}} >/dev/null 2>&1 || { echo '[NG] user {{STREAM_USER}} missing'; exit 1; }",
+        "echo '[OK] precheck'"
+      ]
+    },
+    {
+      "id": "10-stop-service",
+      "name": "Stop existing voice-image-edit-stream service (if any)",
+      "description": "systemd unit があれば一旦止める。冪等性のため失敗しても続行。",
+      "commands": [
+        "systemctl stop voice-image-edit-stream.service 2>/dev/null || true",
+        "echo '[OK] stop attempted'"
+      ]
+    },
+    {
+      "id": "20-deploy-tarball",
+      "name": "Download + extract stream backend tarball",
+      "description": "presigned URL で tarball を取得し /opt/voice-image-edit/stream に展開する。",
+      "commands": [
+        "set -e",
+        "test -n '{{STREAM_TARBALL_URL}}' || { echo '[NG] STREAM_TARBALL_URL is empty'; exit 1; }",
+        "mkdir -p /opt/voice-image-edit",
+        "rm -rf {{STREAM_DIR}}",
+        "mkdir -p {{STREAM_DIR}}",
+        "tmp=$(mktemp /tmp/voice-image-edit-stream.XXXXXX.tar.gz)",
+        "trap 'rm -f $tmp' EXIT",
+        "curl -fsSL '{{STREAM_TARBALL_URL}}' -o $tmp",
+        "tar -C {{STREAM_DIR}} -xzf $tmp",
+        "test -f {{STREAM_DIR}}/app.py || { echo '[NG] app.py missing after extract'; exit 1; }",
+        "test -f {{STREAM_DIR}}/requirements.txt || { echo '[NG] requirements.txt missing'; exit 1; }",
+        "echo '[OK] deployed'"
+      ]
+    },
+    {
+      "id": "30-create-venv",
+      "name": "Create venv + install dependencies",
+      "description": "system python は触らない。venv を作って FastAPI / uvicorn を pip install。",
+      "commands": [
+        "set -e",
+        "apt-get -y install python3-venv >/dev/null 2>&1 || true",
+        "python3 -m venv {{STREAM_DIR}}/venv",
+        "{{STREAM_DIR}}/venv/bin/pip install --upgrade pip --quiet",
+        "{{STREAM_DIR}}/venv/bin/pip install --quiet -r {{STREAM_DIR}}/requirements.txt",
+        "chown -R {{STREAM_USER}}:{{STREAM_USER}} {{STREAM_DIR}}",
+        "echo '[OK] venv ready'"
+      ]
+    },
+    {
+      "id": "40-install-systemd-unit",
+      "name": "Install voice-image-edit-stream.service systemd unit",
+      "description": "Restart=always で常駐。0.0.0.0:{{STREAM_PORT}} で listen し、ALB から到達可能にする。",
+      "commands": [
+        "set -e",
+        "cat > /etc/systemd/system/voice-image-edit-stream.service <<'EOF'",
+        "[Unit]",
+        "Description=voice-image-edit SSE backend (FastAPI/uvicorn)",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "User={{STREAM_USER}}",
+        "WorkingDirectory={{STREAM_DIR}}",
+        "Environment=PYTHONUNBUFFERED=1",
+        "Environment=LOG_LEVEL=INFO",
+        "Environment=EDIT_API_BASE_URL={{EDIT_API_BASE_URL}}",
+        "Environment=ORIGIN_VERIFY_HEADER_NAME={{ORIGIN_VERIFY_HEADER_NAME}}",
+        "Environment=ORIGIN_VERIFY_HEADER_VALUE={{ORIGIN_VERIFY_HEADER_VALUE}}",
+        "ExecStart={{STREAM_DIR}}/venv/bin/uvicorn app:app --host 0.0.0.0 --port {{STREAM_PORT}} --proxy-headers --no-server-header --timeout-keep-alive 75",
+        "Restart=always",
+        "RestartSec=5s",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "EOF",
+        "echo '[OK] unit installed'"
+      ]
+    },
+    {
+      "id": "50-enable-start",
+      "name": "daemon-reload + enable + start",
+      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "commands": [
+        "set -e",
+        "systemctl daemon-reload",
+        "systemctl enable voice-image-edit-stream.service",
+        "systemctl restart voice-image-edit-stream.service",
+        "echo '[OK] service started'"
+      ]
+    },
+    {
+      "id": "60-health-check",
+      "name": "Local HTTP health check on 127.0.0.1:{{STREAM_PORT}}/stream/health",
+      "description": "uvicorn が listen するまで最大 30s 待ち、200 を返すかを確認する。",
+      "commands": [
+        "set -e",
+        "for i in $(seq 1 30); do",
+        "  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{STREAM_PORT}}/stream/health || echo 000)",
+        "  if [ \"$code\" = \"200\" ]; then echo \"[OK] http=$code (attempt=$i)\"; exit 0; fi",
+        "  sleep 1",
+        "done",
+        "echo '[NG] stream did not become healthy in 30s' >&2",
+        "systemctl status voice-image-edit-stream.service --no-pager || true",
+        "journalctl -u voice-image-edit-stream.service -n 50 --no-pager || true",
+        "exit 1"
+      ]
+    }
+  ]
+}
