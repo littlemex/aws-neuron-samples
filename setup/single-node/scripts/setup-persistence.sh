@@ -63,26 +63,69 @@ fi
 log() { echo "[setup-persistence] $*"; }
 
 # -------- Step 1: NVMe instance store --------
-log "Step 1: NVMe instance store (/dev/nvme1n1 -> /mnt/local)"
-if [ -b /dev/nvme1n1 ]; then
-    if ! mount | grep -q "/mnt/local"; then
-        if ! blkid /dev/nvme1n1 >/dev/null 2>&1; then
-            log "  formatting /dev/nvme1n1 (first time or post-stop wipe)"
-            mkfs.ext4 -F /dev/nvme1n1
+# trn2.3xlarge has 1 instance store NVMe, trn2.48xlarge has 4. The kernel
+# enumerates EBS volumes and instance stores together as /dev/nvmeN, and the
+# ordering is not guaranteed across instance types. Identify instance stores
+# by AWS NVMe vendor model "Amazon EC2 NVMe Instance Storage" and exclude any
+# device that already hosts the root filesystem.
+log "Step 1: NVMe instance store -> /mnt/local"
+
+ROOT_SRC=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's|p[0-9]\+$||')
+log "  root device (excluded): ${ROOT_SRC:-unknown}"
+
+INSTANCE_STORE_DEVS=()
+for d in /dev/nvme*n1; do
+    [ -b "$d" ] || continue
+    [ "$d" = "$ROOT_SRC" ] && continue
+    model=$(cat /sys/class/nvme/$(basename "$d" | sed 's/n1$//')/model 2>/dev/null | tr -d ' ' || true)
+    if echo "$model" | grep -qi "InstanceStorage"; then
+        INSTANCE_STORE_DEVS+=("$d")
+    fi
+done
+log "  detected instance store devices: ${INSTANCE_STORE_DEVS[*]:-(none)}"
+
+LOCAL_DEV=""
+NSTORES=${#INSTANCE_STORE_DEVS[@]}
+if [ "$NSTORES" -eq 0 ]; then
+    log "  [WARN] no instance store NVMe found; skipping /mnt/local"
+elif [ "$NSTORES" -eq 1 ]; then
+    LOCAL_DEV="${INSTANCE_STORE_DEVS[0]}"
+else
+    # Multiple instance stores -> assemble md RAID0
+    DEBIAN_FRONTEND=noninteractive apt-get install -yq mdadm >/dev/null 2>&1 || true
+    LOCAL_DEV="/dev/md0"
+    if [ ! -b "$LOCAL_DEV" ]; then
+        log "  creating RAID0 across ${INSTANCE_STORE_DEVS[*]}"
+        # Wipe any old superblocks (e.g. after Spot stop/start the disks come back blank,
+        # but on first boot they may have leftover signatures from prior tenants).
+        for d in "${INSTANCE_STORE_DEVS[@]}"; do
+            wipefs -a "$d" >/dev/null 2>&1 || true
+            mdadm --zero-superblock --force "$d" >/dev/null 2>&1 || true
+        done
+        mdadm --create --verbose "$LOCAL_DEV" --level=0 --raid-devices="$NSTORES" \
+            "${INSTANCE_STORE_DEVS[@]}" --run
+    else
+        log "  RAID0 $LOCAL_DEV already assembled"
+    fi
+fi
+
+if [ -n "$LOCAL_DEV" ] && [ -b "$LOCAL_DEV" ]; then
+    if ! mount | grep -q " /mnt/local "; then
+        if ! blkid "$LOCAL_DEV" >/dev/null 2>&1; then
+            log "  formatting $LOCAL_DEV (first time or post-stop wipe)"
+            mkfs.ext4 -F "$LOCAL_DEV"
         fi
         mkdir -p /mnt/local
-        mount /dev/nvme1n1 /mnt/local || {
+        mount "$LOCAL_DEV" /mnt/local || {
             log "  mount failed, reformat + retry"
-            mkfs.ext4 -F /dev/nvme1n1
-            mount /dev/nvme1n1 /mnt/local
+            mkfs.ext4 -F "$LOCAL_DEV"
+            mount "$LOCAL_DEV" /mnt/local
         }
         chmod 1777 /mnt/local
-        log "  mounted /dev/nvme1n1 -> /mnt/local"
+        log "  mounted $LOCAL_DEV -> /mnt/local"
     else
         log "  /mnt/local already mounted"
     fi
-else
-    log "  [WARN] /dev/nvme1n1 not found"
 fi
 
 # -------- Step 2: mount EFS and fix permissions --------
@@ -117,13 +160,11 @@ if ! grep -q "${EFS_ID}.efs" /etc/fstab; then
 ${EFS_ID}.efs.${REGION}.amazonaws.com:/ /mnt/efs nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,noresvport,_netdev 0 0
 EOF
 fi
-if ! grep -q "/mnt/local" /etc/fstab; then
-    cat >> /etc/fstab <<EOF
-
-# Instance store NVMe (ephemeral, re-format on boot if missing)
-/dev/nvme1n1 /mnt/local ext4 defaults,nofail,x-systemd.device-timeout=5 0 0
-EOF
-fi
+# Note: we deliberately do NOT add /mnt/local to /etc/fstab. The set of NVMe
+# instance store devices (and md device names) is not stable across stop/start
+# on Spot or instance-type swaps, so persisting a fixed entry would race with
+# the early-boot mount and leave the box in maintenance mode. setup-persistence.sh
+# is idempotent and is re-run on boot via the recovery hook to remount /mnt/local.
 
 # -------- Step 4: symlink /home/${CODE_USER} and /work onto EFS --------
 log "Step 4: migrate /home/${CODE_USER} and /work -> EFS"
