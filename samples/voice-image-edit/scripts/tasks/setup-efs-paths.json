@@ -1,0 +1,167 @@
+{
+  "name": "Voice-image-edit canonical paths -> EFS symlink layer",
+  "description": "EFS が /mnt/efs にマウントされている前提で、 model キャッシュ/コンパイル成果物/サーバ source を EFS に永続化するための symlink layer をセットアップする。冪等: 既に symlink が EFS に向いていれば SKIP。 setup-persistence.sh が先に走って /mnt/efs を mount している必要がある。",
+  "variables": {
+    "EFS_ROOT": "/mnt/efs/neuron-workspace",
+    "MODELS_DIR_NAME": "models",
+    "VIE_DIR_NAME": "voice-image-edit"
+  },
+  "tasks": [
+    {
+      "id": "00-precheck",
+      "name": "Verify /mnt/efs is mounted",
+      "description": "EFS がマウントされていなかったら setup-persistence.sh が先に走っていない、もしくは EFS 側 policy が壊れている。後段の rsync/symlink で root fs を圧迫しないために必ず止める。",
+      "commands": [
+        "set -e",
+        "mountpoint -q /mnt/efs || { echo '[NG] /mnt/efs is not a mountpoint - run setup-persistence.sh first'; exit 1; }",
+        "df -hT /mnt/efs | tail -1",
+        "echo '[OK] /mnt/efs mounted'"
+      ]
+    },
+    {
+      "id": "10-mkdir-efs",
+      "name": "mkdir EFS dirs (models / voice-image-edit)",
+      "description": "EFS 上に永続化先 directory を作る。既にあれば noop。",
+      "commands": [
+        "set -e",
+        "mkdir -p {{EFS_ROOT}}/{{MODELS_DIR_NAME}}",
+        "mkdir -p {{EFS_ROOT}}/{{MODELS_DIR_NAME}}/hf-cache",
+        "mkdir -p {{EFS_ROOT}}/{{MODELS_DIR_NAME}}/whisper-large-v3-neuron",
+        "mkdir -p {{EFS_ROOT}}/{{MODELS_DIR_NAME}}/qwen-image-edit-compiled",
+        "mkdir -p {{EFS_ROOT}}/{{MODELS_DIR_NAME}}/qwen3-vl-compiled",
+        "mkdir -p {{EFS_ROOT}}/{{VIE_DIR_NAME}}",
+        "mkdir -p {{EFS_ROOT}}/{{VIE_DIR_NAME}}/whisper-server",
+        "mkdir -p {{EFS_ROOT}}/{{VIE_DIR_NAME}}/qwen3-vl-server",
+        "mkdir -p {{EFS_ROOT}}/{{VIE_DIR_NAME}}/qwen-image-edit-server",
+        "mkdir -p {{EFS_ROOT}}/{{VIE_DIR_NAME}}/qwen-image-edit-compile",
+        "chown -R ubuntu:ubuntu {{EFS_ROOT}}/{{MODELS_DIR_NAME}} {{EFS_ROOT}}/{{VIE_DIR_NAME}}",
+        "echo '[OK] EFS dirs prepared'"
+      ]
+    },
+    {
+      "id": "20-mkdir-canonical",
+      "name": "mkdir canonical parent dirs",
+      "description": "symlink を貼る親ディレクトリ (/opt, /opt/dlami/nvme, /mnt/local) が無い trn2 用に空に作る。",
+      "commands": [
+        "set -e",
+        "mkdir -p /models",
+        "mkdir -p /opt",
+        "mkdir -p /opt/dlami/nvme",
+        "mkdir -p /mnt/local",
+        "echo '[OK] parent dirs ensured'"
+      ]
+    },
+    {
+      "id": "30-link-models",
+      "name": "Symlink /models -> EFS/models",
+      "description": "/models が directory ならその中身を EFS に rsync してから symlink に張り替える。 既に EFS 向き symlink ならスキップ。",
+      "commands": [
+        "set -e",
+        "TARGET={{EFS_ROOT}}/{{MODELS_DIR_NAME}}",
+        "if [ -L /models ]; then",
+        "  current=$(readlink -f /models)",
+        "  if [ \"$current\" = \"$TARGET\" ]; then echo '[OK] /models already symlinked'; exit 0; fi",
+        "  echo \"[INFO] /models points to $current, retargeting\"; rm /models",
+        "elif [ -d /models ] && [ \"$(ls -A /models 2>/dev/null)\" ]; then",
+        "  echo '[INFO] migrating /models contents to EFS'",
+        "  rsync -a --info=progress2 /models/ ${TARGET}/",
+        "  rm -rf /models",
+        "elif [ -d /models ]; then",
+        "  rmdir /models 2>/dev/null || rm -rf /models",
+        "fi",
+        "ln -sfn ${TARGET} /models",
+        "ls -ld /models",
+        "echo '[OK] /models -> EFS'"
+      ]
+    },
+    {
+      "id": "40-link-voice-image-edit",
+      "name": "Symlink /opt/voice-image-edit -> EFS/voice-image-edit",
+      "description": "サーバ source は EFS に置いて compile artifact 同様に永続化する。 systemd unit 側は /opt/voice-image-edit/<server>/ を見るので透明。",
+      "commands": [
+        "set -e",
+        "TARGET={{EFS_ROOT}}/{{VIE_DIR_NAME}}",
+        "if [ -L /opt/voice-image-edit ]; then",
+        "  current=$(readlink -f /opt/voice-image-edit)",
+        "  if [ \"$current\" = \"$TARGET\" ]; then echo '[OK] /opt/voice-image-edit already symlinked'; exit 0; fi",
+        "  rm /opt/voice-image-edit",
+        "elif [ -d /opt/voice-image-edit ] && [ \"$(ls -A /opt/voice-image-edit 2>/dev/null)\" ]; then",
+        "  echo '[INFO] migrating /opt/voice-image-edit contents to EFS'",
+        "  rsync -a --info=progress2 /opt/voice-image-edit/ ${TARGET}/",
+        "  rm -rf /opt/voice-image-edit",
+        "elif [ -d /opt/voice-image-edit ]; then",
+        "  rmdir /opt/voice-image-edit 2>/dev/null || rm -rf /opt/voice-image-edit",
+        "fi",
+        "ln -sfn ${TARGET} /opt/voice-image-edit",
+        "ls -ld /opt/voice-image-edit",
+        "echo '[OK] /opt/voice-image-edit -> EFS'"
+      ]
+    },
+    {
+      "id": "50-link-compiled-models",
+      "name": "Symlink /mnt/local/compiled_models -> EFS/models/qwen-image-edit-compiled",
+      "description": "compile.sh は /mnt/local/compiled_models/ を出力先にハードコードしているので、 そこを EFS の qwen-image-edit-compiled/ に link する。 NVMe 上の既存内容があれば一旦 EFS に rsync する。",
+      "commands": [
+        "set -e",
+        "TARGET={{EFS_ROOT}}/{{MODELS_DIR_NAME}}/qwen-image-edit-compiled",
+        "if [ -L /mnt/local/compiled_models ]; then",
+        "  current=$(readlink -f /mnt/local/compiled_models)",
+        "  if [ \"$current\" = \"$TARGET\" ]; then echo '[OK] compiled_models already symlinked'; exit 0; fi",
+        "  rm /mnt/local/compiled_models",
+        "elif [ -d /mnt/local/compiled_models ] && [ \"$(ls -A /mnt/local/compiled_models 2>/dev/null)\" ]; then",
+        "  echo '[INFO] migrating compiled_models to EFS (this may take ~10 min for ~80GB)'",
+        "  rsync -a --info=progress2 /mnt/local/compiled_models/ ${TARGET}/",
+        "  rm -rf /mnt/local/compiled_models",
+        "elif [ -d /mnt/local/compiled_models ]; then",
+        "  rmdir /mnt/local/compiled_models 2>/dev/null || rm -rf /mnt/local/compiled_models",
+        "fi",
+        "ln -sfn ${TARGET} /mnt/local/compiled_models",
+        "ls -ld /mnt/local/compiled_models",
+        "echo '[OK] /mnt/local/compiled_models -> EFS'"
+      ]
+    },
+    {
+      "id": "60-link-hf-cache",
+      "name": "Symlink HF cache -> EFS/models/hf-cache",
+      "description": "compile.sh と serve.py が見る HF_HOME / HUGGINGFACE_CACHE_DIR の親 (/opt/dlami/nvme/qwen_image_edit_hf_cache_dir) を EFS に向ける。 既存の HF download (~110GB) があれば EFS に rsync する。",
+      "commands": [
+        "set -e",
+        "SRC=/opt/dlami/nvme/qwen_image_edit_hf_cache_dir",
+        "TARGET={{EFS_ROOT}}/{{MODELS_DIR_NAME}}/hf-cache",
+        "if [ -L $SRC ]; then",
+        "  current=$(readlink -f $SRC)",
+        "  if [ \"$current\" = \"$TARGET\" ]; then echo '[OK] hf-cache already symlinked'; exit 0; fi",
+        "  rm $SRC",
+        "elif [ -d $SRC ] && [ \"$(ls -A $SRC 2>/dev/null)\" ]; then",
+        "  echo '[INFO] migrating HF cache to EFS (this may take ~15 min for ~110GB)'",
+        "  rsync -a --info=progress2 $SRC/ ${TARGET}/",
+        "  rm -rf $SRC",
+        "elif [ -d $SRC ]; then",
+        "  rmdir $SRC 2>/dev/null || rm -rf $SRC",
+        "fi",
+        "mkdir -p $(dirname $SRC)",
+        "ln -sfn ${TARGET} $SRC",
+        "ls -ld $SRC",
+        "echo '[OK] hf-cache -> EFS'"
+      ]
+    },
+    {
+      "id": "70-summary",
+      "name": "Print symlink summary + EFS usage",
+      "description": "確認用に各 canonical path の symlink 情報と EFS の disk usage を出す。",
+      "commands": [
+        "set -e",
+        "echo '=== canonical paths ==='",
+        "for p in /models /opt/voice-image-edit /mnt/local/compiled_models /opt/dlami/nvme/qwen_image_edit_hf_cache_dir; do",
+        "  if [ -L $p ]; then echo \"$p -> $(readlink -f $p)\"; else echo \"[WARN] $p is not a symlink\"; fi",
+        "done",
+        "echo",
+        "echo '=== EFS usage ==='",
+        "df -hT /mnt/efs | tail -1",
+        "du -sh {{EFS_ROOT}}/{{MODELS_DIR_NAME}}/* 2>/dev/null || true",
+        "du -sh {{EFS_ROOT}}/{{VIE_DIR_NAME}}/* 2>/dev/null || true",
+        "echo '[OK] setup-efs-paths complete'"
+      ]
+    }
+  ]
+}

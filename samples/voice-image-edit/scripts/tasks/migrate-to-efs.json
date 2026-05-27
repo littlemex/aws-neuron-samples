@@ -1,0 +1,120 @@
+{
+  "name": "Migrate existing model artifacts from NVMe / root fs to EFS",
+  "description": "新規 trn2 セットアップでは setup-efs-paths.json が rsync しながら symlink を貼ってくれるが、 既に compile/HF download が走った後の現役 EC2 から EFS へ初回移行するときに使う。 setup-efs-paths.json の rsync ブロックを抜き出した形。 EFS が mount 済 + 各 canonical path が directory として存在している前提 (まだ symlink になっていないケース)。",
+  "variables": {
+    "EFS_ROOT": "/mnt/efs/neuron-workspace",
+    "MODELS_DIR_NAME": "models",
+    "VIE_DIR_NAME": "voice-image-edit"
+  },
+  "tasks": [
+    {
+      "id": "00-precheck",
+      "name": "Verify EFS mounted + sources exist",
+      "description": "/mnt/efs が mount 済で、 移行元 directory のいずれかが存在することを確認する。 全部存在しなければ migrate 不要なので exit 0。",
+      "commands": [
+        "set -e",
+        "mountpoint -q /mnt/efs || { echo '[NG] /mnt/efs not mounted'; exit 1; }",
+        "any=0",
+        "for p in /models /opt/voice-image-edit /mnt/local/compiled_models /opt/dlami/nvme/qwen_image_edit_hf_cache_dir; do",
+        "  if [ -d $p ] && [ ! -L $p ] && [ \"$(ls -A $p 2>/dev/null)\" ]; then any=1; echo \"[INFO] need migrate: $p\"; fi",
+        "done",
+        "if [ $any -eq 0 ]; then echo '[OK] nothing to migrate'; exit 0; fi",
+        "echo '[OK] some sources need migration'"
+      ]
+    },
+    {
+      "id": "10-mkdir-efs",
+      "name": "Ensure EFS target dirs exist",
+      "description": "EFS 上に rsync 先 directory を作る。",
+      "commands": [
+        "set -e",
+        "mkdir -p {{EFS_ROOT}}/{{MODELS_DIR_NAME}} {{EFS_ROOT}}/{{VIE_DIR_NAME}}",
+        "echo '[OK] EFS dirs ensured'"
+      ]
+    },
+    {
+      "id": "20-rsync-models",
+      "name": "rsync /models -> EFS/models (whisper artifacts etc.)",
+      "description": "/models が directory + non-empty なら EFS に rsync。 既に symlink ならスキップ。",
+      "commands": [
+        "set -e",
+        "if [ -L /models ]; then echo '[OK] already symlinked'; exit 0; fi",
+        "if [ -d /models ] && [ \"$(ls -A /models 2>/dev/null)\" ]; then",
+        "  echo '[INFO] rsync /models -> {{EFS_ROOT}}/{{MODELS_DIR_NAME}}'",
+        "  rsync -a --info=stats2,progress2 /models/ {{EFS_ROOT}}/{{MODELS_DIR_NAME}}/",
+        "  echo '[OK] /models rsync done'",
+        "else",
+        "  echo '[INFO] /models is empty or missing, skip'",
+        "fi"
+      ]
+    },
+    {
+      "id": "30-rsync-compiled-models",
+      "name": "rsync /mnt/local/compiled_models -> EFS/models/qwen-image-edit-compiled (~80GB)",
+      "description": "compile.sh 出力の本体。 NVMe -> EFS の rsync は大きいので時間がかかる (~10 min for 80GB)。 SSM の TASK_MAX_WAIT_SECONDS を大きくすること。",
+      "commands": [
+        "set -e",
+        "SRC=/mnt/local/compiled_models",
+        "TARGET={{EFS_ROOT}}/{{MODELS_DIR_NAME}}/qwen-image-edit-compiled",
+        "if [ -L $SRC ]; then echo '[OK] already symlinked'; exit 0; fi",
+        "if [ -d $SRC ] && [ \"$(ls -A $SRC 2>/dev/null)\" ]; then",
+        "  mkdir -p $TARGET",
+        "  echo '[INFO] rsync (this can take ~10 min for ~80GB)'",
+        "  rsync -a --info=stats2,progress2 $SRC/ $TARGET/",
+        "  echo '[OK] compiled_models rsync done'",
+        "else",
+        "  echo '[INFO] compiled_models empty/missing, skip'",
+        "fi"
+      ]
+    },
+    {
+      "id": "40-rsync-hf-cache",
+      "name": "rsync HF cache -> EFS/models/hf-cache (~110GB)",
+      "description": "HF download (Qwen-Image-Edit-2511 + Qwen3-VL-8B-Thinking + tokenizers) の本体。 ~110GB なので ~15 min かかる。",
+      "commands": [
+        "set -e",
+        "SRC=/opt/dlami/nvme/qwen_image_edit_hf_cache_dir",
+        "TARGET={{EFS_ROOT}}/{{MODELS_DIR_NAME}}/hf-cache",
+        "if [ -L $SRC ]; then echo '[OK] already symlinked'; exit 0; fi",
+        "if [ -d $SRC ] && [ \"$(ls -A $SRC 2>/dev/null)\" ]; then",
+        "  mkdir -p $TARGET",
+        "  echo '[INFO] rsync (this can take ~15 min for ~110GB)'",
+        "  rsync -a --info=stats2,progress2 $SRC/ $TARGET/",
+        "  echo '[OK] hf-cache rsync done'",
+        "else",
+        "  echo '[INFO] hf-cache empty/missing, skip'",
+        "fi"
+      ]
+    },
+    {
+      "id": "50-rsync-voice-image-edit",
+      "name": "rsync /opt/voice-image-edit -> EFS/voice-image-edit (server source)",
+      "description": "サーバ source (whisper-server, qwen3-vl-server, qwen-image-edit-server, qwen-image-edit-compile) を EFS に持っていく。 どれも ~MB-GB クラス。",
+      "commands": [
+        "set -e",
+        "if [ -L /opt/voice-image-edit ]; then echo '[OK] already symlinked'; exit 0; fi",
+        "if [ -d /opt/voice-image-edit ] && [ \"$(ls -A /opt/voice-image-edit 2>/dev/null)\" ]; then",
+        "  mkdir -p {{EFS_ROOT}}/{{VIE_DIR_NAME}}",
+        "  rsync -a --info=stats2,progress2 /opt/voice-image-edit/ {{EFS_ROOT}}/{{VIE_DIR_NAME}}/",
+        "  echo '[OK] voice-image-edit rsync done'",
+        "else",
+        "  echo '[INFO] voice-image-edit empty/missing, skip'",
+        "fi"
+      ]
+    },
+    {
+      "id": "60-summary",
+      "name": "Summary of EFS contents post-migration",
+      "description": "rsync 後の EFS 占有を表示する。",
+      "commands": [
+        "set -e",
+        "echo '=== EFS usage ==='",
+        "df -hT /mnt/efs | tail -1",
+        "du -sh {{EFS_ROOT}}/* 2>/dev/null || true",
+        "du -sh {{EFS_ROOT}}/{{MODELS_DIR_NAME}}/* 2>/dev/null || true",
+        "du -sh {{EFS_ROOT}}/{{VIE_DIR_NAME}}/* 2>/dev/null || true",
+        "echo '[OK] migrate complete - run setup-efs-paths.json next to flip symlinks'"
+      ]
+    }
+  ]
+}

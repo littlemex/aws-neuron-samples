@@ -28,6 +28,15 @@ export interface NeuronCodeServerStackProps extends cdk.StackProps {
   project?: string;
   /** Optional free-form tag applied to the instance (example: "training"). */
   purpose?: string;
+  /**
+   * Optional opaque token used as the launch template versionDescription.
+   * deploy.sh sets this to a timestamp when --force-recreate is passed
+   * (or when --recover detects a terminated EC2). Any change to the
+   * description triggers a new LT version, which CFN sees as a diff
+   * and uses to replace the EC2 instance even when no other context
+   * has changed.
+   */
+  forceRecreateToken?: string;
 }
 
 interface Config {
@@ -291,6 +300,15 @@ export class NeuronCodeServerStack extends cdk.Stack {
     const launchTemplate = new ec2.CfnLaunchTemplate(this, 'CodeServerLaunchTemplate', {
       launchTemplateName: `${id}-LaunchTemplate`,
       launchTemplateData,
+      // Changing versionDescription bumps the LT version, which CFN
+      // sees as a diff on the CfnInstance (which pins
+      // attrLatestVersionNumber) and uses to replace the EC2 even when
+      // no other context has changed. deploy.sh sets a fresh timestamp
+      // here when --force-recreate is passed or when --recover detects
+      // a terminated instance.
+      ...(props.forceRecreateToken
+        ? { versionDescription: `force-recreate:${props.forceRecreateToken}` }
+        : {}),
     });
 
     launchTemplate.node.addDependency(instanceProfile);

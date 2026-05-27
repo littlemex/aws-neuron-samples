@@ -11,11 +11,8 @@
 """
 from __future__ import annotations
 
-import base64
 import json
-import os
 import time
-import uuid
 
 import urllib3
 
@@ -24,44 +21,42 @@ from contracts import (
     AsrResponse,
     AsrSegment,
     EngineError,
-    EngineMetadata,
 )
 from engines.asr.base import AsrEngine
+from engines._common import (
+    build_metadata,
+    decode_audio_b64,
+    env_float,
+    env_required,
+    raise_for_status,
+    whisper_language,
+)
 
 
 class TrainiumAsrEngine(AsrEngine):
     name = "trainium"
 
     def __init__(self) -> None:
-        url = os.environ.get("TRAINIUM_ASR_URL")
-        if not url:
-            raise EngineError(
-                "config_missing", "TRAINIUM_ASR_URL env var is required"
-            )
-        self.endpoint = url
+        import os
+
+        self.endpoint = env_required("TRAINIUM_ASR_URL")
         self.model_id = os.environ.get(
             "TRAINIUM_ASR_MODEL_ID", "openai/whisper-large-v3"
         )
-        self.timeout = float(
-            os.environ.get("TRAINIUM_ASR_TIMEOUT_SECONDS", "60")
-        )
+        self.timeout = env_float("TRAINIUM_ASR_TIMEOUT_SECONDS", 60.0)
         self._http = urllib3.PoolManager()
 
     def invoke(self, req: AsrRequest) -> AsrResponse:
         start = time.monotonic()
-        try:
-            audio_bytes = base64.b64decode(req.audio_b64, validate=True)
-        except (ValueError, TypeError) as exc:
-            raise EngineError(
-                "invalid_request", f"audio_b64 is not valid base64: {exc}"
-            ) from exc
+        audio_bytes = decode_audio_b64(req.audio_b64, allow_empty=True)
 
         headers = {
             "Content-Type": "application/octet-stream",
             "X-Mime-Type": req.mime_type,
         }
-        if req.language:
-            headers["X-Language"] = req.language
+        whisper_lang = whisper_language(req.language)
+        if whisper_lang:
+            headers["X-Language"] = whisper_lang
         sample_rate = _extract_sample_rate(req.mime_type)
         if sample_rate:
             headers["X-Sample-Rate"] = str(sample_rate)
@@ -82,19 +77,7 @@ class TrainiumAsrEngine(AsrEngine):
                 retryable=True,
             ) from exc
 
-        if resp.status >= 500:
-            raise EngineError(
-                "provider_error",
-                f"trainium asr returned {resp.status}",
-                retryable=True,
-                provider_detail={"body": resp.data[:512].decode("utf-8", "replace")},
-            )
-        if resp.status >= 400:
-            raise EngineError(
-                "provider_invalid_response",
-                f"trainium asr returned {resp.status}",
-                provider_detail={"body": resp.data[:512].decode("utf-8", "replace")},
-            )
+        raise_for_status(resp, label="trainium asr")
 
         try:
             payload = json.loads(resp.data.decode("utf-8"))
@@ -128,10 +111,10 @@ class TrainiumAsrEngine(AsrEngine):
             engine=self.name,
             text=text,
             segments=segments,
-            metadata=EngineMetadata(
+            metadata=build_metadata(
                 model_id=self.model_id,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                request_id=req.request_id or str(uuid.uuid4()),
+                start_monotonic=start,
+                request_id=req.request_id,
                 extra={"endpoint": self.endpoint},
             ),
         )

@@ -10,16 +10,15 @@ Bedrock リージョンとモデル ID は環境変数で外から差し替え�
 from __future__ import annotations
 
 import json
-import os
 import time
-import uuid
 from typing import Any
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from contracts import EditRequest, EditResponse, EngineError, EngineMetadata
+from contracts import EditRequest, EditResponse, EngineError
 from engines.edit.base import ImageEditEngine
+from engines._common import build_metadata, env_required
 
 
 class BedrockEditEngine(ImageEditEngine):
@@ -32,24 +31,16 @@ class BedrockEditEngine(ImageEditEngine):
         model_id: str | None = None,
         engine_name: str | None = None,
     ) -> None:
-        region = os.environ.get("BEDROCK_REGION")
-        if not region:
-            raise EngineError("config_missing", "BEDROCK_REGION env var is required")
-        resolved_model_id = (
-            model_id
-            or os.environ.get("BEDROCK_EDIT_MODEL_ID")
-            or os.environ.get("NOVA_CANVAS_MODEL_ID")
-        )
-        if not resolved_model_id:
-            raise EngineError(
-                "config_missing",
-                "BEDROCK_EDIT_MODEL_ID env var is required",
+        self.region = env_required("BEDROCK_REGION")
+        if model_id:
+            self.model_id = model_id
+        else:
+            self.model_id = env_required(
+                "BEDROCK_EDIT_MODEL_ID", "NOVA_CANVAS_MODEL_ID"
             )
-        self.region = region
-        self.model_id = resolved_model_id
         if engine_name:
             self.name = engine_name
-        self._client = boto3.client("bedrock-runtime", region_name=region)
+        self._client = boto3.client("bedrock-runtime", region_name=self.region)
 
     def invoke(self, req: EditRequest) -> EditResponse:
         start = time.monotonic()
@@ -80,10 +71,10 @@ class BedrockEditEngine(ImageEditEngine):
         return EditResponse(
             engine=self.name,
             image_b64=out_b64,
-            metadata=EngineMetadata(
+            metadata=build_metadata(
                 model_id=self.model_id,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                request_id=req.request_id or str(uuid.uuid4()),
+                start_monotonic=start,
+                request_id=req.request_id,
                 extra={"bedrock_region": self.region},
             ),
         )

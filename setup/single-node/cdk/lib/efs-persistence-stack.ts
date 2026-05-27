@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as efs from 'aws-cdk-lib/aws-efs';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
 export interface EfsPersistenceStackProps extends cdk.StackProps {
@@ -100,6 +101,25 @@ export class EfsPersistenceStack extends cdk.Stack {
       //   aws efs delete-file-system --file-system-id <fs-...>
       removalPolicy: props.removalPolicy ?? cdk.RemovalPolicy.RETAIN,
     });
+
+    // ClientMount は NFS mount 自体に必要。 ClientWrite + ClientRootAccess
+    // だけだと "access denied by server while mounting" になるので明示する。
+    // AccessedViaMountTarget=true 条件で VPC 外からの mount を防ぐ。
+    this.fileSystem.addToResourcePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      principals: [new iam.AnyPrincipal()],
+      actions: [
+        'elasticfilesystem:ClientMount',
+        'elasticfilesystem:ClientWrite',
+        'elasticfilesystem:ClientRootAccess',
+      ],
+      resources: [this.fileSystem.fileSystemArn],
+      conditions: {
+        Bool: {
+          'elasticfilesystem:AccessedViaMountTarget': 'true',
+        },
+      },
+    }));
 
     if (props.project) cdk.Tags.of(this).add('Project', props.project);
     if (props.purpose) cdk.Tags.of(this).add('Purpose', props.purpose);

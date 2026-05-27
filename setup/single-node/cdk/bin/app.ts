@@ -24,6 +24,7 @@ const efsSubpath = app.node.tryGetContext('efsSubpath') || '/neuron-workspace';
 const installClaudeCode = app.node.tryGetContext('installClaudeCode') === 'true';
 const project = app.node.tryGetContext('project') || '';
 const purpose = app.node.tryGetContext('purpose') || '';
+const forceRecreateToken = app.node.tryGetContext('forceRecreateToken') || '';
 
 if (useCapacityBlock && useSpot) {
   throw new Error(
@@ -69,6 +70,7 @@ new NeuronCodeServerStack(app, stackName, {
   installClaudeCode,
   project: project || undefined,
   purpose: purpose || undefined,
+  forceRecreateToken: forceRecreateToken || undefined,
 });
 
 // ---------------------------------------------------------------------------

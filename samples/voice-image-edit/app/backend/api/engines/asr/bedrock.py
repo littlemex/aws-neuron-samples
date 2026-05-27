@@ -14,19 +14,17 @@ backend を切り替えられるが、現在は ``transcribe`` のみ実装済�
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import time
-import uuid
 
 from contracts import (
     AsrRequest,
     AsrResponse,
     AsrSegment,
     EngineError,
-    EngineMetadata,
 )
 from engines.asr.base import AsrEngine
+from engines._common import build_metadata, decode_audio_b64, env_required
 
 _PCM_MIME_PREFIX = "audio/pcm"
 
@@ -41,12 +39,7 @@ class BedrockAsrEngine(AsrEngine):
         backend: str | None = None,
         engine_name: str | None = None,
     ) -> None:
-        region = os.environ.get("BEDROCK_REGION") or os.environ.get("AWS_REGION")
-        if not region:
-            raise EngineError(
-                "config_missing", "BEDROCK_REGION env var is required"
-            )
-        self.region = region
+        self.region = env_required("BEDROCK_REGION", "AWS_REGION")
         self.backend = backend or os.environ.get(
             "BEDROCK_ASR_BACKEND", "transcribe"
         )
@@ -90,14 +83,7 @@ class BedrockAsrEngine(AsrEngine):
             )
         sample_rate = _extract_sample_rate(req.mime_type) or 16000
 
-        try:
-            audio_bytes = base64.b64decode(req.audio_b64, validate=True)
-        except (ValueError, TypeError) as exc:
-            raise EngineError(
-                "invalid_request", f"audio_b64 is not valid base64: {exc}"
-            ) from exc
-        if not audio_bytes:
-            raise EngineError("invalid_request", "audio_b64 decoded to empty bytes")
+        audio_bytes = decode_audio_b64(req.audio_b64)
 
         try:
             from amazon_transcribe.client import TranscribeStreamingClient
@@ -170,10 +156,10 @@ class BedrockAsrEngine(AsrEngine):
             engine=self.name,
             text=text,
             segments=segments,
-            metadata=EngineMetadata(
+            metadata=build_metadata(
                 model_id=self.model_id,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                request_id=req.request_id or str(uuid.uuid4()),
+                start_monotonic=start,
+                request_id=req.request_id,
                 extra={
                     "region": self.region,
                     "language": language,

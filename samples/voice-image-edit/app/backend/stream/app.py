@@ -201,6 +201,45 @@ async def _post_edit_api(
     return res.json()
 
 
+# CloudFront / ALB の idle timeout は 60s 程度。Trainium EDIT/VLM の long await 中に
+# 接続が idle になって切られないよう、long await を heartbeat 付きで包む。
+_HEARTBEAT_INTERVAL_S = float(os.environ.get("STREAM_HEARTBEAT_INTERVAL_S", "10"))
+
+
+async def _stage_with_heartbeat(coro, stage: str) -> AsyncIterator[Any]:
+    """coro を await しつつ、_HEARTBEAT_INTERVAL_S 間隔で stage_progress heartbeat を yield する。
+
+    最終的に coro の戻り値は ("result", value) として yield。例外時は ("error", exc)。
+    呼び元は (kind, payload) を受け取り、"heartbeat" は SSE bytes をそのまま yield、
+    "result"/"error" は処理を分岐する。
+    """
+    task = asyncio.create_task(coro)
+    try:
+        while True:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=_HEARTBEAT_INTERVAL_S)
+                yield ("result", result)
+                return
+            except asyncio.TimeoutError:
+                yield (
+                    "heartbeat",
+                    _sse_event(
+                        "stage_progress",
+                        {"stage": stage, "ts_ms": int(time.time() * 1000)},
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                yield ("error", exc)
+                return
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+
 async def _fetch_image_b64(client: httpx.AsyncClient, url: str) -> str:
     """presigned S3 GET を取得し base64 文字列として返す。"""
     import base64
@@ -230,50 +269,65 @@ async def _run_pipeline(req: PipelineRequest) -> AsyncIterator[bytes]:
     async with httpx.AsyncClient(http2=False) as client:
         # ---- Stage 2: VLM (instruction) ---------------------------------
         yield _sse_event("stage_start", {"stage": "vlm_instruction"})
-        try:
-            vlm_body: dict[str, Any] = {
-                "image_b64": req.image_b64,
-                "prompt": req.user_instruction,
-                "mode": "instruction",
-                "request_id": request_id,
-            }
-            if req.vlm_engine:
-                vlm_body["engine"] = req.vlm_engine
-            vlm_res = await _post_edit_api(client, "/vlm", vlm_body, _HTTP_TIMEOUT_VLM_S)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("pipeline vlm_instruction failed: %s", exc)
-            yield _sse_event("stage_error", _stage_error_payload("vlm_instruction", exc))
-            yield _sse_event("pipeline_complete", {"request_id": request_id})
-            return
+        vlm_body: dict[str, Any] = {
+            "image_b64": req.image_b64,
+            "prompt": req.user_instruction,
+            "mode": "instruction",
+            "request_id": request_id,
+        }
+        if req.vlm_engine:
+            vlm_body["engine"] = req.vlm_engine
+        vlm_res = None
+        async for kind, payload in _stage_with_heartbeat(
+            _post_edit_api(client, "/vlm", vlm_body, _HTTP_TIMEOUT_VLM_S),
+            "vlm_instruction",
+        ):
+            if kind == "heartbeat":
+                yield payload
+            elif kind == "error":
+                log.warning("pipeline vlm_instruction failed: %s", payload)
+                yield _sse_event("stage_error", _stage_error_payload("vlm_instruction", payload))
+                yield _sse_event("pipeline_complete", {"request_id": request_id})
+                return
+            else:
+                vlm_res = payload
 
-        edit_prompt = vlm_res.get("text") or ""
+        edit_prompt = (vlm_res or {}).get("text") or ""
         yield _sse_event(
             "stage_complete",
             {
                 "stage": "vlm_instruction",
-                "engine": vlm_res.get("engine"),
+                "engine": (vlm_res or {}).get("engine"),
                 "text": edit_prompt,
-                "metadata": vlm_res.get("metadata", {}),
+                "metadata": (vlm_res or {}).get("metadata", {}),
             },
         )
 
         # ---- Stage 3: EDIT ----------------------------------------------
         yield _sse_event("stage_start", {"stage": "edit"})
-        try:
-            edit_body: dict[str, Any] = {
-                "image_b64": req.image_b64,
-                "prompt": edit_prompt,
-                "request_id": request_id,
-            }
-            if req.edit_engine:
-                edit_body["engine"] = req.edit_engine
-            edit_res = await _post_edit_api(client, "/edit", edit_body, _HTTP_TIMEOUT_EDIT_S)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("pipeline edit failed: %s", exc)
-            yield _sse_event("stage_error", _stage_error_payload("edit", exc))
-            yield _sse_event("pipeline_complete", {"request_id": request_id})
-            return
+        edit_body: dict[str, Any] = {
+            "image_b64": req.image_b64,
+            "prompt": edit_prompt,
+            "request_id": request_id,
+        }
+        if req.edit_engine:
+            edit_body["engine"] = req.edit_engine
+        edit_res = None
+        async for kind, payload in _stage_with_heartbeat(
+            _post_edit_api(client, "/edit", edit_body, _HTTP_TIMEOUT_EDIT_S),
+            "edit",
+        ):
+            if kind == "heartbeat":
+                yield payload
+            elif kind == "error":
+                log.warning("pipeline edit failed: %s", payload)
+                yield _sse_event("stage_error", _stage_error_payload("edit", payload))
+                yield _sse_event("pipeline_complete", {"request_id": request_id})
+                return
+            else:
+                edit_res = payload
 
+        edit_res = edit_res or {}
         image_url = edit_res.get("image_url")
         yield _sse_event(
             "stage_complete",
@@ -302,31 +356,50 @@ async def _run_pipeline(req: PipelineRequest) -> AsyncIterator[bytes]:
             yield _sse_event("pipeline_complete", {"request_id": request_id})
             return
 
-        try:
-            # P10 で /api/edit/* が EC2 systemd FastAPI に移ったので body 上限はなくなった。
-            # AFTER 画像 (Nova Canvas 1024px PNG) をそのまま base64 で review に渡す。
-            after_b64 = await _fetch_image_b64(client, image_url)
-            review_body: dict[str, Any] = {
-                "image_b64": after_b64,
-                "prompt": req.user_instruction,
-                "mode": "review",
-                "request_id": request_id,
-            }
-            if req.vlm_engine:
-                review_body["engine"] = req.vlm_engine
-            review_res = await _post_edit_api(client, "/vlm", review_body, _HTTP_TIMEOUT_VLM_S)
-            yield _sse_event(
-                "stage_complete",
-                {
-                    "stage": "vlm_review",
-                    "engine": review_res.get("engine"),
-                    "text": review_res.get("text") or "",
-                    "metadata": review_res.get("metadata", {}),
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("pipeline vlm_review failed: %s", exc)
-            yield _sse_event("stage_error", _stage_error_payload("vlm_review", exc))
+        # AFTER 画像取得 → review POST。両方 heartbeat を回す。
+        after_b64: Optional[str] = None
+        async for kind, payload in _stage_with_heartbeat(
+            _fetch_image_b64(client, image_url), "vlm_review"
+        ):
+            if kind == "heartbeat":
+                yield payload
+            elif kind == "error":
+                log.warning("pipeline vlm_review fetch failed: %s", payload)
+                yield _sse_event("stage_error", _stage_error_payload("vlm_review", payload))
+                yield _sse_event("pipeline_complete", {"request_id": request_id})
+                return
+            else:
+                after_b64 = payload
+
+        review_body: dict[str, Any] = {
+            "image_b64": after_b64 or "",
+            "prompt": req.user_instruction,
+            "mode": "review",
+            "request_id": request_id,
+        }
+        if req.vlm_engine:
+            review_body["engine"] = req.vlm_engine
+        async for kind, payload in _stage_with_heartbeat(
+            _post_edit_api(client, "/vlm", review_body, _HTTP_TIMEOUT_VLM_S),
+            "vlm_review",
+        ):
+            if kind == "heartbeat":
+                yield payload
+            elif kind == "error":
+                log.warning("pipeline vlm_review failed: %s", payload)
+                yield _sse_event("stage_error", _stage_error_payload("vlm_review", payload))
+                break
+            else:
+                review_res = payload or {}
+                yield _sse_event(
+                    "stage_complete",
+                    {
+                        "stage": "vlm_review",
+                        "engine": review_res.get("engine"),
+                        "text": review_res.get("text") or "",
+                        "metadata": review_res.get("metadata", {}),
+                    },
+                )
 
         yield _sse_event("pipeline_complete", {"request_id": request_id})
 

@@ -64,7 +64,7 @@ Trainium / GPU で 3 モデルを自前で立てる場合、各モデルサー�
 
 | 環境変数 | 用途 | 例 |
 |---|---|---|
-| `TRAINIUM_ASR_URL` | Whisper サーバの WS 入口 | `ws://internal-...:8765/whisper-neuron/ws` |
+| `TRAINIUM_ASR_URL` | Whisper サーバの HTTP `/transcribe` endpoint | `http://internal-...:8765/transcribe` |
 | `TRAINIUM_VLM_URL` | Qwen3-VL の OpenAI 互換 endpoint | `http://internal-...:8090/v1/chat/completions` |
 | `TRAINIUM_EDIT_URL` | Qwen-Image-Edit の `/edit` endpoint | `http://internal-...:8081/edit` |
 
