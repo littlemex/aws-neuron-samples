@@ -179,6 +179,11 @@ export class AlbBackendStack extends cdk.Stack {
       // Drop invalid HTTP headers so a malformed client cannot smuggle
       // X-Origin-Verify into a request that also bypasses CloudFront.
       dropInvalidHeaderFields: true,
+      // SSE pipeline (/stream/pipeline) には Trainium EDIT/VLM の長い await
+      // (60-120s) が含まれるため、ALB default 60s では idle で切られる。
+      // stream backend が 10s 間隔の heartbeat を吐くので 60s でも理屈上は
+      // 持つが、heartbeat の 1 拍ずれ程度の余裕を持たせて 300s に上げる。
+      idleTimeout: cdk.Duration.seconds(300),
     });
 
     // ---- EC2 SG: open one port per route from the ALB SG only ----

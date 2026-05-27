@@ -108,6 +108,11 @@ export class CloudFrontFrontendStack extends cdk.Stack {
       customHeaders: {
         'X-Origin-Verify': props.originVerifySecret.secretValue.unsafeUnwrap(),
       },
+      // /stream/pipeline は Trainium EDIT/VLM の長い await (60-120s) を含み、
+      // CF default 30s では origin read timeout で切られる。stream backend が
+      // 10s 間隔で stage_progress heartbeat を吐くので、CF 上限の 60s で十分
+      // (本番で更に伸ばす場合は service quota 引き上げが必要)。
+      readTimeout: cdk.Duration.seconds(60),
     });
 
     // ---------------------------------------------------------------

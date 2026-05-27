@@ -77,6 +77,32 @@ Options:
                                          skills) into ~/.claude for the code-server user.
                                          Default: off.
     --show-info                          Show connection info for an already-deployed stack
+    --recover                            Recover an existing stack in place without changing
+                                         instance type / purchase mode. Heals:
+                                           - stopped instance      -> start (Spot retry)
+                                           - SG replaced by AWS    -> re-attach the CDK SG
+                                           - EIP missing           -> allocate / reuse
+                                           - terminated instance   -> bump LT to force replace
+                                           - filesystem persistence -> rerun setup-persistence.sh
+                                         Combine with --reallocate-eip to roll the public IP.
+    --reallocate-eip                     Release the existing EIP and allocate a new one
+                                         (use with --recover).
+    --auto-heal-stack                    During a normal deploy, automatically delete a stack
+                                         that is stuck in ROLLBACK_COMPLETE / *_FAILED and
+                                         recreate it. Off by default — without this flag the
+                                         script aborts so you can inspect the failure first.
+    --force-recreate                     Force the EC2 instance to be replaced on the next
+                                         deploy even when no relevant context has changed.
+                                         Internally bumps the launch-template version
+                                         description so CFN sees a diff. Useful when the
+                                         current instance is terminated but the stack still
+                                         records its old InstanceId.
+    --migrate-from STACK                 (Reserved) Source stack name to migrate persistence
+                                         from. Currently a no-op placeholder; today the
+                                         persistence stack is shared via --efs-id, so simply
+                                         pass the same --efs-id value to a new stack to keep
+                                         data. This flag is reserved for future moves between
+                                         independent EFS file systems.
     --port-forward                       Open SSM port forwards against an existing stack
     -p, --ports MAP                      Port forward map (comma-separated)
                                          format: LOCAL:REMOTE[,LOCAL:REMOTE...]
@@ -119,6 +145,21 @@ Examples:
 
     # Show connection info for an existing stack
     $0 -r us-west-2 --show-info --stack-name neuron-training-a
+
+    # Switch an existing trn2.3xlarge stack to trn2.48xlarge (CFN replaces the EC2)
+    $0 -r us-east-2 --stack-name neuron-ws \\
+       -t trn2.48xlarge --use-capacity-block --slot use2-48-2026-05-26
+
+    # Switch from Capacity Block back to Spot, keeping the same EFS
+    $0 -r us-east-2 --stack-name neuron-ws \\
+       -t trn2.48xlarge --use-spot --spot-interruption-behavior stop
+
+    # Recover a stack in place (terminated instance, SG hijacked, EIP missing)
+    # without changing instance type or purchase mode
+    $0 -r us-east-2 --stack-name neuron-ws --recover
+
+    # Recover and rotate the EIP at the same time
+    $0 -r us-east-2 --stack-name neuron-ws --recover --reallocate-eip
 
     # Forward a single port (local 3000 -> instance 80 which is nginx -> code-server)
     $0 -r us-west-2 --port-forward --stack-name neuron-training-a -p 3000:80
@@ -173,6 +214,11 @@ SKIP_SETUP=false
 INSTALL_CLAUDE_CODE=false
 SHOW_INFO=false
 DESTROY=false
+RECOVER=false
+REALLOCATE_EIP=false
+AUTO_HEAL_STACK=false
+FORCE_RECREATE=false
+MIGRATE_FROM=""
 PORT_FORWARD=false
 PORTS=""
 PROFILE_ARG=""
@@ -303,6 +349,26 @@ while [[ $# -gt 0 ]]; do
         --destroy)
             DESTROY=true
             shift
+            ;;
+        --recover)
+            RECOVER=true
+            shift
+            ;;
+        --reallocate-eip)
+            REALLOCATE_EIP=true
+            shift
+            ;;
+        --auto-heal-stack)
+            AUTO_HEAL_STACK=true
+            shift
+            ;;
+        --force-recreate)
+            FORCE_RECREATE=true
+            shift
+            ;;
+        --migrate-from)
+            MIGRATE_FROM="$2"
+            shift 2
             ;;
         --create-efs)
             # Provision EFS via CDK as a separate stack `<stackName>-efs`,
@@ -906,6 +972,356 @@ if [[ "$DESTROY" == true ]]; then
     exit $RC
 fi
 
+# ----------------------------------------------------------------------
+# Helper: read CFN stack status (returns "MISSING" if the stack is gone).
+# ----------------------------------------------------------------------
+get_stack_status() {
+    local sn="$1" rg="$2"
+    aws cloudformation describe-stacks --stack-name "$sn" --region "$rg" \
+        --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "MISSING"
+}
+
+# ----------------------------------------------------------------------
+# Helper: read context that an existing stack was deployed with so we
+# can show a clear transition log (e.g. trn2.3xlarge -> trn2.48xlarge,
+# spot -> capacity-block).
+#
+# We read it from instance tags rather than CFN parameters because the
+# CDK app does not surface them as CFN parameters (they ride through as
+# context values, which CFN does not preserve).
+# ----------------------------------------------------------------------
+describe_existing_shape() {
+    local sn="$1" rg="$2"
+    local iid
+    iid=$(aws cloudformation describe-stacks --stack-name "$sn" --region "$rg" \
+        --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' \
+        --output text 2>/dev/null)
+    [[ -z "$iid" ]] || [[ "$iid" == "None" ]] && return 0
+    aws ec2 describe-instances --instance-ids "$iid" --region "$rg" \
+        --query 'Reservations[0].Instances[0].{InstanceType: InstanceType, MarketType: SpotInstanceRequestId && `spot` || (CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId && `capacity-block` || `on-demand`)}' \
+        --output json 2>/dev/null
+}
+
+# ----------------------------------------------------------------------
+# Pre-deploy: heal a stuck stack so the new context can land cleanly.
+#
+# Treatment:
+#   ROLLBACK_COMPLETE / CREATE_FAILED -> delete + wait, then redeploy
+#   ROLLBACK_FAILED                   -> abort (manual investigation needed)
+#   *_IN_PROGRESS                     -> wait for completion
+#
+# Gated behind --auto-heal-stack so we never silently delete something
+# the operator may want to inspect.
+# ----------------------------------------------------------------------
+maybe_heal_stack() {
+    if [[ "$RECOVER" == true ]] || [[ "$DESTROY" == true ]] || \
+       [[ "$SHOW_INFO" == true ]] || [[ "$PORT_FORWARD" == true ]]; then
+        return 0
+    fi
+    local status
+    status=$(get_stack_status "$STACK_NAME" "$REGION")
+    case "$status" in
+        MISSING|CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)
+            return 0
+            ;;
+        ROLLBACK_COMPLETE|CREATE_FAILED|DELETE_FAILED)
+            if [[ "$AUTO_HEAL_STACK" != true ]]; then
+                echo -e "${RED}[NG] Stack '$STACK_NAME' is in $status — cannot deploy on top of it${NC}" >&2
+                echo -e "${YELLOW}     Re-run with --auto-heal-stack to delete and recreate, or${NC}" >&2
+                echo -e "${YELLOW}     run: $0 --destroy --stack-name $STACK_NAME -r $REGION${NC}" >&2
+                exit 1
+            fi
+            echo -e "${YELLOW}[HEAL] Stack '$STACK_NAME' is in $status — deleting before redeploy${NC}"
+            aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$REGION" || true
+            ;;
+        *_IN_PROGRESS)
+            echo -e "${YELLOW}[HEAL] Stack '$STACK_NAME' is $status — waiting for completion${NC}"
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+                sleep 30
+                local s
+                s=$(get_stack_status "$STACK_NAME" "$REGION")
+                echo "    wait $i: $s"
+                case "$s" in
+                    *_IN_PROGRESS) ;;
+                    *) status="$s"; break ;;
+                esac
+            done
+            # Re-evaluate once more after the wait loop.
+            maybe_heal_stack
+            return 0
+            ;;
+        *)
+            echo -e "${YELLOW}[WARN] Unfamiliar stack status: $status (continuing)${NC}"
+            ;;
+    esac
+}
+
+# ----------------------------------------------------------------------
+# Recover mode (--recover)
+# ----------------------------------------------------------------------
+# Heal an existing stack in place WITHOUT changing instance type or
+# purchase mode. Folds the responsibilities of the legacy recover.sh
+# into deploy.sh so a single command can roll the box back to a healthy
+# state after AWS-side disruption (Spot stop, mitigation SG, EIP
+# detached, terminated instance, persistence wiped).
+#
+# Steps:
+#   1. Stack health -> if MISSING / ROLLBACK_COMPLETE, fall through to
+#      a plain --auto-heal-stack deploy with the current shape.
+#   2. Read current InstanceId + EC2 SG from CFN outputs.
+#   3. Diagnose instance state (running / stopped / terminated) and SG
+#      drift.
+#   4. stopped       -> start (Spot retry).
+#      terminated    -> bump LT version via cdk deploy (FORCE_RECREATE).
+#   5. SG drift      -> modify-instance-attribute back to the CDK SG.
+#   6. EIP missing   -> allocate or reuse a free one.
+#      --reallocate-eip -> release current EIP then allocate.
+#   7. SSM Online + nginx health probe.
+#   8. setup-persistence.sh re-run via SSM (rebuilds NVMe / EFS / NEFF
+#      cache symlinks after stop/start).
+# ----------------------------------------------------------------------
+if [[ "$RECOVER" == true ]]; then
+    echo -e "${BLUE}=========================================${NC}"
+    echo -e "${BLUE}[RECOVER] Stack '$STACK_NAME' (region: $REGION)${NC}"
+    echo -e "${BLUE}=========================================${NC}"
+
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    PERSIST_LOCAL="${SCRIPT_DIR}/setup-persistence.sh"
+
+    STACK_STATUS=$(get_stack_status "$STACK_NAME" "$REGION")
+    echo "  Stack status: $STACK_STATUS"
+
+    case "$STACK_STATUS" in
+        MISSING|ROLLBACK_COMPLETE|CREATE_FAILED|DELETE_FAILED)
+            echo -e "${YELLOW}[RECOVER] Stack is unhealthy/missing — falling through to a fresh deploy${NC}"
+            echo -e "${YELLOW}          (auto-heal-stack will be auto-enabled for this run)${NC}"
+            AUTO_HEAL_STACK=true
+            # Allow the rest of deploy.sh to run with the current --instance-type / --use-* flags.
+            ;;
+        *_IN_PROGRESS)
+            echo -e "${YELLOW}[RECOVER] Stack is $STACK_STATUS; waiting for completion before recovery${NC}"
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                sleep 30
+                S=$(get_stack_status "$STACK_NAME" "$REGION")
+                echo "    wait $i: $S"
+                case "$S" in *_IN_PROGRESS) ;; *) STACK_STATUS="$S"; break ;; esac
+            done
+            ;;
+    esac
+
+    if [[ "$STACK_STATUS" == CREATE_COMPLETE || "$STACK_STATUS" == UPDATE_COMPLETE \
+       || "$STACK_STATUS" == UPDATE_ROLLBACK_COMPLETE || "$STACK_STATUS" == IMPORT_COMPLETE ]]; then
+
+        INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text)
+        CDK_SG_ID=$(aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
+            --query 'StackResources[?ResourceType==`AWS::EC2::SecurityGroup`].PhysicalResourceId | [0]' --output text)
+        STACK_EFS_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`EfsId`].OutputValue' --output text 2>/dev/null)
+
+        echo "  Instance ID:  $INSTANCE_ID"
+        echo "  CDK SG:       $CDK_SG_ID"
+        [[ -n "$STACK_EFS_ID" ]] && [[ "$STACK_EFS_ID" != "None" ]] && [[ "$STACK_EFS_ID" != "none" ]] && \
+            echo "  EFS:          $STACK_EFS_ID"
+
+        # Diagnose
+        INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --output json 2>/dev/null)
+        STATE=$(echo "$INSTANCE_INFO" | jq -r '.Reservations[0].Instances[0].State.Name // "unknown"')
+        CURRENT_SGS=$(echo "$INSTANCE_INFO" | jq -r '.Reservations[0].Instances[0].SecurityGroups[].GroupId // empty' | sort | tr '\n' ' ')
+
+        echo "  State:        ${STATE:-unknown}"
+        echo "  Current SG:   ${CURRENT_SGS:-(none)}"
+
+        # Step: terminated instance -> rerun cdk deploy to replace.
+        if [[ "$STATE" == "terminated" ]] || [[ "$STATE" == "shutting-down" ]] || [[ "$STATE" == "unknown" ]]; then
+            echo -e "${YELLOW}[RECOVER] Instance is $STATE — falling through to cdk deploy to replace${NC}"
+            FORCE_RECREATE=true
+            # The rest of deploy.sh will run cdk deploy with current flags.
+            # CFN compares the LT version (which CDK regenerates each synth
+            # because the user-data render is deterministic but the LT
+            # depends on the CFN logical id; CFN sees the EC2 backed by a
+            # terminated instance and replaces it).
+        else
+            # Step: stopped -> start (Spot retry).
+            if [[ "$STATE" == "stopped" ]]; then
+                echo -e "${BLUE}[RECOVER] Instance is stopped — starting (Spot retry logic)${NC}"
+                START_OK=false
+                for attempt in 1 2 3 4 5 6 7 8; do
+                    if aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null 2>&1; then
+                        echo "    start-instances attempt $attempt: OK"
+                        START_OK=true
+                        break
+                    else
+                        echo "    start-instances attempt $attempt: not yet, retrying in 10s"
+                        sleep 10
+                    fi
+                done
+                if [[ "$START_OK" != true ]]; then
+                    echo -e "${RED}[NG] start-instances failed; check the Spot request state manually${NC}"
+                    aws ec2 describe-spot-instance-requests --region "$REGION" \
+                        --filters "Name=instance-id,Values=$INSTANCE_ID" \
+                        --query 'SpotInstanceRequests[].[SpotInstanceRequestId,State,Status.Code]' \
+                        --output table || true
+                    exit 1
+                fi
+                for i in 1 2 3 4 5 6 7 8 9 10; do
+                    sleep 10
+                    S=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+                        --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)
+                    echo "    wait $i: state=$S"
+                    [[ "$S" == "running" ]] && break
+                done
+            fi
+
+            # Step: SG drift -> re-attach the CDK SG.
+            if [[ -n "$CDK_SG_ID" ]] && [[ "$CDK_SG_ID" != "None" ]] && \
+               [[ "$CURRENT_SGS" != *"$CDK_SG_ID"* ]]; then
+                echo -e "${YELLOW}[RECOVER] SG drifted (mitigation policy?) — re-attaching $CDK_SG_ID${NC}"
+                aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --region "$REGION" \
+                    --groups "$CDK_SG_ID"
+                echo "    [OK] SG re-attached"
+            fi
+
+            # Step: EIP allocate / reuse / reallocate.
+            ASSOCIATED_EIP=$(aws ec2 describe-addresses --region "$REGION" \
+                --filters "Name=instance-id,Values=$INSTANCE_ID" \
+                --query 'Addresses[0].PublicIp' --output text 2>/dev/null || echo "None")
+            if [[ "$REALLOCATE_EIP" == true ]] && [[ "$ASSOCIATED_EIP" != "None" ]]; then
+                echo -e "${BLUE}[RECOVER] Releasing existing EIP ($ASSOCIATED_EIP)${NC}"
+                OLD_ALLOC=$(aws ec2 describe-addresses --region "$REGION" \
+                    --filters "Name=instance-id,Values=$INSTANCE_ID" \
+                    --query 'Addresses[0].AllocationId' --output text)
+                OLD_ASSOC=$(aws ec2 describe-addresses --region "$REGION" \
+                    --filters "Name=instance-id,Values=$INSTANCE_ID" \
+                    --query 'Addresses[0].AssociationId' --output text)
+                [[ "$OLD_ASSOC" != "None" ]] && \
+                    aws ec2 disassociate-address --region "$REGION" --association-id "$OLD_ASSOC" >/dev/null
+                aws ec2 release-address --region "$REGION" --allocation-id "$OLD_ALLOC" >/dev/null
+                ASSOCIATED_EIP="None"
+            fi
+            if [[ "$ASSOCIATED_EIP" == "None" ]] || [[ "$ASSOCIATED_EIP" == "null" ]]; then
+                FREE_EIP=$(aws ec2 describe-addresses --region "$REGION" \
+                    --query 'Addresses[?AssociationId==null] | [0].[AllocationId,PublicIp]' --output text 2>/dev/null)
+                FREE_ALLOC=$(echo "$FREE_EIP" | awk '{print $1}')
+                FREE_IP=$(echo "$FREE_EIP" | awk '{print $2}')
+                if [[ -n "$FREE_ALLOC" ]] && [[ "$FREE_ALLOC" != "None" ]]; then
+                    echo -e "${BLUE}[RECOVER] Reusing free EIP $FREE_IP (alloc=$FREE_ALLOC)${NC}"
+                    ALLOC_ID="$FREE_ALLOC"
+                else
+                    echo -e "${BLUE}[RECOVER] Allocating new EIP${NC}"
+                    ALLOC_ID=$(aws ec2 allocate-address --region "$REGION" --domain vpc \
+                        --query 'AllocationId' --output text)
+                fi
+                aws ec2 associate-address --region "$REGION" --instance-id "$INSTANCE_ID" \
+                    --allocation-id "$ALLOC_ID" >/dev/null
+                sleep 3
+                ASSOCIATED_EIP=$(aws ec2 describe-addresses --region "$REGION" \
+                    --filters "Name=instance-id,Values=$INSTANCE_ID" \
+                    --query 'Addresses[0].PublicIp' --output text)
+                echo "    [OK] EIP associated: $ASSOCIATED_EIP"
+            else
+                echo "  EIP:          $ASSOCIATED_EIP (kept)"
+            fi
+
+            # Step: SSM Online probe (agent comes back ~1 min after start).
+            echo -e "${BLUE}[RECOVER] Waiting for SSM agent to come Online${NC}"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+                sleep 10
+                P=$(aws ssm describe-instance-information --region "$REGION" \
+                    --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+                    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)
+                echo "    wait $i: SSM=${P:-not-registered}"
+                [[ "$P" == "Online" ]] && break
+            done
+
+            # Step: setup-persistence.sh (idempotent rebuild of NVMe / EFS / NEFF cache).
+            if [[ -n "$STACK_EFS_ID" ]] && [[ "$STACK_EFS_ID" != "None" ]] && \
+               [[ "$STACK_EFS_ID" != "none" ]] && [[ -f "$PERSIST_LOCAL" ]]; then
+                echo -e "${BLUE}[RECOVER] Re-running setup-persistence.sh${NC}"
+                PERSIST_B64=$(base64 < "$PERSIST_LOCAL" | tr -d '\n')
+                EFS_SUBPATH_VALUE="${EFS_SUBPATH:-/neuron-workspace}"
+                PERSIST_CMD_ID=$(aws ssm send-command --region "$REGION" \
+                    --instance-ids "$INSTANCE_ID" \
+                    --document-name AWS-RunShellScript \
+                    --parameters "commands=[\"bash -c 'echo ${PERSIST_B64} | base64 -d > /tmp/setup-persistence.sh && chmod +x /tmp/setup-persistence.sh && EFS_ID=${STACK_EFS_ID} EFS_SUBPATH=${EFS_SUBPATH_VALUE} AWS_REGION=${REGION} bash /tmp/setup-persistence.sh 2>&1 | tail -40'\"]" \
+                    --query 'Command.CommandId' --output text 2>/dev/null)
+                if [[ -n "$PERSIST_CMD_ID" ]]; then
+                    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                        sleep 10
+                        PS=$(aws ssm get-command-invocation --region "$REGION" \
+                            --command-id "$PERSIST_CMD_ID" --instance-id "$INSTANCE_ID" \
+                            --query 'Status' --output text 2>/dev/null)
+                        [[ "$PS" == "Success" || "$PS" == "Failed" ]] && break
+                    done
+                    PO=$(aws ssm get-command-invocation --region "$REGION" \
+                        --command-id "$PERSIST_CMD_ID" --instance-id "$INSTANCE_ID" \
+                        --query 'StandardOutputContent' --output text 2>/dev/null)
+                    if [[ "$PS" == "Success" ]]; then
+                        echo -e "    ${GREEN}[OK] setup-persistence.sh completed${NC}"
+                        echo "$PO" | grep -E "WRITE OK|DONE" | sed 's/^/    /' || true
+                    else
+                        echo -e "    ${YELLOW}[WARN] setup-persistence.sh status=$PS${NC}"
+                        echo "$PO" | tail -10 | sed 's/^/    /'
+                    fi
+                fi
+            fi
+
+            echo ""
+            echo -e "${GREEN}=========================================${NC}"
+            echo -e "${GREEN}[OK] Recovery complete${NC}"
+            echo -e "${GREEN}=========================================${NC}"
+            echo "  Instance ID:  $INSTANCE_ID"
+            echo "  Region:       $REGION"
+            [[ -n "$ASSOCIATED_EIP" && "$ASSOCIATED_EIP" != "None" ]] && \
+                echo "  Public IP:    $ASSOCIATED_EIP"
+            echo ""
+            echo "  Re-run with the same command to recover idempotently."
+            echo "  To rotate the public IP next time:    $0 --recover --reallocate-eip --stack-name $STACK_NAME -r $REGION"
+            echo "  To switch instance shape (e.g. 3x -> 48x):"
+            echo "    $0 --stack-name $STACK_NAME -r $REGION -t trn2.48xlarge --use-capacity-block --slot <slot>"
+            exit 0
+        fi
+    fi
+    # Fall through to a normal deploy when the stack is missing/unhealthy
+    # or when we've decided to force-recreate the EC2 via cdk.
+fi
+
+# ----------------------------------------------------------------------
+# Pre-deploy: heal a stuck stack so the new context can land cleanly.
+# Runs unconditionally for normal deploys; gated by --auto-heal-stack
+# when the stack is in ROLLBACK_COMPLETE / CREATE_FAILED / DELETE_FAILED.
+# ----------------------------------------------------------------------
+maybe_heal_stack
+
+# ----------------------------------------------------------------------
+# Transition log: show what shape the stack is moving from / to.
+# Helps the operator catch unintended changes (e.g. wrong instance type
+# left in the env) before CFN actually starts replacing the instance.
+# ----------------------------------------------------------------------
+EXISTING_SHAPE=""
+if [[ "$(get_stack_status "$STACK_NAME" "$REGION")" =~ ^(CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)$ ]]; then
+    EXISTING_INSTANCE=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text 2>/dev/null)
+    if [[ -n "$EXISTING_INSTANCE" ]] && [[ "$EXISTING_INSTANCE" != "None" ]]; then
+        EX_INFO=$(aws ec2 describe-instances --instance-ids "$EXISTING_INSTANCE" --region "$REGION" --output json 2>/dev/null)
+        EX_TYPE=$(echo "$EX_INFO" | jq -r '.Reservations[0].Instances[0].InstanceType // "unknown"')
+        EX_MARKET=$(echo "$EX_INFO" | jq -r '
+            .Reservations[0].Instances[0] |
+            if .SpotInstanceRequestId then "spot"
+            elif (.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId // "") != "" then "capacity-block"
+            else "on-demand" end' 2>/dev/null)
+        WANTED_MARKET="on-demand"
+        [[ "$USE_CAPACITY_BLOCK" == true ]] && WANTED_MARKET="capacity-block"
+        [[ "$USE_SPOT" == true ]] && WANTED_MARKET="spot"
+        EXISTING_SHAPE="$EX_TYPE/$EX_MARKET"
+        echo -e "${BLUE}[TRANSITION] $EX_TYPE/$EX_MARKET -> $INSTANCE_TYPE/$WANTED_MARKET${NC}"
+        if [[ "$EX_TYPE" != "$INSTANCE_TYPE" ]] || [[ "$EX_MARKET" != "$WANTED_MARKET" ]]; then
+            echo -e "${YELLOW}             CFN will REPLACE the EC2 instance (NVMe wiped, EFS preserved).${NC}"
+        fi
+    fi
+fi
+
 # Build CDK context parameters
 CDK_PARAMS=()
 CDK_PARAMS+=("-c" "stackName=$STACK_NAME")
@@ -1010,6 +1426,18 @@ fi
 
 if [[ "$INSTALL_CLAUDE_CODE" == true ]]; then
     CDK_PARAMS+=("-c" "installClaudeCode=true")
+fi
+
+# When --force-recreate is set (or --recover detected a terminated EC2),
+# inject a fresh timestamp as the LT versionDescription. CFN sees this
+# as a diff on the LT and replaces the EC2 instance even when nothing
+# else changed. Without this, a stack that "remembers" a now-terminated
+# EC2 would not get a new EC2 because the synthesised template is
+# identical to the deployed one.
+if [[ "$FORCE_RECREATE" == true ]]; then
+    FORCE_RECREATE_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)"
+    CDK_PARAMS+=("-c" "forceRecreateToken=$FORCE_RECREATE_TOKEN")
+    echo -e "${YELLOW}[FORCE-RECREATE] Bumping LT versionDescription to $FORCE_RECREATE_TOKEN${NC}"
 fi
 
 echo -e "${BLUE}[BUILD] Compiling CDK app...${NC}"
