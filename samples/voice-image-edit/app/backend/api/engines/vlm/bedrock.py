@@ -16,17 +16,21 @@
 """
 from __future__ import annotations
 
-import base64
 import os
 import time
-import uuid
 from typing import Any
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
-from contracts import EngineError, EngineMetadata, VlmRequest, VlmResponse
+from contracts import EngineError, VlmRequest, VlmResponse
 from engines.vlm.base import VlmEngine
+from engines._common import (
+    build_metadata,
+    decode_image_b64,
+    env_required,
+    guess_image_format,
+)
 
 
 _DEFAULT_INSTRUCTION_PROMPT = (
@@ -56,36 +60,21 @@ class BedrockVlmEngine(VlmEngine):
         model_id: str | None = None,
         engine_name: str | None = None,
     ) -> None:
-        region = os.environ.get("BEDROCK_REGION") or os.environ.get("AWS_REGION")
-        if not region:
-            raise EngineError(
-                "config_missing", "BEDROCK_REGION env var is required"
-            )
-        resolved_model_id = model_id or os.environ.get("BEDROCK_VLM_MODEL_ID")
-        if not resolved_model_id:
-            raise EngineError(
-                "config_missing",
-                "BEDROCK_VLM_MODEL_ID env var is required",
-            )
-        self.region = region
-        self.model_id = resolved_model_id
+        self.region = env_required("BEDROCK_REGION", "AWS_REGION")
+        if model_id:
+            self.model_id = model_id
+        else:
+            self.model_id = env_required("BEDROCK_VLM_MODEL_ID")
         if engine_name:
             self.name = engine_name
-        self._client = boto3.client("bedrock-runtime", region_name=region)
+        self._client = boto3.client("bedrock-runtime", region_name=self.region)
 
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
-        try:
-            image_bytes = base64.b64decode(req.image_b64, validate=True)
-        except (ValueError, TypeError) as exc:
-            raise EngineError(
-                "invalid_request", f"image_b64 is not valid base64: {exc}"
-            ) from exc
-        if not image_bytes:
-            raise EngineError("invalid_request", "image_b64 decoded to empty bytes")
+        image_bytes = decode_image_b64(req.image_b64)
 
         system_prompt = _resolve_system_prompt(req.mode)
-        image_format = _guess_image_format(image_bytes)
+        image_format = guess_image_format(image_bytes)
 
         try:
             resp = self._client.converse(
@@ -126,10 +115,10 @@ class BedrockVlmEngine(VlmEngine):
         return VlmResponse(
             engine=self.name,
             text=text,
-            metadata=EngineMetadata(
+            metadata=build_metadata(
                 model_id=self.model_id,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                request_id=req.request_id or str(uuid.uuid4()),
+                start_monotonic=start,
+                request_id=req.request_id,
                 extra={
                     "region": self.region,
                     "mode": req.mode,
@@ -148,20 +137,6 @@ def _resolve_system_prompt(mode: str) -> str:
         os.environ.get("VLM_INSTRUCTION_PROMPT_OVERRIDE")
         or _DEFAULT_INSTRUCTION_PROMPT
     )
-
-
-def _guess_image_format(image_bytes: bytes) -> str:
-    """Bedrock Converse API が受ける format string を magic byte から判定する。"""
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return "jpeg"
-    if image_bytes.startswith(b"GIF87a") or image_bytes.startswith(b"GIF89a"):
-        return "gif"
-    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
-        return "webp"
-    # 不明な場合は png を仮定 (Bedrock 側で reject されたら provider_error で返る)
-    return "png"
 
 
 def _extract_text(resp: dict[str, Any]) -> str:

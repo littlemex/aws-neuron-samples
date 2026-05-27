@@ -32,6 +32,7 @@ from typing import Any
 
 import boto3
 import uvicorn
+from botocore.config import Config as BotoConfig
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -50,7 +51,23 @@ _EDIT_RESULT_BUCKET = os.environ.get("EDIT_RESULT_BUCKET", "")
 _EDIT_RESULT_TTL = int(os.environ.get("EDIT_RESULT_TTL_SECONDS", "900"))
 _EDIT_RESULT_PREFIX = os.environ.get("EDIT_RESULT_PREFIX", "edit-results/")
 # boto3 client はプロセス起動時に 1 度だけ作る (uvicorn worker ごとの cold start 相当)。
-_s3_client = boto3.client("s3") if _EDIT_RESULT_BUCKET else None
+# SigV4 (s3v4) を明示。STS 一時クレデンシャル (x-amz-security-token) で presigned URL を発行する場合、
+# us-east-2 などの新しいリージョンは SigV4 のみ受け付け、SigV2 (AWSAccessKeyId=/Signature=) は 400 を返す。
+_S3_REGION = (
+    os.environ.get("EDIT_RESULT_REGION")
+    or os.environ.get("AWS_REGION")
+    or os.environ.get("AWS_DEFAULT_REGION")
+    or None
+)
+_s3_client = (
+    boto3.client(
+        "s3",
+        region_name=_S3_REGION,
+        config=BotoConfig(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+    )
+    if _EDIT_RESULT_BUCKET
+    else None
+)
 
 
 app = FastAPI(

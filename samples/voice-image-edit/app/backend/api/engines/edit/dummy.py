@@ -8,12 +8,12 @@ from __future__ import annotations
 import base64
 import io
 import time
-import uuid
 
 from PIL import Image, ImageDraw, ImageFont
 
-from contracts import EditRequest, EditResponse, EngineError, EngineMetadata
+from contracts import EditRequest, EditResponse, EngineError
 from engines.edit.base import ImageEditEngine
+from engines._common import build_metadata
 
 
 class DummyEditEngine(ImageEditEngine):
@@ -43,10 +43,10 @@ class DummyEditEngine(ImageEditEngine):
         return EditResponse(
             engine=self.name,
             image_b64=out_b64,
-            metadata=EngineMetadata(
+            metadata=build_metadata(
                 model_id=self.model_id,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                request_id=req.request_id or str(uuid.uuid4()),
+                start_monotonic=start,
+                request_id=req.request_id,
                 extra={"simulated_latency_ms": self.simulate_latency_ms},
             ),
         )

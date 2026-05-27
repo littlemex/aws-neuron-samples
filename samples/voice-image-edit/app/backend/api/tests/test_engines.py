@@ -332,7 +332,8 @@ class TestTrainiumAsr:
         assert out.text == "hello"
         assert len(out.segments) == 1
         assert engine._http.captured["headers"]["X-Sample-Rate"] == "16000"
-        assert engine._http.captured["headers"]["X-Language"] == "ja"
+        # BCP-47 "ja" は Whisper の "japanese" に正規化される
+        assert engine._http.captured["headers"]["X-Language"] == "japanese"
         assert engine._http.captured["body"] == b"\x00\x01" * 8000
 
     def test_5xx_is_retryable_provider_error(self, monkeypatch):

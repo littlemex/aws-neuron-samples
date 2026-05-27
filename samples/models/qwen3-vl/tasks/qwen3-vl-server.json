@@ -1,0 +1,122 @@
+{
+  "name": "Qwen3-VL-8B-Thinking vLLM Neuron server (OpenAI compatible) on EC2",
+  "description": "samples/models/qwen3-vl/start.sh を systemd で常駐起動する。事前に qwen3-vl-prepare.json で warm-up が完了 (= /models/Qwen3-VL-8B-Thinking/.neuron_warmup_done が存在) している必要がある。 NeuronCore 0-15 (TP=16) を専有し、 port {{PORT}} で OpenAI 互換 API (/v1/chat/completions, /health) を提供する。 start.sh は presigned URL 経由で配布。",
+  "variables": {
+    "SERVER_TARBALL_URL": "",
+    "SERVE_DIR": "/opt/voice-image-edit/qwen3-vl-server",
+    "SERVE_USER": "ubuntu",
+    "PORT": "8090",
+    "MODEL_ID": "Qwen/Qwen3-VL-8B-Thinking",
+    "MODEL_DIR": "/models/Qwen3-VL-8B-Thinking",
+    "NEURON_CORES": "0-15",
+    "VENV": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16"
+  },
+  "tasks": [
+    {
+      "id": "00-precheck",
+      "name": "Verify venv + warmed model dir",
+      "description": "venv と warm-up marker (.neuron_warmup_done) があること。 model dir に config.json があること。",
+      "commands": [
+        "set -e",
+        "test -x {{VENV}}/bin/python || { echo '[NG] venv missing: {{VENV}}'; exit 1; }",
+        "test -f {{MODEL_DIR}}/config.json || { echo '[NG] {{MODEL_DIR}}/config.json missing — run qwen3-vl-prepare.json first'; exit 1; }",
+        "test -f {{MODEL_DIR}}/.neuron_warmup_done || { echo '[NG] {{MODEL_DIR}}/.neuron_warmup_done missing — run qwen3-vl-prepare.json first'; exit 1; }",
+        "id {{SERVE_USER}} >/dev/null 2>&1 || { echo '[NG] user {{SERVE_USER}} missing'; exit 1; }",
+        "echo '[OK] precheck'"
+      ]
+    },
+    {
+      "id": "10-stop-service",
+      "name": "Stop existing qwen3-vl.service (if any)",
+      "description": "systemd unit があれば一旦止める。失敗しても続行。",
+      "commands": [
+        "systemctl stop qwen3-vl.service 2>/dev/null || true",
+        "echo '[OK] stop attempted'"
+      ]
+    },
+    {
+      "id": "20-deploy-tarball",
+      "name": "Download + extract qwen3-vl server tarball (start.sh)",
+      "description": "presigned URL から start.sh を含む tarball を取得して SERVE_DIR に展開。",
+      "commands": [
+        "set -e",
+        "test -n '{{SERVER_TARBALL_URL}}' || { echo '[NG] SERVER_TARBALL_URL is empty'; exit 1; }",
+        "mkdir -p $(dirname {{SERVE_DIR}})",
+        "rm -rf {{SERVE_DIR}}",
+        "mkdir -p {{SERVE_DIR}}",
+        "tmp=$(mktemp /tmp/qwen3-vl-server.XXXXXX.tar.gz)",
+        "trap 'rm -f $tmp' EXIT",
+        "curl -fsSL '{{SERVER_TARBALL_URL}}' -o $tmp",
+        "tar -C {{SERVE_DIR}} -xzf $tmp",
+        "test -f {{SERVE_DIR}}/start.sh || { echo '[NG] start.sh missing after extract'; exit 1; }",
+        "chmod +x {{SERVE_DIR}}/start.sh",
+        "chown -R {{SERVE_USER}}:{{SERVE_USER}} {{SERVE_DIR}}",
+        "echo '[OK] deployed'"
+      ]
+    },
+    {
+      "id": "30-install-systemd-unit",
+      "name": "Install qwen3-vl.service systemd unit",
+      "description": "Restart=always で常駐。 NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} で 16 cores 専有。 vllm serve は既存 cache を使うので 5-10 min で /health 200 になる想定。",
+      "commands": [
+        "set -e",
+        "cat > /etc/systemd/system/qwen3-vl.service <<'EOF'",
+        "[Unit]",
+        "Description=Qwen3-VL-8B-Thinking vLLM Neuron server (OpenAI compatible)",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "User={{SERVE_USER}}",
+        "WorkingDirectory={{SERVE_DIR}}",
+        "Environment=PYTHONUNBUFFERED=1",
+        "Environment=PORT={{PORT}}",
+        "Environment=MODEL_DIR={{MODEL_DIR}}",
+        "Environment=VENV={{VENV}}",
+        "Environment=NEURON_CORES={{NEURON_CORES}}",
+        "Environment=LOG_DIR={{SERVE_DIR}}/logs",
+        "ExecStart=/bin/bash {{SERVE_DIR}}/start.sh --port {{PORT}} --model-dir {{MODEL_DIR}} --venv {{VENV}} --cores {{NEURON_CORES}}",
+        "Restart=always",
+        "RestartSec=15s",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "TimeoutStartSec=1800",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "EOF",
+        "echo '[OK] unit installed'"
+      ]
+    },
+    {
+      "id": "40-enable-start",
+      "name": "daemon-reload + enable + start qwen3-vl",
+      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "commands": [
+        "set -e",
+        "systemctl daemon-reload",
+        "systemctl enable qwen3-vl.service",
+        "systemctl restart qwen3-vl.service",
+        "echo '[OK] service started'"
+      ]
+    },
+    {
+      "id": "50-health-check",
+      "name": "Local HTTP health check on 127.0.0.1:{{PORT}}/health",
+      "description": "warmup cache 適用後でも初回 launch は 600s 程度かかる。 最大 1500s 待つ。",
+      "commands": [
+        "set -e",
+        "for i in $(seq 1 150); do",
+        "  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{PORT}}/health || echo 000)",
+        "  if [ \"$code\" = \"200\" ]; then echo \"[OK] http=$code (attempt=$i)\"; exit 0; fi",
+        "  sleep 10",
+        "done",
+        "echo '[NG] qwen3-vl did not become healthy in 1500s' >&2",
+        "systemctl status qwen3-vl.service --no-pager || true",
+        "journalctl -u qwen3-vl.service -n 200 --no-pager || true",
+        "exit 1"
+      ]
+    }
+  ]
+}

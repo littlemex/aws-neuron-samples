@@ -5,25 +5,36 @@
     ``image_url`` の data: URI で base64 inline。多くの OSS サーバ (vLLM,
     SGLang など) がこの形に準拠しているため、特定の Qwen 拡張に依存しない。
   - 応答は ``choices[0].message.content`` を取り出して text として返す。
+  - Qwen3-VL-Thinking など <think>...</think> CoT を含むモデルでは、
+    上位層 (Bedrock 系と同等の出力契約) のために thinking ブロックを除去し、
+    raw を ``metadata.extra["raw_text"]`` に退避する。
 
 環境変数 (ハードコード禁止):
   - TRAINIUM_VLM_URL  (例: http://internal-...:8090/v1/chat/completions)
   - TRAINIUM_VLM_MODEL_ID (default: Qwen/Qwen3-VL-8B-Thinking)
-  - TRAINIUM_VLM_TIMEOUT_SECONDS (default: 60)
+  - TRAINIUM_VLM_TIMEOUT_SECONDS (default: 300)
   - TRAINIUM_VLM_API_KEY (任意。Bearer ヘッダで送る)
+  - TRAINIUM_VLM_STRIP_THINKING (default: "1"。"0" で無効化)
 """
 from __future__ import annotations
 
-import base64
 import json
 import os
 import time
-import uuid
 
 import urllib3
 
-from contracts import EngineError, EngineMetadata, VlmRequest, VlmResponse
+from contracts import EngineError, VlmRequest, VlmResponse
 from engines.vlm.base import VlmEngine
+from engines._common import (
+    build_metadata,
+    decode_image_b64,
+    env_float,
+    env_required,
+    guess_image_mime,
+    raise_for_status,
+    strip_thinking,
+)
 
 _DEFAULT_INSTRUCTION_PROMPT = (
     "You are an assistant that converts a user's voice instruction into an"
@@ -42,33 +53,22 @@ class TrainiumVlmEngine(VlmEngine):
     name = "trainium"
 
     def __init__(self) -> None:
-        url = os.environ.get("TRAINIUM_VLM_URL")
-        if not url:
-            raise EngineError(
-                "config_missing", "TRAINIUM_VLM_URL env var is required"
-            )
-        self.endpoint = url
+        self.endpoint = env_required("TRAINIUM_VLM_URL")
         self.model_id = os.environ.get(
             "TRAINIUM_VLM_MODEL_ID", "Qwen/Qwen3-VL-8B-Thinking"
         )
-        self.timeout = float(
-            os.environ.get("TRAINIUM_VLM_TIMEOUT_SECONDS", "60")
-        )
+        self.timeout = env_float("TRAINIUM_VLM_TIMEOUT_SECONDS", 300.0)
         self.api_key = os.environ.get("TRAINIUM_VLM_API_KEY")
+        self.strip_thinking = os.environ.get(
+            "TRAINIUM_VLM_STRIP_THINKING", "1"
+        ).strip() not in {"0", "false", "False", ""}
         self._http = urllib3.PoolManager()
 
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
-        try:
-            image_bytes = base64.b64decode(req.image_b64, validate=True)
-        except (ValueError, TypeError) as exc:
-            raise EngineError(
-                "invalid_request", f"image_b64 is not valid base64: {exc}"
-            ) from exc
-        if not image_bytes:
-            raise EngineError("invalid_request", "image_b64 decoded to empty bytes")
+        image_bytes = decode_image_b64(req.image_b64)
 
-        mime = _guess_image_mime(image_bytes)
+        mime = guess_image_mime(image_bytes)
         data_uri = f"data:{mime};base64,{req.image_b64}"
         system_prompt = (
             os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE") or _DEFAULT_REVIEW_PROMPT
@@ -112,19 +112,7 @@ class TrainiumVlmEngine(VlmEngine):
                 retryable=True,
             ) from exc
 
-        if resp.status >= 500:
-            raise EngineError(
-                "provider_error",
-                f"trainium vlm returned {resp.status}",
-                retryable=True,
-                provider_detail={"body": resp.data[:512].decode("utf-8", "replace")},
-            )
-        if resp.status >= 400:
-            raise EngineError(
-                "provider_invalid_response",
-                f"trainium vlm returned {resp.status}",
-                provider_detail={"body": resp.data[:512].decode("utf-8", "replace")},
-            )
+        raise_for_status(resp, label="trainium vlm")
 
         try:
             payload = json.loads(resp.data.decode("utf-8"))
@@ -134,42 +122,39 @@ class TrainiumVlmEngine(VlmEngine):
                 f"trainium vlm returned non-JSON: {exc}",
             ) from exc
 
-        text = _extract_text(payload)
-        if not text:
+        raw_text = _extract_text(payload)
+        if not raw_text:
             raise EngineError(
                 "provider_invalid_response",
                 "trainium vlm response missing 'choices[0].message.content'",
                 provider_detail={"keys": list(payload.keys())},
             )
 
+        text, was_stripped = (
+            strip_thinking(raw_text) if self.strip_thinking else (raw_text, False)
+        )
+
         usage = payload.get("usage") or {}
+        extra = {
+            "endpoint": self.endpoint,
+            "mode": req.mode,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+        }
+        if was_stripped:
+            extra["raw_text"] = raw_text
+            extra["thinking_stripped"] = True
+
         return VlmResponse(
             engine=self.name,
             text=text,
-            metadata=EngineMetadata(
+            metadata=build_metadata(
                 model_id=self.model_id,
-                latency_ms=int((time.monotonic() - start) * 1000),
-                request_id=req.request_id or str(uuid.uuid4()),
-                extra={
-                    "endpoint": self.endpoint,
-                    "mode": req.mode,
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                },
+                start_monotonic=start,
+                request_id=req.request_id,
+                extra=extra,
             ),
         )
-
-
-def _guess_image_mime(image_bytes: bytes) -> str:
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if image_bytes.startswith(b"GIF87a") or image_bytes.startswith(b"GIF89a"):
-        return "image/gif"
-    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
-        return "image/webp"
-    return "image/png"
 
 
 def _extract_text(payload: dict) -> str:

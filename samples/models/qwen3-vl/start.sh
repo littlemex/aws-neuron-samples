@@ -66,16 +66,32 @@ print(json.dumps({'override_neuron_config': {
 ")
 LIMIT_MM='{"image":20}'
 
-echo "[qwen3] launching vLLM on :${PORT} (TP=16, cores=${NEURON_CORES})"
-nohup vllm serve \
-  --model="${MODEL_DIR}" --tokenizer="${MODEL_DIR}" \
-  --trust-remote-code --dtype=bfloat16 \
-  --tensor-parallel-size=16 --max-num-seqs=1 --max-model-len=32768 \
-  --additional-config="${ADDITIONAL_CONFIG}" \
-  --limit-mm-per-prompt="${LIMIT_MM}" \
-  --no-enable-chunked-prefill --no-enable-prefix-caching \
-  --host=0.0.0.0 --port="${PORT}" \
-  >>"${LOG}" 2>&1 &
-
-echo $! > "${PIDFILE}"
-echo "[qwen3] pid=$(cat "${PIDFILE}") log=${LOG}"
+echo "[qwen3] launching vLLM on :${PORT} (TP=16, cores=${NEURON_CORES}) (log -> ${LOG})"
+# When run under systemd Type=simple, do NOT background — the main process must
+# stay in the foreground so systemd tracks the actual vllm process. We keep the
+# log file as a tee target for ad-hoc debugging.
+if [[ -t 1 ]]; then
+  # Interactive shell: keep legacy nohup behaviour for manual launches.
+  nohup vllm serve \
+    --model="${MODEL_DIR}" --tokenizer="${MODEL_DIR}" \
+    --trust-remote-code --dtype=bfloat16 \
+    --tensor-parallel-size=16 --max-num-seqs=1 --max-model-len=32768 \
+    --additional-config="${ADDITIONAL_CONFIG}" \
+    --limit-mm-per-prompt="${LIMIT_MM}" \
+    --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --host=0.0.0.0 --port="${PORT}" \
+    >>"${LOG}" 2>&1 &
+  echo $! > "${PIDFILE}"
+  echo "[qwen3] pid=$(cat "${PIDFILE}") log=${LOG}"
+else
+  # Non-interactive (systemd / SSM): exec into vllm so it becomes the main PID.
+  echo $$ > "${PIDFILE}"
+  exec vllm serve \
+    --model="${MODEL_DIR}" --tokenizer="${MODEL_DIR}" \
+    --trust-remote-code --dtype=bfloat16 \
+    --tensor-parallel-size=16 --max-num-seqs=1 --max-model-len=32768 \
+    --additional-config="${ADDITIONAL_CONFIG}" \
+    --limit-mm-per-prompt="${LIMIT_MM}" \
+    --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --host=0.0.0.0 --port="${PORT}"
+fi

@@ -1,0 +1,154 @@
+{
+  "name": "Qwen-Image-Edit-2511 serve.py (FastAPI multipart /infer) on EC2",
+  "description": "samples/models/qwen-image-edit/start.sh + serve.py を systemd で常駐起動する。事前に qwen-image-edit-prepare.json で /mnt/local/compiled_models/ に V3 CFG artifacts が揃っている必要がある。 NeuronCore 16-23 (TP=4 DP=2 world_size=8) を専有し、 port {{PORT}} で FastAPI (POST /infer multipart, GET /health, POST /vton/infer alias) を提供。 source は presigned URL 経由で配布。",
+  "variables": {
+    "SOURCE_TARBALL_URL": "",
+    "SERVE_DIR": "/opt/voice-image-edit/qwen-image-edit-server",
+    "SERVE_USER": "ubuntu",
+    "PORT": "8081",
+    "HOST": "0.0.0.0",
+    "COMPILED_MODELS_DIR": "/mnt/local/compiled_models",
+    "HEIGHT": "1024",
+    "WIDTH": "1024",
+    "PATCH_MULTIPLIER": "3",
+    "NEURON_CORES": "16-23",
+    "WORLD_SIZE": "8",
+    "PATH_PREFIX": "/qwen-image-edit",
+    "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference",
+    "HF_HOME_DIR": "/models/hf-cache",
+    "HF_CACHE_DIR": "/models/hf-cache/hub"
+  },
+  "tasks": [
+    {
+      "id": "00-precheck",
+      "name": "Verify venv + compiled artifacts",
+      "description": "venv と compile artifact (transformer_v3_cfg/ 等) があること。",
+      "commands": [
+        "set -e",
+        "test -x {{VENV}}/bin/python || { echo '[NG] venv missing: {{VENV}}'; exit 1; }",
+        "for d in transformer_v3_cfg vae_encoder vae_decoder language_model_v3 vision_encoder_v3; do",
+        "  test -d {{COMPILED_MODELS_DIR}}/$d || { echo \"[NG] {{COMPILED_MODELS_DIR}}/$d missing — run qwen-image-edit-prepare.json first\"; exit 1; }",
+        "done",
+        "id {{SERVE_USER}} >/dev/null 2>&1 || { echo '[NG] user {{SERVE_USER}} missing'; exit 1; }",
+        "echo '[OK] precheck'"
+      ]
+    },
+    {
+      "id": "10-stop-service",
+      "name": "Stop existing qwen-image-edit.service (if any)",
+      "description": "systemd unit があれば一旦止める。",
+      "commands": [
+        "systemctl stop qwen-image-edit.service 2>/dev/null || true",
+        "echo '[OK] stop attempted'"
+      ]
+    },
+    {
+      "id": "20-deploy-tarball",
+      "name": "Download + extract source tarball (start.sh + serve.py + run_qwen_image_edit.py + neuron_qwen_image_edit/)",
+      "description": "presigned URL から tarball を SERVE_DIR に展開。",
+      "commands": [
+        "set -e",
+        "test -n '{{SOURCE_TARBALL_URL}}' || { echo '[NG] SOURCE_TARBALL_URL is empty'; exit 1; }",
+        "mkdir -p $(dirname {{SERVE_DIR}})",
+        "rm -rf {{SERVE_DIR}}",
+        "mkdir -p {{SERVE_DIR}}",
+        "tmp=$(mktemp /tmp/qwen-image-edit-server.XXXXXX.tar.gz)",
+        "trap 'rm -f $tmp' EXIT",
+        "curl -fsSL '{{SOURCE_TARBALL_URL}}' -o $tmp",
+        "tar -C {{SERVE_DIR}} -xzf $tmp",
+        "test -f {{SERVE_DIR}}/serve.py || { echo '[NG] serve.py missing'; exit 1; }",
+        "test -f {{SERVE_DIR}}/start.sh || { echo '[NG] start.sh missing'; exit 1; }",
+        "chmod +x {{SERVE_DIR}}/start.sh",
+        "chown -R {{SERVE_USER}}:{{SERVE_USER}} {{SERVE_DIR}}",
+        "echo '[OK] deployed'"
+      ]
+    },
+    {
+      "id": "30-install-deps",
+      "name": "Install runtime Python deps (diffusers, transformers, fastapi, uvicorn)",
+      "description": "venv に diffusers/transformers/fastapi/uvicorn が無ければ入れる。compile タスク後なので大半は既存。",
+      "commands": [
+        "set -e",
+        ". {{VENV}}/bin/activate",
+        "{{VENV}}/bin/pip install --quiet 'fastapi' 'uvicorn[standard]' 'python-multipart' 'qwen-vl-utils' 2>&1 | tail -5 || true",
+        "{{VENV}}/bin/python -c 'import fastapi, uvicorn, diffusers, transformers; print(\"fastapi\", fastapi.__version__)'",
+        "echo '[OK] deps installed'"
+      ]
+    },
+    {
+      "id": "40-install-systemd-unit",
+      "name": "Install qwen-image-edit.service systemd unit",
+      "description": "Restart=always で常駐。 NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} で 8 cores 専有。 port {{PORT}} で listen。 PATH_PREFIX={{PATH_PREFIX}} (FastAPI に /qwen-image-edit/health 等の prefix endpoint も載る、 / 直下も生かす)。",
+      "commands": [
+        "set -e",
+        "cat > /etc/systemd/system/qwen-image-edit.service <<'EOF'",
+        "[Unit]",
+        "Description=Qwen-Image-Edit-2511 Neuron server (FastAPI multipart /infer)",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        "User={{SERVE_USER}}",
+        "WorkingDirectory={{SERVE_DIR}}",
+        "Environment=PYTHONUNBUFFERED=1",
+        "Environment=PYTHONPATH={{SERVE_DIR}}",
+        "Environment=NEURON_RT_VISIBLE_CORES={{NEURON_CORES}}",
+        "Environment=NEURON_RT_NUM_CORES={{WORLD_SIZE}}",
+        "Environment=PORT={{PORT}}",
+        "Environment=HOST={{HOST}}",
+        "Environment=COMPILED_DIR={{COMPILED_MODELS_DIR}}",
+        "Environment=HEIGHT={{HEIGHT}}",
+        "Environment=WIDTH={{WIDTH}}",
+        "Environment=PATCH_MULT={{PATCH_MULTIPLIER}}",
+        "Environment=NEURON_CORES={{NEURON_CORES}}",
+        "Environment=WORLD_SIZE={{WORLD_SIZE}}",
+        "Environment=PATH_PREFIX={{PATH_PREFIX}}",
+        "Environment=HUGGINGFACE_CACHE_DIR={{HF_CACHE_DIR}}",
+        "Environment=HF_HOME={{HF_HOME_DIR}}",
+        "Environment=TRANSFORMERS_CACHE={{HF_CACHE_DIR}}",
+        "Environment=LOG_DIR={{SERVE_DIR}}/logs",
+        "ExecStart=/bin/bash {{SERVE_DIR}}/start.sh --port {{PORT}} --host {{HOST}} --compiled-dir {{COMPILED_MODELS_DIR}} --height {{HEIGHT}} --width {{WIDTH}} --cores {{NEURON_CORES}} --world-size {{WORLD_SIZE}} --serve-py {{SERVE_DIR}}/serve.py",
+        "Restart=always",
+        "RestartSec=15s",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "TimeoutStartSec=1800",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "EOF",
+        "echo '[OK] unit installed'"
+      ]
+    },
+    {
+      "id": "50-enable-start",
+      "name": "daemon-reload + enable + start qwen-image-edit",
+      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "commands": [
+        "set -e",
+        "systemctl daemon-reload",
+        "systemctl enable qwen-image-edit.service",
+        "systemctl restart qwen-image-edit.service",
+        "echo '[OK] service started'"
+      ]
+    },
+    {
+      "id": "60-health-check",
+      "name": "Local HTTP health check on 127.0.0.1:{{PORT}}/health",
+      "description": "compile cache 適用後でも model load + Neuron load で 5-10 min。 最大 1500s 待つ。",
+      "commands": [
+        "set -e",
+        "for i in $(seq 1 150); do",
+        "  code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:{{PORT}}/health || echo 000)",
+        "  if [ \"$code\" = \"200\" ]; then echo \"[OK] http=$code (attempt=$i)\"; curl -s http://127.0.0.1:{{PORT}}/health; echo; exit 0; fi",
+        "  sleep 10",
+        "done",
+        "echo '[NG] qwen-image-edit did not become healthy in 1500s' >&2",
+        "systemctl status qwen-image-edit.service --no-pager || true",
+        "journalctl -u qwen-image-edit.service -n 200 --no-pager || true",
+        "exit 1"
+      ]
+    }
+  ]
+}
