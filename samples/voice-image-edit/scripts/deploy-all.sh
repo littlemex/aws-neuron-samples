@@ -42,11 +42,11 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-log()    { echo -e "${BLUE}[deploy-all]${NC} $*"; }
-ok()     { echo -e "${GREEN}[OK]${NC}        $*"; }
-warn()   { echo -e "${YELLOW}[WARN]${NC}      $*"; }
+log()    { echo -e "${BLUE}[deploy-all]${NC} $*" >&2; }
+ok()     { echo -e "${GREEN}[OK]${NC}        $*" >&2; }
+warn()   { echo -e "${YELLOW}[WARN]${NC}      $*" >&2; }
 err()    { echo -e "${RED}[NG]${NC}        $*" >&2; }
-section(){ echo -e "\n${CYAN}========== $* ==========${NC}"; }
+section(){ echo -e "\n${CYAN}========== $* ==========${NC}" >&2; }
 
 # --- defaults ---
 BASE_STACK_NAME=""
@@ -234,7 +234,7 @@ step_whisper_server() {
   local tarball_url
   tarball_url=$(stage_dir_to_s3 "$REPO_ROOT/samples/models/whisper" whisper-server-source.tar.gz) || return 1
   local vars
-  vars=$(jq -nc --arg url "$tarball_url" '{SOURCE_TARBALL_URL:$url}')
+  vars=$(jq -nc --arg url "$tarball_url" '{SERVER_TARBALL_URL:$url}')
   TASK_MAX_WAIT_SECONDS=1800 \
     run_task_json "$WHISPER_TASKS/whisper-server.json" "$vars" whisper-server
 }
@@ -245,7 +245,7 @@ step_qwen3vl_server() {
   local tarball_url
   tarball_url=$(stage_dir_to_s3 "$REPO_ROOT/samples/models/qwen3-vl" qwen3-vl-source.tar.gz) || return 1
   local vars
-  vars=$(jq -nc --arg url "$tarball_url" '{SOURCE_TARBALL_URL:$url}')
+  vars=$(jq -nc --arg url "$tarball_url" '{SERVER_TARBALL_URL:$url}')
   TASK_MAX_WAIT_SECONDS=1800 \
     run_task_json "$QWEN3VL_TASKS/qwen3-vl-server.json" "$vars" qwen3-vl-server
 }
@@ -289,7 +289,7 @@ ensure_stage_bucket() {
   if [[ "$STAGE_BUCKET" == "None" || -z "$STAGE_BUCKET" ]]; then
     STAGE_BUCKET="voice-image-edit-stage-$(echo $REGION|tr -d '-')-$RANDOM-$RANDOM"
     log "creating stage bucket $STAGE_BUCKET"
-    aws s3 mb "s3://$STAGE_BUCKET" --region "$REGION"
+    aws s3 mb "s3://$STAGE_BUCKET" --region "$REGION" >&2
   fi
   log "STAGE_BUCKET=$STAGE_BUCKET"
 }
