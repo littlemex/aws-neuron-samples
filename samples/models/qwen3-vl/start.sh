@@ -70,10 +70,18 @@ echo "[qwen3] launching vLLM on :${PORT} (TP=16, cores=${NEURON_CORES}) (log -> 
 # When run under systemd Type=simple, do NOT background — the main process must
 # stay in the foreground so systemd tracks the actual vllm process. We keep the
 # log file as a tee target for ad-hoc debugging.
+# vLLM が ``--model=`` に渡されたパス文字列をそのまま served-model-name として
+# 公開してしまうため (例: ``/models/Qwen3-VL-8B-Thinking``)、下流クライアント
+# (voice-image-edit-api の TrainiumVlmEngine 等) が HF 形式の id
+# ``Qwen/Qwen3-VL-8B-Thinking`` で問い合わせると 404 NotFoundError になる。
+# served-model-name を明示してパス依存を切る。
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3-VL-8B-Thinking}"
+
 if [[ -t 1 ]]; then
   # Interactive shell: keep legacy nohup behaviour for manual launches.
   nohup vllm serve \
     --model="${MODEL_DIR}" --tokenizer="${MODEL_DIR}" \
+    --served-model-name="${SERVED_MODEL_NAME}" \
     --trust-remote-code --dtype=bfloat16 \
     --tensor-parallel-size=16 --max-num-seqs=1 --max-model-len=32768 \
     --additional-config="${ADDITIONAL_CONFIG}" \
@@ -88,6 +96,7 @@ else
   echo $$ > "${PIDFILE}"
   exec vllm serve \
     --model="${MODEL_DIR}" --tokenizer="${MODEL_DIR}" \
+    --served-model-name="${SERVED_MODEL_NAME}" \
     --trust-remote-code --dtype=bfloat16 \
     --tensor-parallel-size=16 --max-num-seqs=1 --max-model-len=32768 \
     --additional-config="${ADDITIONAL_CONFIG}" \

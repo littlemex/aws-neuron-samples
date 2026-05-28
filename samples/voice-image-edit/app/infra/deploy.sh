@@ -790,12 +790,18 @@ deploy_api_service() {
     local presigned
     presigned="$(stage_tarball "$tarball" "voice-image-edit-api")"
 
+    # EDIT 結果 S3 bucket は EC2 / ALB と同じ region (= $REGION) に CDK が作る。
+    # api unit の AWS_REGION は Bedrock 用に us-east-1 を渡しているため、
+    # EDIT_RESULT_REGION を明示しないと boto3 が us-east-1 で SigV4 署名して
+    # bucket が us-east-2 だと SignatureDoesNotMatch / 403 になり presigned URL
+    # が成立しない (P10 以降 task #89 で恒久対処)。
     local vars_json
     vars_json=$(jq -n \
         --arg api_tarball "$presigned" \
         --arg api_port "$API_PORT" \
         --arg bedrock_region "$BEDROCK_REGION" \
         --arg edit_bucket "$API_RESULT_BUCKET" \
+        --arg edit_region "$REGION" \
         --arg asr "$ASR_ENGINE_DEFAULT" \
         --arg vlm "$VLM_ENGINE_DEFAULT" \
         --arg edit "$EDIT_ENGINE_DEFAULT" \
@@ -812,6 +818,7 @@ deploy_api_service() {
           API_PORT: $api_port,
           BEDROCK_REGION: $bedrock_region,
           EDIT_RESULT_BUCKET: $edit_bucket,
+          EDIT_RESULT_REGION: $edit_region,
           ASR_ENGINE_DEFAULT: $asr,
           VLM_ENGINE_DEFAULT: $vlm,
           EDIT_ENGINE_DEFAULT: $edit,
