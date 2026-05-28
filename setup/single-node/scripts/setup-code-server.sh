@@ -226,7 +226,7 @@ if [[ -f "$PERSIST_SH" ]]; then
     UPLOAD_ID=$(aws ssm send-command --region "$REGION" \
         --instance-ids "$INSTANCE_ID" \
         --document-name AWS-RunShellScript \
-        --parameters "commands=[\"bash -c \\\"echo '${PERSIST_B64}' | base64 -d > /tmp/setup-persistence-full.sh && chmod +x /tmp/setup-persistence-full.sh && echo 'setup-persistence-full.sh uploaded: '$(wc -c < /tmp/setup-persistence-full.sh)' bytes'\\\"\"]" \
+        --parameters "commands=[\"bash -c \\\"echo '${PERSIST_B64}' | base64 -d > /tmp/setup-persistence-full.sh && chmod +x /tmp/setup-persistence-full.sh && echo 'setup-persistence-full.sh uploaded: '\$(wc -c < /tmp/setup-persistence-full.sh)' bytes'\\\"\"]" \
         --query 'Command.CommandId' --output text 2>/dev/null)
     # Wait for completion
     for i in 1 2 3 4; do

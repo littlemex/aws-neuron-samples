@@ -293,7 +293,10 @@ def _transcribe_array(audio: np.ndarray, language: str | None) -> str:
             audio, sampling_rate=SAMPLE_RATE, return_tensors="pt"
         ).input_features
         with _generate_lock:
-            ids = model.generate(features, language=language)
+            # task="transcribe" を明示しないと HF Whisper の generate は
+            # 言語指定だけだと "translate" にフォールバックする (= 日本語音声を
+            # 英訳して返す挙動になる)。ここは ASR 用なので必ず transcribe。
+            ids = model.generate(features, language=language, task="transcribe")
         text = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
     return text
 

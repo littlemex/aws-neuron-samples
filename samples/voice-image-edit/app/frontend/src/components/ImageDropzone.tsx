@@ -47,12 +47,20 @@ export function ImageDropzone({ onPick, className }: Props) {
         const f = e.dataTransfer.files?.[0];
         f && handle(f);
       }}
-      onClick={() => inputRef.current?.click()}
-      className={`relative flex cursor-pointer items-center justify-center overflow-hidden rounded-lg border-2 border-dashed transition ${
+      onClick={() => {
+        // 既に選択済みのファイルと同じファイルを再選択しても change が発火するよう、
+        // クリックの直前に value をリセットする。これがないと「画像を入れた後はリロード
+        // しないと再選択できない」現象になる (input value が同じなら change が出ない)。
+        if (inputRef.current) {
+          inputRef.current.value = '';
+        }
+        inputRef.current?.click();
+      }}
+      className={`group relative flex cursor-pointer items-center justify-center overflow-hidden rounded-lg border-2 border-dashed transition ${
         hover
           ? 'border-blue-400 bg-blue-950/30'
           : picked
-          ? 'border-gray-700 bg-black/40'
+          ? 'border-gray-700 bg-black/40 hover:border-blue-400'
           : 'border-gray-600 bg-gray-900/40 hover:border-gray-400'
       } ${className ?? 'h-full w-full'}`}
     >
@@ -65,6 +73,11 @@ export function ImageDropzone({ onPick, className }: Props) {
             alt="picked preview"
             className="max-h-full max-w-full object-contain"
           />
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition group-hover:bg-black/50 group-hover:opacity-100">
+            <p className="rounded bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow">
+              クリックして画像を変更
+            </p>
+          </div>
           <div className="pointer-events-none absolute bottom-2 left-2 right-2 truncate rounded bg-black/70 px-2 py-1 text-xs text-gray-100">
             {picked.fileName} · {(picked.sizeBytes / 1024 / 1024).toFixed(2)} MB
           </div>
@@ -87,6 +100,10 @@ export function ImageDropzone({ onPick, className }: Props) {
         onChange={(e) => {
           const f = e.target.files?.[0];
           f && handle(f);
+          // 取り出したあと value を空にしておくと、次回同じファイルを選ぶときも change が発火する。
+          if (inputRef.current) {
+            inputRef.current.value = '';
+          }
         }}
       />
     </div>
