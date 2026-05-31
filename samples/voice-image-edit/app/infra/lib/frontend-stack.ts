@@ -14,10 +14,13 @@ import { Construct } from 'constructs';
  *   - EC2 SG に「ALB SG -> 3000/tcp」の ingress を 1 本追加
  *   - 既存 ALB に Frontend Target Group (instance target, port 3000) を作成
  *   - X-Origin-Verify header 一致を要求する path-based ListenerRule を生やす
- *     既定パターンは ['/', '/edit*', '/manage*', '/_next/*']
+ *     Default patterns are ['/edit*', '/manage*', '/_next/*'].
+ *     '/' is intentionally NOT matched here so it falls through to the
+ *     code-server catch-all (priority 1000); users enter the
+ *     voice-image-edit UI at /edit.  This avoids fighting other apps
+ *     (code-server, Neuron Explorer) that share the same ALB for '/'.
  *     ALB は 1 rule 全 condition 合計で最大 5 値 (path + header)。
- *     header 1 値を確保するため path は 4 値に抑える。/favicon.ico は code-server
- *     catch-all にフォールバックするだけなので無害 (アイコンが出ないだけ)。
+ *     header 1 値を確保するため path は 4 値以下に抑える。
  *     priority 200 (code-server catch-all 1000 より強く、api rule 100 より弱い)
  *
  * 必須 context:
@@ -66,9 +69,13 @@ export class FrontendStack extends cdk.Stack {
     // ALB は 1 rule 全 condition 合計で最大 5 値 (path + header)。
     // header 1 を確保するため path は 4 値以下に抑える必要がある。
     // '/edit*' / '/manage*' は末尾 wildcard で完全一致も prefix もカバー。
+    // '/' is intentionally omitted: it falls through to the code-server
+    // catch-all (priority 1000) so other apps sharing the ALB
+    // (code-server, Neuron Explorer) keep '/' for themselves.  Users
+    // enter the voice-image-edit UI at /edit.
     const frontendPathPatterns = (
       ctx('frontendPathPatterns') ??
-      '/,/edit*,/manage*,/_next/*'
+      '/edit*,/manage*,/_next/*'
     )
       .split(',')
       .map((s) => s.trim())
