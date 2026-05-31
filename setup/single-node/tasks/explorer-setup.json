@@ -1,0 +1,70 @@
+{
+  "name": "Neuron Explorer Setup",
+  "description": "Install and configure neuron-explorer as a long-running systemd service fronted by an nginx /explorer/ location block.  Idempotent.  Designed to be invoked through run-tasks.sh after setup-code-server has produced /etc/nginx/sites-enabled/code-server.",
+  "variables": {
+    "EXPLORER_USER": "coder",
+    "EXPLORER_PORT": "8081",
+    "EXPLORER_API_PORT": "3002",
+    "EXPLORER_DATA_DIR": "/var/lib/neuron-explorer",
+    "EXPLORER_DISPLAY_NAME": "workshop",
+    "NGINX_LOCATION": "/explorer"
+  },
+  "tasks": [
+    {
+      "id": "00-prerequisites",
+      "name": "Verify prerequisites (neuron-explorer binary, nginx site, target user)",
+      "description": "Hard-fail before mutating state if the host is not ready.",
+      "commands": [
+        "echo '==> Verifying prerequisites'",
+        "test -x /opt/aws/neuron/bin/neuron-explorer || { echo 'ERROR: /opt/aws/neuron/bin/neuron-explorer missing - update Neuron SDK first'; exit 1; }",
+        "test -f /etc/nginx/sites-enabled/code-server || { echo 'ERROR: /etc/nginx/sites-enabled/code-server missing - run code-server-setup first'; exit 1; }",
+        "id {{EXPLORER_USER}} >/dev/null 2>&1 || { echo 'ERROR: user {{EXPLORER_USER}} does not exist'; exit 1; }",
+        "echo 'Prerequisites OK'"
+      ]
+    },
+    {
+      "id": "01-install-explorer",
+      "name": "Install systemd unit, nginx fragment, and start the service",
+      "description": "Drops setup-explorer.sh on the instance and runs it.  Re-runnable: the script is idempotent and patches /etc/nginx/sites-enabled/code-server only if the include directive is missing.",
+      "commands": [
+        "echo '==> Running setup-explorer.sh'",
+        "if [ ! -f /tmp/setup-explorer.sh ]; then",
+        "  echo 'ERROR: /tmp/setup-explorer.sh not found on instance'",
+        "  echo 'deploy.sh / install-explorer.sh must upload it before this task runs'",
+        "  exit 1",
+        "fi",
+        "EXPLORER_USER='{{EXPLORER_USER}}' \\",
+        "EXPLORER_PORT='{{EXPLORER_PORT}}' \\",
+        "EXPLORER_API_PORT='{{EXPLORER_API_PORT}}' \\",
+        "EXPLORER_DATA_DIR='{{EXPLORER_DATA_DIR}}' \\",
+        "EXPLORER_DISPLAY_NAME='{{EXPLORER_DISPLAY_NAME}}' \\",
+        "NGINX_LOCATION='{{NGINX_LOCATION}}' \\",
+        "bash /tmp/setup-explorer.sh"
+      ]
+    },
+    {
+      "id": "02-smoke-check",
+      "name": "Smoke check the service through nginx",
+      "description": "Confirm /explorer/ returns the SPA shell and /explorer/api/v1/profiles/search responds.",
+      "commands": [
+        "echo '==> Smoke check'",
+        "set +e",
+        "for i in $(seq 1 15); do",
+        "  if curl -sf 'http://127.0.0.1{{NGINX_LOCATION}}/' >/dev/null; then",
+        "    echo 'UI shell reachable'",
+        "    break",
+        "  fi",
+        "  sleep 2",
+        "done",
+        "echo '--- /explorer/ headers ---'",
+        "curl -sI 'http://127.0.0.1{{NGINX_LOCATION}}/' | head -5",
+        "echo '--- /explorer/api/v1/profiles/search status ---'",
+        "curl -s -o /dev/null -w 'HTTP %{http_code}\\n' 'http://127.0.0.1{{NGINX_LOCATION}}/api/v1/profiles/search'",
+        "echo '--- service status ---'",
+        "systemctl is-active neuron-explorer || true",
+        "echo '--- log tail ---'",
+        "tail -10 {{EXPLORER_DATA_DIR}}/logs/explorer.log 2>/dev/null || true"
+      ]
+    }
+  ]
+}

@@ -76,6 +76,17 @@ Options:
                                          Also installs neuron-agentic-development (agents and
                                          skills) into ~/.claude for the code-server user.
                                          Default: off.
+    --enable-explorer                    Opt-in: install Neuron Explorer as a systemd service
+                                         and front it from the existing nginx site at /explorer/.
+                                         The same SSM port-forward / CloudFront entry that serves
+                                         code-server now also serves the Explorer UI.
+                                         Idempotent and re-runnable.  Default: off.
+    --explorer-display-name NAME         Override the human-friendly Explorer display name
+                                         (default: workshop).  Implies --enable-explorer.
+    --session-ttl SECONDS                cf_session cookie lifetime in seconds (Cognito re-login
+                                         interval).  Threaded into the OAuth Lambda environment.
+                                         Common values: 3600 (1h, default), 28800 (8h),
+                                         86400 (1d), 604800 (1w).
     --show-info                          Show connection info for an already-deployed stack
     --recover                            Recover an existing stack in place without changing
                                          instance type / purchase mode. Heals:
@@ -212,6 +223,9 @@ SUBNET_ID=""
 VOLUME_SIZE="500"
 SKIP_SETUP=false
 INSTALL_CLAUDE_CODE=false
+ENABLE_EXPLORER=false
+EXPLORER_DISPLAY_NAME="workshop"
+SESSION_TTL_SECONDS=""
 SHOW_INFO=false
 DESTROY=false
 RECOVER=false
@@ -329,6 +343,29 @@ while [[ $# -gt 0 ]]; do
         --install-claude-code)
             INSTALL_CLAUDE_CODE=true
             shift
+            ;;
+        --enable-explorer)
+            # Opt-in: install Neuron Explorer behind /explorer/ on the
+            # same nginx site that fronts code-server.  Idempotent and
+            # safe to re-apply on existing instances.
+            ENABLE_EXPLORER=true
+            shift
+            ;;
+        --explorer-display-name)
+            EXPLORER_DISPLAY_NAME="$2"
+            ENABLE_EXPLORER=true
+            shift 2
+            ;;
+        --session-ttl)
+            # cf_session cookie lifetime in seconds.  Threaded into the
+            # OAuth Lambda env (SESSION_TTL_SECONDS) so the HMAC payload
+            # exp and the Set-Cookie Max-Age agree.  Common values:
+            #   3600    (1 hour, default)
+            #   28800   (8 hours, work day)
+            #   86400   (1 day)
+            #   604800  (1 week)
+            SESSION_TTL_SECONDS="$2"
+            shift 2
             ;;
         --show-info)
             SHOW_INFO=true
@@ -1632,6 +1669,27 @@ if [[ "$SKIP_SETUP" == false ]]; then
             echo "  $SETUP_CMD"
             exit 1
         fi
+
+        # Optional: install Neuron Explorer behind /explorer/ on the
+        # same nginx site.  Idempotent and runs after the code-server
+        # nginx config exists, since setup-explorer.sh patches the same
+        # site to add the include directive.
+        if [[ "$ENABLE_EXPLORER" == true ]]; then
+            EXPLORER_ARGS=(
+                -i "$INSTANCE_ID"
+                -r "$REGION"
+                --explorer-display-name "$EXPLORER_DISPLAY_NAME"
+            )
+            EXPLORER_CMD="bash $SCRIPT_DIR/setup-explorer-wrapper.sh ${EXPLORER_ARGS[*]}"
+            echo ""
+            echo -e "${BLUE}==> Installing Neuron Explorer (--enable-explorer)${NC}"
+            bash "$SCRIPT_DIR/setup-explorer-wrapper.sh" "${EXPLORER_ARGS[@]}"
+            if [[ $? -ne 0 ]]; then
+                echo -e "${YELLOW}[WARN] Neuron Explorer setup failed${NC}"
+                echo -e "${YELLOW}Re-run manually:${NC}"
+                echo "  $EXPLORER_CMD"
+            fi
+        fi
     fi
 else
     echo ""
@@ -1819,6 +1877,9 @@ if [[ "$CREATE_ALB_BACKEND" == true ]]; then
     if [[ -n "$OPERATOR_PASSWORD_SECRET_ARN" ]]; then
         ALB_CDK_PARAMS+=("-c" "operatorPasswordSecretArn=$OPERATOR_PASSWORD_SECRET_ARN")
     fi
+    if [[ -n "$SESSION_TTL_SECONDS" ]]; then
+        ALB_CDK_PARAMS+=("-c" "sessionTtlSeconds=$SESSION_TTL_SECONDS")
+    fi
     if [[ -n "$PROJECT" ]]; then
         ALB_CDK_PARAMS+=("-c" "project=$PROJECT")
     fi
@@ -1893,6 +1954,9 @@ if [[ "$CREATE_CLOUDFRONT_FRONTEND" == true ]]; then
     fi
     if [[ -n "$OPERATOR_PASSWORD_SECRET_ARN" ]]; then
         FRONTEND_CDK_PARAMS+=("-c" "operatorPasswordSecretArn=$OPERATOR_PASSWORD_SECRET_ARN")
+    fi
+    if [[ -n "$SESSION_TTL_SECONDS" ]]; then
+        FRONTEND_CDK_PARAMS+=("-c" "sessionTtlSeconds=$SESSION_TTL_SECONDS")
     fi
     if [[ -n "$PROJECT" ]]; then
         FRONTEND_CDK_PARAMS+=("-c" "project=$PROJECT")
