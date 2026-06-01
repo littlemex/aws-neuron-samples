@@ -102,9 +102,19 @@ export class EfsPersistenceStack extends cdk.Stack {
       removalPolicy: props.removalPolicy ?? cdk.RemovalPolicy.RETAIN,
     });
 
-    // ClientMount は NFS mount 自体に必要。 ClientWrite + ClientRootAccess
-    // だけだと "access denied by server while mounting" になるので明示する。
-    // AccessedViaMountTarget=true 条件で VPC 外からの mount を防ぐ。
+    // NFS mount に必要な ClientMount / ClientWrite / ClientRootAccess を許可。
+    //
+    // 元実装は AccessedViaMountTarget=true 条件付きで policy を設定していたが、
+    // この条件をインライン FileSystemPolicy に書くと CFN が
+    //   FileSystem ⇄ MountTarget
+    // の循環参照を検出して deploy が失敗する。VPC 外 mount は
+    // mountTargetSecurityGroup が SG 単位で制御しているので resource policy 側
+    // の AccessedViaMountTarget 条件は冗長。条件を外して循環を断つ。
+    // Resource を "*" にしているのは循環参照回避のため。
+    // file system 自身に attach されるインライン policy なので、Resource を
+    // file system ARN にしても意味は同じ。ただし fileSystemArn は Fn::GetAtt で
+    // 解決され、CFN がその計算のために MountTarget 群への依存を引き寄せる結果
+    // FileSystem ⇄ MountTarget の循環を作るので、ここでは "*" を使う。
     this.fileSystem.addToResourcePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       principals: [new iam.AnyPrincipal()],
@@ -113,12 +123,7 @@ export class EfsPersistenceStack extends cdk.Stack {
         'elasticfilesystem:ClientWrite',
         'elasticfilesystem:ClientRootAccess',
       ],
-      resources: [this.fileSystem.fileSystemArn],
-      conditions: {
-        Bool: {
-          'elasticfilesystem:AccessedViaMountTarget': 'true',
-        },
-      },
+      resources: ['*'],
     }));
 
     if (props.project) cdk.Tags.of(this).add('Project', props.project);
