@@ -168,6 +168,23 @@ export class CloudFrontFrontendStack extends cdk.Stack {
           // No functionAssociations: the OAuth dance must reach the
           // Lambda without a redirect-to-login loop.
         },
+        // Neuron Explorer is interactive, profile-heavy, and cookie-
+        // backed.  We share the same VPC Origin and the same HMAC
+        // viewer-request function as the default behavior so a single
+        // Cognito session covers both code-server and Explorer.
+        '/explorer/*': {
+          origin: vpcOrigin,
+          viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+          allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+          cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+          originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER,
+          functionAssociations: [
+            {
+              function: viewerRequestFn,
+              eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+            },
+          ],
+        },
       },
       // Default *.cloudfront.net cert (ADR-001). No alternate domain.
       // Geo restrictions / WAF are deliberately omitted (ADR-009).

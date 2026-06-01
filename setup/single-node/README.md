@@ -229,6 +229,70 @@ mount target, then runs `cdk destroy`. The EFS itself is not deleted -
 data you wrote under `/home/coder` and `/work` persists and will be
 visible to the next stack that uses the same `--efs-subpath`.
 
+## Optional: Neuron Explorer behind /explorer/
+
+Neuron SDK 2.30 ships `neuron-explorer`, a web UI that visualises NEFF
++ NTFF profile bundles.  Pass `--enable-explorer` to bring it up as a
+long-running systemd service on the same host, served from
+`/explorer/` via the existing nginx site:
+
+```bash
+AWS_REGION=us-west-2 bash scripts/deploy.sh \
+    --stack-name neuron-ws \
+    --enable-explorer
+```
+
+What this opt-in adds:
+
+- `neuron-explorer.service` — `view` daemon owned by `coder`, listening
+  on `127.0.0.1:8081` (UI) and `127.0.0.1:3002` (REST API).
+- `neuron-explorer-rewrite.service` — one-shot post-start unit that
+  rewrites the upstream SPA bundle so it issues same-origin URLs
+  against `/explorer/api/v1/...` instead of the upstream-default
+  hostname literals.  Idempotent on the bundle's sha256.
+- nginx fragment that serves `/explorer/`, `/explorer/api/`, the
+  rewritten `/explorer/assets/`, and a `/explorer/health` status
+  endpoint.
+- ALB listener rules + a CloudFront cache behaviour for `/explorer/*`,
+  so the same Cognito session that protects code-server also protects
+  Explorer.
+
+Once the stack is up, capture a profile and push it to the local
+view server in one command:
+
+```bash
+# On the trn2 host:
+sudo -u coder /opt/neuron-explorer/capture-and-upload.sh \
+    --entry /home/coder/your-kernel-driver.py \
+    --name kernel-v1 --uploader $USER
+```
+
+`capture-and-upload.sh` runs the entrypoint with
+`NEURON_RT_INSPECT_*` enabled, locates the resulting NEFF + NTFF, and
+calls `neuron-explorer upload` against `localhost:3002`.  The profile
+appears in the Profile Manager UI immediately.
+
+`docs/explorer.md` covers the rewriter design, the regex substitution
+table, and a smoke-test recipe for SDK upgrades.
+
+### Cognito session lifetime
+
+The default `cf_session` cookie lasts **86400 seconds (1 day)** so an
+operator does not have to re-authenticate every hour.  Override at
+deploy time when needed:
+
+```bash
+# 8-hour work day:
+bash scripts/deploy.sh ... --session-ttl 28800
+# 1-hour (sensitive operator account):
+bash scripts/deploy.sh ... --session-ttl 3600
+# 1 week (validation env):
+bash scripts/deploy.sh ... --session-ttl 604800
+```
+
+The TTL is mirrored on both the HMAC payload (`exp` claim) and the
+Set-Cookie `Max-Age`, so they always agree.
+
 ## Running multiple instances in parallel
 
 Three instances, each with isolated state, sharing the same EFS:

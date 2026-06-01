@@ -135,6 +135,13 @@ export class AlbBackendStack extends cdk.Stack {
       { name: 'vton',    pathPattern: '/api/vton/*',    port: 8081, healthCheckPath: '/health' },
       { name: 'whisper', pathPattern: '/api/whisper/*', port: 8765, healthCheckPath: '/health' },
       { name: 'avatar',  pathPattern: '/api/avatar/*',  port: 8770, healthCheckPath: '/health' },
+      // Neuron Explorer.  Co-tenants with code-server on port 80; the
+      // /explorer/ location block in /etc/nginx/sites-enabled/code-server
+      // forwards to the explorer process on 127.0.0.1:8081 + :3002.  We
+      // split UI and API into two listener rules so cache policies and
+      // future WAF rules can treat them independently.
+      { name: 'explorer-ui',  pathPattern: '/explorer/*',     port: codeServerPort, healthCheckPath: '/explorer/' },
+      { name: 'explorer-api', pathPattern: '/explorer/api/*', port: codeServerPort, healthCheckPath: '/explorer/api/v1/profiles/search' },
     ];
 
     const vpc = ec2.Vpc.fromLookup(this, 'DefaultVpc', { isDefault: true });
@@ -242,7 +249,13 @@ export class AlbBackendStack extends cdk.Stack {
         COGNITO_USER_POOL_ID: props.userPool.userPoolId,
         COGNITO_DOMAIN: cognitoDomainFqdn,
         HMAC_SECRET: this.hmacSecret.secretValue.unsafeUnwrap(),
-        SESSION_TTL_SECONDS: '3600',
+        // cf_session lifetime in seconds.  Mirrored on both the HMAC
+        // payload (exp claim) and the Set-Cookie Max-Age, so they
+        // always agree.  Default is 1 day; override via
+        // -c sessionTtlSeconds=... at synth time
+        // (1 hour = 3600, 1 week = 604800).
+        SESSION_TTL_SECONDS:
+          (this.node.tryGetContext('sessionTtlSeconds') as string | undefined) ?? '86400',
       },
     });
     this.oauthLambda.addToRolePolicy(new iam.PolicyStatement({
