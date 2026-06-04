@@ -34,6 +34,21 @@
 #   AWS_PROFILE=claude-code  (他 profile 禁止: 2026-04-20 厳命)
 set -euo pipefail
 
+# Always emit a final-line marker so an operator (or wrapper that looks
+# only at logs) can tell success from failure even if exit code is
+# masked by `tee` or other pipe gymnastics. The trap fires on any
+# non-zero exit including unbound-variable, set -e, or signals.
+CURRENT_STEP="(startup)"
+on_exit() {
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "" >&2
+    echo -e "\033[0;31m[deploy-all][NG] failed at step '$CURRENT_STEP' (exit=$rc)\033[0m" >&2
+  fi
+  exit $rc
+}
+trap on_exit EXIT
+
 # --- color helpers ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -117,6 +132,30 @@ should_skip() {
   [[ ",$SKIP_STEPS," == *",$name,"* ]]
 }
 
+# Validate --only / --skip values match real step names. Catches typos
+# such as --only qwen3vl-server (missing the "-vl-") which would
+# otherwise silently skip everything and exit 0.
+validate_step_list() {
+  local kind="$1"   # "--only" or "--skip"
+  local list="$2"
+  [[ -z "$list" ]] && return 0
+  local IFS=','
+  for name in $list; do
+    [[ -z "$name" ]] && continue
+    local found=false
+    for known in "${ALL_STEPS[@]}"; do
+      [[ "$known" == "$name" ]] && { found=true; break; }
+    done
+    if [[ "$found" != true ]]; then
+      err "unknown step in $kind: '$name'"
+      err "  valid steps: ${ALL_STEPS[*]}"
+      exit 1
+    fi
+  done
+}
+validate_step_list "--only" "$ONLY_STEPS"
+validate_step_list "--skip" "$SKIP_STEPS"
+
 # --- locate paths ---
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VIE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -196,14 +235,18 @@ step_migrate_to_efs() {
 }
 
 # --- step: whisper-precompile ---
+# Switched to the NxD Inference path (TP=8). Legacy torch_neuronx.trace
+# artefacts on EFS were wedged on a stale 3-tensor decoder signature; the
+# NxD path keeps its artefacts under a separate prefix
+# (/models/whisper-large-v3-neuron-nxd) so the two never collide.
 step_whisper_precompile() {
-  section "whisper-precompile"
+  section "whisper-precompile (NxD)"
   local compile_url
-  compile_url=$(stage_to_s3 "$REPO_ROOT/samples/models/whisper/compile_whisper.py" compile_whisper.py) || return 1
+  compile_url=$(stage_to_s3 "$REPO_ROOT/samples/models/whisper/compile_whisper_nxd.py" compile_whisper_nxd.py) || return 1
   local vars
   vars=$(jq -nc --arg url "$compile_url" '{COMPILE_SCRIPT_URL:$url}')
   TASK_MAX_WAIT_SECONDS=3600 \
-    run_task_json "$WHISPER_TASKS/whisper-precompile.json" "$vars" whisper-precompile
+    run_task_json "$WHISPER_TASKS/whisper-nxd-precompile.json" "$vars" whisper-nxd-precompile
 }
 
 # --- step: qwen3-vl-prepare ---
@@ -229,14 +272,18 @@ step_qie_prepare() {
 }
 
 # --- step: whisper-server ---
+# Uses the NxD server (TP=8). Pinned to NeuronCores 24-39 by
+# whisper-nxd-server.json; non-overlapping with Qwen3-VL (0-15) and
+# Qwen-Image-Edit (16-23). The first health check on a freshly compiled
+# model can take several minutes, so the upstream task allows 600s.
 step_whisper_server() {
-  section "whisper-server"
+  section "whisper-server (NxD)"
   local tarball_url
   tarball_url=$(stage_dir_to_s3 "$REPO_ROOT/samples/models/whisper" whisper-server-source.tar.gz) || return 1
   local vars
   vars=$(jq -nc --arg url "$tarball_url" '{SERVER_TARBALL_URL:$url}')
   TASK_MAX_WAIT_SECONDS=1800 \
-    run_task_json "$WHISPER_TASKS/whisper-server.json" "$vars" whisper-server
+    run_task_json "$WHISPER_TASKS/whisper-nxd-server.json" "$vars" whisper-nxd-server
 }
 
 # --- step: qwen3-vl-server ---
@@ -315,14 +362,28 @@ stage_dir_to_s3() {
 }
 
 # --- main ---
+# `precheck` populates EC2_INSTANCE_ID / EFS_ID / EC2_PUBLIC_IP from
+# CloudFormation outputs and exports them. Every other step needs at
+# least EC2_INSTANCE_ID to talk to the instance via SSM, so it must run
+# unconditionally even when the operator scoped the run with --only.
+# The check is read-only (describe-stacks + jq), so unconditional
+# execution is safe and idempotent.
+CURRENT_STEP="precheck"
+step_precheck
+
 START_TS=$(date +%s)
 for step in "${ALL_STEPS[@]}"; do
+  # precheck has already run above; skip it in the main loop regardless
+  # of --only / --skip so we never describe-stacks twice.
+  if [[ "$step" == "precheck" ]]; then
+    continue
+  fi
   if should_skip "$step"; then
     warn "skip: $step"
     continue
   fi
+  CURRENT_STEP="$step"
   case "$step" in
-    precheck)                step_precheck ;;
     setup-efs-paths)         step_setup_efs_paths ;;
     migrate-to-efs)          step_migrate_to_efs ;;
     whisper-precompile)      step_whisper_precompile ;;

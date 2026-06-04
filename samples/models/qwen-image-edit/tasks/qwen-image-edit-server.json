@@ -70,7 +70,7 @@
       "commands": [
         "set -e",
         ". {{VENV}}/bin/activate",
-        "{{VENV}}/bin/pip install --quiet 'fastapi' 'uvicorn[standard]' 'python-multipart' 'qwen-vl-utils' 2>&1 | tail -5 || true",
+        "{{VENV}}/bin/pip install --quiet 'fastapi' 'uvicorn[standard]' 'python-multipart' 'qwen-vl-utils' 'git+https://github.com/huggingface/diffusers' 'transformers>=4.45.0' 2>&1 | tail -5 || true",
         "{{VENV}}/bin/python -c 'import fastapi, uvicorn, diffusers, transformers; print(\"fastapi\", fastapi.__version__)'",
         "echo '[OK] deps installed'"
       ]
