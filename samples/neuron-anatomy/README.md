@@ -83,21 +83,39 @@ curl -H 'cookie: cf_session=...' https://<cloudfront-dist>/neuron/health
 curl -N -H 'cookie: cf_session=...' https://<cloudfront-dist>/neuron/stream
 ```
 
-## デプロイ手順
+## Deploy
 
-backend (systemd unit のインストール) と infra (CDK スタックの deploy) は
-samples/voice-image-edit/scripts/deploy-all.sh と同じ流儀で
-`scripts/deploy.sh` (TBD) に集約する予定。現状は手作業:
+`scripts/deploy.sh` is the one-shot deploy helper. Modelled after
+`samples/voice-image-edit/scripts/deploy-all.sh`, it resolves every CFN
+output it needs from `<base>` and `<base>-alb`, stages the backend
+tarball through S3, runs a 6-task SSM runner to install the
+`neuron-anatomy.service` systemd unit, then `cdk deploy`s
+`NeuronAnatomyStack` to attach `/neuron/*` (priority 250) to the
+existing internal ALB.
 
 ```bash
-# infra
-cd infra
-npm install
-cdk synth -c albArn=... -c albListenerArn=... -c originVerifySecretArn=... \
-          -c anatomyInstancePrivateIp=... -c anatomyInstanceSgId=... \
-          -c anatomyVpcId=... -c albSecurityGroupId=... \
-          -c albListenerSgId=... -c originVerifyHeaderName=X-Origin-Verify
-cdk deploy
+AWS_PROFILE=claude-code bash scripts/deploy.sh \
+  --base-stack-name storeai-validation-use2 \
+  --region us-east-2
 ```
 
-詳細は [docs/EMBEDDING.md](./docs/EMBEDDING.md) を参照。
+Flags:
+
+- `--alb-stack-name NAME` — override the default `<base>-alb`.
+- `--only backend|infra|integrate` / `--skip ...` — target a subset of steps.
+- `--integrate-voice-image-edit` — also patch
+  `samples/voice-image-edit/app/frontend/src/app/edit/page.tsx` to
+  mount `<NeuronDrawer />` and add the `file:` dependency to its
+  `package.json`. After this you still need to ship the patched
+  frontend with `voice-image-edit/scripts/deploy-all.sh --only voice-image-edit-app`.
+- `--dry-run` — print every step without touching SSM / CDK.
+
+A non-zero exit emits a final-line marker so wrappers that pipe
+through `tee` can still detect failure:
+
+```
+[anatomy][NG] failed at step '<step>' (exit=<n>)
+```
+
+For embedding the React component into other samples see
+[docs/EMBEDDING.md](./docs/EMBEDDING.md).

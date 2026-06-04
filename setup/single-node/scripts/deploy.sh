@@ -1518,6 +1518,26 @@ if [[ "$RECOVER" == true ]]; then
                     echo "  bash $SCRIPT_DIR/setup-code-server.sh ${SETUP_ARGS[*]}"
                     exit 1
                 }
+
+                # Optional: install Neuron Explorer behind /explorer/. The
+                # normal deploy path runs this block too (line ~1904); we
+                # mirror it here so --recover --enable-explorer is a true
+                # one-shot. Idempotent: setup-explorer.sh skips when the
+                # systemd unit + nginx snippet are already in place.
+                if [[ "$ENABLE_EXPLORER" == true ]]; then
+                    EXPLORER_ARGS=(
+                        -i "$INSTANCE_ID"
+                        -r "$REGION"
+                        --explorer-display-name "$EXPLORER_DISPLAY_NAME"
+                    )
+                    echo ""
+                    echo -e "${BLUE}[RECOVER] Installing Neuron Explorer (--enable-explorer)${NC}"
+                    bash "$SCRIPT_DIR/setup-explorer-wrapper.sh" "${EXPLORER_ARGS[@]}" || {
+                        echo -e "${YELLOW}[WARN] Neuron Explorer setup failed${NC}"
+                        echo -e "${YELLOW}Re-run manually:${NC}"
+                        echo "  bash $SCRIPT_DIR/setup-explorer-wrapper.sh ${EXPLORER_ARGS[*]}"
+                    }
+                fi
             fi
 
             echo ""

@@ -866,9 +866,12 @@ deploy_frontend_service() {
         echo -e "${BLUE}[INFO] building frontend (next build, standalone) in ${fe_dir}${NC}"
         (
             cd "$fe_dir"
-            if [[ ! -d node_modules ]]; then
-                npm ci --silent
-            fi
+            # Run npm ci unconditionally (not just when node_modules is
+            # absent). file: dependencies that landed via npm install on a
+            # developer machine remain in node_modules even after the
+            # underlying source moved or the package was renamed; only npm
+            # ci against the lock file recreates the correct symlinks.
+            npm ci --silent
             npm run build
         )
     else

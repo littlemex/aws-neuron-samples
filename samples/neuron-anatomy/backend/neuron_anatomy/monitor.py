@@ -60,11 +60,16 @@ def _build_config_json() -> str:
                 ],
             }
         ],
+        # neuron_hardware_info is not available as a system metric on the
+        # currently installed neuron-monitor (Neuron 2.x reports
+        # "available: vcpu_usage, memory_info, self_stats, neuron_hw_counters").
+        # The instance/topology info we used to derive from it is now
+        # picked up from neuron-ls -j at startup, so dropping it here
+        # has no functional impact.
         "system_metrics": [
             {"type": "vcpu_usage"},
             {"type": "memory_info"},
             {"period": f"{_NEURON_MONITOR_PERIOD_S}s", "type": "neuron_hw_counters"},
-            {"type": "neuron_hardware_info"},
         ],
     }
     return json.dumps(cfg)
@@ -75,12 +80,15 @@ def _summarize_runtime(runtime: dict[str, Any]) -> RuntimeSample:
     exec_stats = report.get("execution_stats") or {}
     err = exec_stats.get("error_summary") or {}
     latency = exec_stats.get("latency_stats") or {}
+    # `device_latency` is sometimes present but null (no recent inference);
+    # fall back to {} so the .get("p50") below cannot throw.
+    device_latency = latency.get("device_latency") or {}
     return RuntimeSample(
         pid=runtime.get("pid"),
         tag=runtime.get("tag"),
         error_summary={k: int(v) for k, v in err.items() if isinstance(v, (int, float))},
-        latency_p50_ms=_seconds_to_ms(latency.get("device_latency", {}).get("p50")),
-        latency_p99_ms=_seconds_to_ms(latency.get("device_latency", {}).get("p99")),
+        latency_p50_ms=_seconds_to_ms(device_latency.get("p50")),
+        latency_p99_ms=_seconds_to_ms(device_latency.get("p99")),
     )
 
 
@@ -99,12 +107,12 @@ def _extract_cores(runtime_data: list[dict[str, Any]]) -> list[NeuronCoreSample]
     for runtime in runtime_data or []:
         report = runtime.get("report") or {}
         ncc = (report.get("neuroncore_counters") or {}).get("neuroncores_in_use") or {}
-        mem_used_breakdown = (
-            (report.get("memory_used") or {})
-            .get("neuron_runtime_used_bytes", {})
-            .get("usage_breakdown", {})
-            .get("neuroncore_memory_usage", {})
-        )
+        # Defensive: any of these intermediate keys can come back as null
+        # rather than missing, which would make .get(...) raise.
+        memory_used = report.get("memory_used") or {}
+        used_bytes = memory_used.get("neuron_runtime_used_bytes") or {}
+        usage_breakdown = used_bytes.get("usage_breakdown") or {}
+        mem_used_breakdown = usage_breakdown.get("neuroncore_memory_usage") or {}
         for nc_key, payload in ncc.items():
             try:
                 nc_id = int(nc_key)
@@ -301,17 +309,24 @@ class MonitorService:
                     pass
 
     async def _run(self) -> None:
+        # Backoff between failures: start at 5 s and grow up to 60 s so a
+        # broken setup does not flood the journal with restart spam.
+        backoff = 5.0
         while not self._stopped.is_set():
             try:
                 if _FAKE:
                     await self._run_fake()
                 else:
                     await self._run_real()
+                # Successful exit (e.g. neuron-monitor terminated cleanly):
+                # reset the backoff before the next loop.
+                backoff = 5.0
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
-                log.exception("neuron-monitor loop crashed; retry in 3s")
-                await asyncio.sleep(3.0)
+                log.exception("neuron-monitor loop crashed; retry in %.0fs", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
 
     async def _run_real(self) -> None:
         if not (shutil.which(_NEURON_MONITOR_BIN) or os.path.exists(_NEURON_MONITOR_BIN)):
@@ -319,9 +334,20 @@ class MonitorService:
             await asyncio.sleep(10.0)
             return
 
-        cfg_path = "/tmp/neuron-anatomy-monitor.json"
-        with open(cfg_path, "w", encoding="utf-8") as fh:
-            fh.write(_build_config_json())
+        # Write the config to a path that survives systemd PrivateTmp=true
+        # by writing it into the working directory rather than /tmp. The
+        # working directory belongs to the unit user so this is writable.
+        cfg_path = os.environ.get(
+            "NEURON_ANATOMY_MONITOR_CFG",
+            os.path.join(os.getcwd(), "neuron-anatomy-monitor.json"),
+        )
+        try:
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                fh.write(_build_config_json())
+        except OSError as exc:
+            log.error("failed to write neuron-monitor config to %s: %s", cfg_path, exc)
+            await asyncio.sleep(10.0)
+            return
 
         log.info("spawning %s -c %s", _NEURON_MONITOR_BIN, cfg_path)
         self._proc = await asyncio.create_subprocess_exec(
@@ -333,23 +359,65 @@ class MonitorService:
         )
 
         assert self._proc.stdout is not None
-        async for line in self._proc.stdout:
-            if self._stopped.is_set():
-                break
-            text = line.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
+
+        # Default StreamReader buffer is 64 KiB; neuron-monitor regularly
+        # emits JSON lines larger than that on trn2.48xlarge with many
+        # loaded models. Bump the limit on the existing reader so
+        # readline() does not raise "Separator is found, but chunk is
+        # longer than limit".
+        try:
+            self._proc.stdout._limit = 64 * 1024 * 1024  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Drain stderr in the background so a chatty tool cannot fill the
+        # pipe and block the producer; surface any messages in the journal.
+        async def _drain_stderr() -> None:
+            assert self._proc is not None and self._proc.stderr is not None
+            async for raw_line in self._proc.stderr:
+                msg = raw_line.decode("utf-8", errors="replace").strip()
+                if msg:
+                    log.warning("neuron-monitor stderr: %s", msg[:300])
+
+        stderr_task = asyncio.create_task(_drain_stderr())
+
+        # Read raw chunks instead of readline() to avoid asyncio's per-line
+        # buffer limit even after raising _limit. Lines are split on '\n'
+        # in user space and any trailing partial line is carried over.
+        try:
+            buf = bytearray()
+            while not self._stopped.is_set():
+                chunk = await self._proc.stdout.read(65536)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                # Drain every complete line in the buffer.
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    line_bytes = bytes(buf[:nl])
+                    del buf[: nl + 1]
+                    text = line_bytes.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+                    try:
+                        raw = json.loads(text)
+                    except json.JSONDecodeError:
+                        log.debug("non-json line: %s", text[:120])
+                        continue
+                    try:
+                        snap = _normalize_line(raw)
+                    except Exception:  # noqa: BLE001
+                        log.exception("failed to normalize neuron-monitor line")
+                        continue
+                    await self._publish(snap)
+        finally:
+            stderr_task.cancel()
             try:
-                raw = json.loads(text)
-            except json.JSONDecodeError:
-                log.debug("non-json line: %s", text[:120])
-                continue
-            try:
-                snap = _normalize_line(raw)
-            except Exception:  # noqa: BLE001
-                log.exception("failed to normalize neuron-monitor line")
-                continue
-            await self._publish(snap)
+                await stderr_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
 
         rc = await self._proc.wait()
         log.warning("neuron-monitor exited with rc=%s", rc)
