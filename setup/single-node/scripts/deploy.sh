@@ -1540,6 +1540,89 @@ if [[ "$RECOVER" == true ]]; then
                 fi
             fi
 
+            # ----------------------------------------------------------
+            # Step: re-deploy auth-related sibling stacks if the operator
+            # passed a setting that lives there but not on the EC2 stack
+            # (currently: --session-ttl). The fast recover path otherwise
+            # never touches AlbBackendStack, so a `--recover --session-ttl
+            # 86400` would silently keep the old SESSION_TTL_SECONDS=3600
+            # on the OAuth Lambda.
+            #
+            # Critical: AlbBackendStack and CloudFrontFrontendStack share
+            # cross-stack references via Fn::ImportValue. Deploying ALB
+            # alone with `cdk deploy <alb-stack>` would synth without the
+            # frontend stack in the assembly, so CloudFormation would see
+            # the related Outputs as orphaned and try to delete them —
+            # breaking the Frontend stack that imports them. We therefore
+            # synth Cognito + ALB + CloudFront in the same run (mirroring
+            # the original deploy) and let CDK update only the diffs.
+            # Cognito and CloudFront are no-ops; only the OAuth Lambda
+            # env on ALB actually changes.
+            # ----------------------------------------------------------
+            if [[ -n "$SESSION_TTL_SECONDS" ]]; then
+                ALB_STACK_NAME_RECOVER="${STACK_NAME}-alb"
+                COGNITO_STACK_NAME_RECOVER="${STACK_NAME}-cognito"
+                FRONTEND_STACK_NAME_RECOVER="${STACK_NAME}-frontend"
+                ALB_STACK_STATUS_RECOVER=$(get_stack_status "$ALB_STACK_NAME_RECOVER" "$REGION" 2>/dev/null || echo "")
+                if [[ "$ALB_STACK_STATUS_RECOVER" =~ ^(CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)$ ]]; then
+                    echo ""
+                    echo -e "${BLUE}[RECOVER] Re-deploying auth stacks (cognito + alb + frontend) to apply --session-ttl ${SESSION_TTL_SECONDS}${NC}"
+                    # Recover the operator email / cognito domain prefix
+                    # from the existing Cognito stack outputs. This keeps
+                    # the synth identical to the original deploy so CDK
+                    # produces a no-op diff for everything except the
+                    # OAuth Lambda env we are actually trying to change.
+                    EC2_SG_RECOVER=$(aws ec2 describe-instances \
+                        --instance-ids "$INSTANCE_ID" --region "$REGION" \
+                        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' \
+                        --output text 2>/dev/null)
+                    EXISTING_DOMAIN_PREFIX=$(aws cloudformation describe-stacks --stack-name "$COGNITO_STACK_NAME_RECOVER" --region "$REGION" \
+                        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' --output text 2>/dev/null)
+                    EXISTING_OPERATOR_EMAIL=$(aws cloudformation describe-stacks --stack-name "$COGNITO_STACK_NAME_RECOVER" --region "$REGION" \
+                        --query 'Stacks[0].Outputs[?OutputKey==`OperatorEmail`].OutputValue' --output text 2>/dev/null)
+                    AUTH_RECOVER_PARAMS=(
+                        "-c" "stackName=$STACK_NAME"
+                        "-c" "createAlbBackend=true"
+                        "-c" "albEc2InstanceId=$INSTANCE_ID"
+                        "-c" "albEc2SecurityGroupId=$EC2_SG_RECOVER"
+                        "-c" "createCognito=true"
+                        "-c" "createCloudFrontFrontend=true"
+                        "-c" "sessionTtlSeconds=$SESSION_TTL_SECONDS"
+                    )
+                    # Prefer the value the user just passed; otherwise
+                    # round-trip through the existing Cognito stack
+                    # outputs so we don't accidentally rename the domain
+                    # or drop the bootstrapped operator email.
+                    DOMAIN_PREFIX_USED="${COGNITO_DOMAIN_PREFIX:-$EXISTING_DOMAIN_PREFIX}"
+                    OPERATOR_EMAIL_USED="${OPERATOR_EMAIL:-$EXISTING_OPERATOR_EMAIL}"
+                    [[ -n "$DOMAIN_PREFIX_USED" ]] && AUTH_RECOVER_PARAMS+=("-c" "cognitoDomainPrefix=$DOMAIN_PREFIX_USED")
+                    [[ -n "$OPERATOR_EMAIL_USED" ]] && AUTH_RECOVER_PARAMS+=("-c" "operatorEmail=$OPERATOR_EMAIL_USED")
+                    [[ -n "$OPERATOR_PASSWORD_SECRET_ARN" ]] && AUTH_RECOVER_PARAMS+=("-c" "operatorPasswordSecretArn=$OPERATOR_PASSWORD_SECRET_ARN")
+                    [[ -n "$PROJECT" ]] && AUTH_RECOVER_PARAMS+=("-c" "project=$PROJECT")
+                    [[ -n "$PURPOSE" ]] && AUTH_RECOVER_PARAMS+=("-c" "purpose=$PURPOSE")
+
+                    # Deploy all three stacks in one cdk run so the
+                    # cross-stack ImportValue references are preserved.
+                    # Cognito + Frontend produce no real changes; ALB
+                    # gets a Lambda env update.
+                    (cd "$CDK_DIR" && aws_creds_refresh && \
+                        AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" \
+                        npx cdk deploy \
+                            "$COGNITO_STACK_NAME_RECOVER" \
+                            "$ALB_STACK_NAME_RECOVER" \
+                            "$FRONTEND_STACK_NAME_RECOVER" \
+                            "${AUTH_RECOVER_PARAMS[@]}" \
+                            --require-approval never) || {
+                        echo -e "${YELLOW}[WARN] auth-stack re-deploy failed — session TTL may not be applied.${NC}"
+                        echo -e "${YELLOW}    Re-run manually:${NC}"
+                        echo -e "${YELLOW}    cd $CDK_DIR && npx cdk deploy $COGNITO_STACK_NAME_RECOVER $ALB_STACK_NAME_RECOVER $FRONTEND_STACK_NAME_RECOVER ${AUTH_RECOVER_PARAMS[*]}${NC}"
+                    }
+                    echo -e "${GREEN}[OK] auth stacks re-deployed (sessionTtlSeconds=$SESSION_TTL_SECONDS)${NC}"
+                else
+                    echo -e "${YELLOW}[WARN] $ALB_STACK_NAME_RECOVER status=$ALB_STACK_STATUS_RECOVER — skipping auth re-deploy. session-ttl not applied.${NC}"
+                fi
+            fi
+
             echo ""
             echo -e "${GREEN}=========================================${NC}"
             echo -e "${GREEN}[OK] Recovery complete${NC}"
