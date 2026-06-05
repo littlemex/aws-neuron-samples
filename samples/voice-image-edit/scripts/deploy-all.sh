@@ -272,10 +272,12 @@ step_qie_prepare() {
 }
 
 # --- step: whisper-server ---
-# Uses the NxD server (TP=8). Pinned to NeuronCores 24-39 by
-# whisper-nxd-server.json; non-overlapping with Qwen3-VL (0-15) and
-# Qwen-Image-Edit (16-23). The first health check on a freshly compiled
-# model can take several minutes, so the upstream task allows 600s.
+# Uses the NxD server (TP=8). Pinned to NeuronCores 48-55 by
+# whisper-nxd-server.json; non-overlapping with Qwen-Image-Edit (0-31)
+# and Qwen3-VL (32-47). cores 48-55 require trn2.48xlarge (LNC=2 -> 64
+# logical cores); on trn2.3xlarge / trn2.8xlarge override NEURON_CORES.
+# The first health check on a freshly compiled model can take several
+# minutes, so the upstream task allows up to 1800s.
 step_whisper_server() {
   section "whisper-server (NxD)"
   local tarball_url

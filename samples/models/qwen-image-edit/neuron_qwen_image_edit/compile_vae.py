@@ -24,7 +24,13 @@ from autoencoder_kl_qwenimage_neuron import AutoencoderKLQwenImage as NeuronAuto
 # Override SDPA
 torch.nn.functional.scaled_dot_product_attention = attention_wrapper
 
-CACHE_DIR = "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"
+# Cache location precedence: explicit HF_CACHE_DIR -> standard HF_HOME ->
+# the DLAMI NVMe convention. Allows non-DLAMI hosts (AL2023, custom AMI)
+# to point at a writable directory without editing source.
+CACHE_DIR = os.environ.get(
+    "HF_CACHE_DIR",
+    os.environ.get("HF_HOME", "/opt/dlami/nvme/qwen_image_edit_hf_cache_dir"),
+)
 MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 
 

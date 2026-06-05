@@ -42,6 +42,12 @@ _FAKE_VARIANT = os.environ.get("NEURON_ANATOMY_FAKE_VARIANT", "trn2.48xlarge")
 
 # Static specs for a Trainium2 chip, used by the frontend to label silhouettes.
 # Switch this block when adding support for other generations.
+#
+# TODO(trainium3): the chip generation is currently hardcoded to Trainium2.
+# When neuron-ls exposes a generation hint (or NEURON_ANATOMY_CHIP_GEN env var
+# is provided), select the spec block via lookup so trn3 / trn3u layouts can
+# render without source edits. Keep _TRAINIUM2_ENGINE_SPECS as the default to
+# preserve current behaviour on existing Trn2 fleets.
 _TRAINIUM2_ENGINE_SPECS = ChipEngineSpecs(
     chip_label="Trainium2 chip",
     hbm_stack_count_per_chip=4,

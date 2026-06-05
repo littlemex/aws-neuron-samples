@@ -1,18 +1,18 @@
 {
   "name": "Qwen-Image-Edit-2511 serve.py (FastAPI multipart /infer) on EC2",
-  "description": "samples/models/qwen-image-edit/start.sh + serve.py を systemd で常駐起動する。事前に qwen-image-edit-prepare.json で /mnt/local/compiled_models/ に V3 CFG artifacts が揃っている必要がある。 NeuronCore 16-23 (TP=4 DP=2 world_size=8) を専有し、 port {{PORT}} で FastAPI (POST /infer multipart, GET /health, POST /vton/infer alias) を提供。 source は presigned URL 経由で配布。",
+  "description": "samples/models/qwen-image-edit/start.sh + serve.py を systemd で常駐起動する。事前に qwen-image-edit-prepare.json で /mnt/local/compiled_models_tp16/ に V3 TP16 artifacts が揃っている必要がある。 NeuronCore 0-31 (TP=16 DP=2 world_size=32) を専有し、 port {{PORT}} で FastAPI (POST /infer multipart, GET /health, POST /vton/infer alias) を提供。 source は presigned URL 経由で配布。",
   "variables": {
     "SOURCE_TARBALL_URL": "",
     "SERVE_DIR": "/opt/voice-image-edit/qwen-image-edit-server",
     "SERVE_USER": "ubuntu",
     "PORT": "8081",
     "HOST": "0.0.0.0",
-    "COMPILED_MODELS_DIR": "/mnt/local/compiled_models",
+    "COMPILED_MODELS_DIR": "/mnt/local/compiled_models_tp16",
     "HEIGHT": "1024",
     "WIDTH": "1024",
     "PATCH_MULTIPLIER": "3",
-    "NEURON_CORES": "16-23",
-    "WORLD_SIZE": "8",
+    "NEURON_CORES": "0-31",
+    "WORLD_SIZE": "32",
     "PATH_PREFIX": "/qwen-image-edit",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference",
     "HF_HOME_DIR": "/models/hf-cache",
@@ -22,7 +22,7 @@
     {
       "id": "00-precheck",
       "name": "Verify venv + compiled artifacts",
-      "description": "venv と compile artifact (transformer_v3_cfg/ 等) があること。",
+      "description": "venv と compile artifact (transformer_v3_cfg/ 等) が compiled_models_tp16/ 下にあること。",
       "commands": [
         "set -e",
         "test -x {{VENV}}/bin/python || { echo '[NG] venv missing: {{VENV}}'; exit 1; }",
@@ -78,7 +78,7 @@
     {
       "id": "40-install-systemd-unit",
       "name": "Install qwen-image-edit.service systemd unit",
-      "description": "Restart=always で常駐。 NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} で 8 cores 専有。 port {{PORT}} で listen。 PATH_PREFIX={{PATH_PREFIX}} (FastAPI に /qwen-image-edit/health 等の prefix endpoint も載る、 / 直下も生かす)。",
+      "description": "Restart=always で常駐。 NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} で 32 cores 専有 (TP=16 DP=2 world_size=32)。 port {{PORT}} で listen。 PATH_PREFIX={{PATH_PREFIX}} (FastAPI に /qwen-image-edit/health 等の prefix endpoint も載る、 / 直下も生かす)。",
       "commands": [
         "set -e",
         "cat > /etc/systemd/system/qwen-image-edit.service <<'EOF'",

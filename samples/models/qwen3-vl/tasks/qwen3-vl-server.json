@@ -1,6 +1,6 @@
 {
   "name": "Qwen3-VL-8B-Thinking vLLM Neuron server (OpenAI compatible) on EC2",
-  "description": "samples/models/qwen3-vl/start.sh を systemd で常駐起動する。事前に qwen3-vl-prepare.json で warm-up が完了 (= /models/Qwen3-VL-8B-Thinking/.neuron_warmup_done が存在) している必要がある。 NeuronCore 0-15 (TP=16) を専有し、 port {{PORT}} で OpenAI 互換 API (/v1/chat/completions, /health) を提供する。 start.sh は presigned URL 経由で配布。",
+  "description": "samples/models/qwen3-vl/start.sh を systemd で常駐起動する。事前に qwen3-vl-prepare.json で warm-up が完了 (= /models/Qwen3-VL-8B-Thinking/.neuron_warmup_done が存在) している必要がある。 NeuronCore 32-47 (TP=16) を専有し、 port {{PORT}} で OpenAI 互換 API (/v1/chat/completions, /health) を提供する。 start.sh は presigned URL 経由で配布。 Qwen-Image-Edit が cores 0-31 (TP=16) を使う配分のため Qwen3-VL は 32-47 に移動。",
   "variables": {
     "SERVER_TARBALL_URL": "",
     "SERVE_DIR": "/opt/voice-image-edit/qwen3-vl-server",
@@ -8,7 +8,7 @@
     "PORT": "8090",
     "MODEL_ID": "Qwen/Qwen3-VL-8B-Thinking",
     "MODEL_DIR": "/models/Qwen3-VL-8B-Thinking",
-    "NEURON_CORES": "0-15",
+    "NEURON_CORES": "32-47",
     "VENV": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16"
   },
   "tasks": [
@@ -57,7 +57,7 @@
     {
       "id": "30-install-systemd-unit",
       "name": "Install qwen3-vl.service systemd unit",
-      "description": "Restart=always で常駐。 NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} で 16 cores 専有。 vllm serve は既存 cache を使うので 5-10 min で /health 200 になる想定。",
+      "description": "Restart=always で常駐。 NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} (default 32-47, 16 cores 専有, trn2.48xlarge 前提)。 vllm serve は既存 cache を使うので 5-10 min で /health 200 になる想定。",
       "commands": [
         "set -e",
         "cat > /etc/systemd/system/qwen3-vl.service <<'EOF'",

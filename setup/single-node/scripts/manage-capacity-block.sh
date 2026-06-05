@@ -28,7 +28,7 @@ Commands:
     list-params                          List every Capacity Block slot stored in Parameter Store
 
 Options:
-    -r, --region REGION                  AWS region (default: sa-east-1)
+    -r, --region REGION                  AWS region (no default; honours AWS_DEFAULT_REGION / AWS_REGION env vars)
     -t, --instance-type TYPE             Instance type (default: trn2.3xlarge)
     -c, --instance-count COUNT           Instance count (default: 1)
     -d, --duration HOURS                 Duration in hours (default: 1)
@@ -69,9 +69,11 @@ Examples:
 EOF
 }
 
-# Default values
+# Default values. REGION must be set explicitly via -r/--region or via
+# AWS_DEFAULT_REGION/AWS_REGION env vars; the previous sa-east-1 default
+# silently sent capacity-block searches and PURCHASES to the wrong region.
 COMMAND=""
-REGION="sa-east-1"
+REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-}}"
 INSTANCE_TYPE="trn2.3xlarge"
 INSTANCE_COUNT="1"
 DURATION="1"
@@ -154,6 +156,14 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Region is required for every subcommand because the API calls below all
+# need it; fail fast rather than silently targeting the wrong region.
+if [[ -z "$REGION" ]]; then
+    echo -e "${RED}Error: AWS region is required (-r/--region or AWS_REGION/AWS_DEFAULT_REGION env var)${NC}"
+    usage
+    exit 1
+fi
 
 # Execute command
 case "$COMMAND" in

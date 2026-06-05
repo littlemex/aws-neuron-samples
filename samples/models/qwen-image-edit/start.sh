@@ -1,18 +1,39 @@
 #!/usr/bin/env bash
-# Qwen-Image-Edit 個別起動 (TP=8, NeuronCore 16-23)
+# Qwen-Image-Edit 個別起動 (vLLM/Neuron diffusers).
+# Default core window = 0-31 on trn2.48xlarge (TP=16 + CFG-DP=2 -> world_size=32, LNC=2).
+# voice-image-edit 3-model layout: Qwen-Image-Edit=0-31, Qwen3-VL=32-47, Whisper=48-55.
+# trn2.3xlarge / trn2.8xlarge では --cores と --world-size を上書きすること。
 # 既に同ポートで起動中の場合はスキップ。
 set -euo pipefail
 
 PORT="${PORT:-8081}"
 HOST="${HOST:-0.0.0.0}"
-COMPILED_DIR="${COMPILED_DIR:-/opt/dlami/nvme/compiled_models}"
+COMPILED_DIR="${COMPILED_DIR:-/opt/dlami/nvme/compiled_models_tp16}"
 HEIGHT="${HEIGHT:-1024}"
 WIDTH="${WIDTH:-1024}"
 PATCH_MULT="${PATCH_MULT:-3}"
-NEURON_CORES="${NEURON_CORES:-16-23}"
-WORLD_SIZE="${WORLD_SIZE:-8}"
+NEURON_CORES="${NEURON_CORES:-0-31}"
+WORLD_SIZE="${WORLD_SIZE:-32}"
 SERVE_PY="${SERVE_PY:-${PWD}/serve.py}"
-VENV="${VENV:-/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference}"
+
+# venv resolution: explicit override -> pinned path -> newest matching
+# DLAMI venv via glob. The pinned path encodes the PyTorch version
+# (2.9 today) and breaks on every DLAMI bump; the glob fallback survives
+# DLAMI updates by picking the highest-version directory present.
+_resolve_venv() {
+  if [[ -n "${VENV:-}" ]] && [[ -x "${VENV}/bin/python" ]]; then return 0; fi
+  local pinned="/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference"
+  if [[ -x "${pinned}/bin/python" ]]; then VENV="$pinned"; return 0; fi
+  local newest
+  newest=$(ls -d /opt/aws_neuronx_venv_pytorch_*_nxd_inference 2>/dev/null | sort -V | tail -1)
+  if [[ -n "$newest" ]] && [[ -x "${newest}/bin/python" ]]; then
+    VENV="$newest"
+    echo "[vton] using auto-detected venv: $VENV"
+    return 0
+  fi
+  return 1
+}
+_resolve_venv || true
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

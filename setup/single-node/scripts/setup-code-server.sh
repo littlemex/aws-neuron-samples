@@ -12,7 +12,7 @@ Usage: $0 [OPTIONS]
 
 Options:
     -i, --instance-id ID            Target EC2 instance ID (required)
-    -r, --region REGION             AWS region (default: sa-east-1)
+    -r, --region REGION             AWS region (no default; honours AWS_DEFAULT_REGION / AWS_REGION env vars)
     -u, --user USERNAME             Code Server username (default: coder)
     -p, --password PASSWORD         Code Server password (if omitted, retrieved from Secrets Manager)
     -s, --secret-arn ARN            Secrets Manager ARN (for automatic password retrieval)
@@ -53,9 +53,11 @@ Examples:
 EOF
 }
 
-# Default values
+# Default values. REGION falls through to the operator's environment so a
+# fresh shell does not silently target sa-east-1 (the previous default
+# left over from the P9 dev environment).
 INSTANCE_ID=""
-REGION="sa-east-1"
+REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-}}"
 USER="coder"
 PASSWORD=""
 SECRET_ARN=""
@@ -148,6 +150,11 @@ done
 # Required parameter check
 if [[ -z "$INSTANCE_ID" ]]; then
     echo "Error: Instance ID is required (-i option)"
+    usage
+    exit 1
+fi
+if [[ -z "$REGION" ]]; then
+    echo "Error: AWS region is required (-r/--region or AWS_REGION/AWS_DEFAULT_REGION env var)"
     usage
     exit 1
 fi

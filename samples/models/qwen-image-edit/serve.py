@@ -36,18 +36,26 @@ os.environ["NEURON_LOGICAL_NC_CONFIG"] = "2"
 os.environ["NEURON_FUSE_SOFTMAX"] = "1"
 os.environ["NEURON_CUSTOM_SILU"] = "1"
 
-# Parse server args early so they're available at module level
+# Parse server args early so they're available at module level.
+# Defaults pull from the environment first so the same binary works on
+# DLAMI, AL2023, and inside Docker without surgery to the source code.
+# The PORT default (8081) matches start.sh's liveness check; an earlier
+# default of 8080 caused start.sh to mis-detect a stale process and
+# immediately re-launch on top of it. The WIDTH default (1024) matches
+# compile.sh's compiled-graph dimensions; an older default of 512 caused
+# a shape mismatch on the first inference call.
 _parser = argparse.ArgumentParser(description="Qwen-Image-Edit inference server")
-_parser.add_argument("--host", type=str, default="0.0.0.0")
-_parser.add_argument("--port", type=int, default=8080)
+_parser.add_argument("--host", type=str, default=os.environ.get("HOST", "0.0.0.0"))
+_parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8081")))
 _parser.add_argument("--compiled_models_dir", type=str,
-                     default="/opt/dlami/nvme/compiled_models_tp16")
+                     default=os.environ.get("COMPILED_DIR",
+                                            "/opt/dlami/nvme/compiled_models_tp16"))
 _parser.add_argument("--s3_models_uri", type=str,
                      default=os.environ.get("VTON_S3_MODELS_URI", ""),
                      help="S3 URI for compiled VTON models. Required unless --compiled_models_dir already populated.")
-_parser.add_argument("--height", type=int, default=1024)
-_parser.add_argument("--width", type=int, default=512)
-_parser.add_argument("--patch_multiplier", type=int, default=3)
+_parser.add_argument("--height", type=int, default=int(os.environ.get("HEIGHT", "1024")))
+_parser.add_argument("--width", type=int, default=int(os.environ.get("WIDTH", "1024")))
+_parser.add_argument("--patch_multiplier", type=int, default=int(os.environ.get("PATCH_MULT", "3")))
 _parser.add_argument("--num_inference_steps", type=int, default=50)
 _parser.add_argument("--true_cfg_scale", type=float, default=3.0)
 _parser.add_argument("--use_v3_cfg", action="store_true", default=True)
