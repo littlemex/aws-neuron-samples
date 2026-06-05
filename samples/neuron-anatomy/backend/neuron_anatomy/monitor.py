@@ -30,10 +30,14 @@ from typing import Any, Optional
 
 from .schemas import (
     ChipSample,
+    DeviceMemory,
+    HostMemory,
     NeuronCoreSample,
     RuntimeSample,
     Snapshot,
+    SystemStats,
     V3dSubCore,
+    VcpuUsage,
 )
 from .topology import topology_cache
 
@@ -57,6 +61,11 @@ def _build_config_json() -> str:
                     {"type": "neuroncore_counters"},
                     {"type": "memory_used"},
                     {"type": "execution_stats"},
+                    # Per-runtime vCPU rollup. neuron-monitor calls this
+                    # "neuron_runtime_vcpu_usage" (different from the
+                    # system_metrics "vcpu_usage"); the config validator
+                    # rejects "vcpu_usage" inside neuron_runtimes.
+                    {"type": "neuron_runtime_vcpu_usage"},
                 ],
             }
         ],
@@ -102,13 +111,24 @@ def _seconds_to_ms(v: Any) -> Optional[float]:
 
 
 def _extract_cores(runtime_data: list[dict[str, Any]]) -> list[NeuronCoreSample]:
-    """Aggregate neuron_runtime_data[].report.neuroncore_counters.neuroncores_in_use."""
+    """Aggregate neuron_runtime_data[].report.neuroncore_counters.neuroncores_in_use.
+
+    A given logical NeuronCore is owned by at most one runtime in any sane
+    deployment, but neuron-monitor still reports the same nc id from every
+    runtime when its tag_filter matches them all (each runtime emits zeros
+    for cores it does not own). The previous "max utilisation wins" rule
+    therefore worked for utilisation but silently dropped the *non-zero*
+    memory_used_bytes from the runtime that actually owns the core.
+    Iterate twice instead: pick the runtime that reports non-zero util OR
+    non-zero memory and merge per-field, falling back to zeros only when
+    no runtime reports anything.
+    """
     out: dict[int, NeuronCoreSample] = {}
+    # nc_id -> (util, flops, v3d_sub, memory_used_bytes)
+    aggregated: dict[int, dict[str, Any]] = {}
     for runtime in runtime_data or []:
         report = runtime.get("report") or {}
         ncc = (report.get("neuroncore_counters") or {}).get("neuroncores_in_use") or {}
-        # Defensive: any of these intermediate keys can come back as null
-        # rather than missing, which would make .get(...) raise.
         memory_used = report.get("memory_used") or {}
         used_bytes = memory_used.get("neuron_runtime_used_bytes") or {}
         usage_breakdown = used_bytes.get("usage_breakdown") or {}
@@ -123,7 +143,6 @@ def _extract_cores(runtime_data: list[dict[str, Any]]) -> list[NeuronCoreSample]
             v3d = payload.get("v3d")
             v3d_sub: Optional[list[V3dSubCore]] = None
             if isinstance(v3d, dict):
-                # Order: v3d.nc_v3.0 then v3d.nc_v3.1
                 nc_v3 = v3d.get("nc_v3") or {}
                 subs = []
                 for k in ("0", "1"):
@@ -140,20 +159,36 @@ def _extract_cores(runtime_data: list[dict[str, Any]]) -> list[NeuronCoreSample]
             mem_for_core = mem_used_breakdown.get(str(nc_id)) or {}
             mem_total = sum(
                 int(v) for v in mem_for_core.values() if isinstance(v, (int, float))
-            ) or None
-
-            # When the same nc id appears under multiple runtimes, keep the
-            # busier entry (max utilisation).
-            existing = out.get(nc_id)
-            if existing and existing.utilisation >= util:
-                continue
-            out[nc_id] = NeuronCoreSample(
-                nc_id=nc_id,
-                utilisation=util,
-                flops=float(flops) if isinstance(flops, (int, float)) else None,
-                v3d_sub=v3d_sub,
-                memory_used_bytes=mem_total,
             )
+
+            cur = aggregated.setdefault(
+                nc_id,
+                {"util": 0.0, "flops": None, "v3d_sub": None, "mem": 0},
+            )
+            # utilisation: max across runtimes (only one runtime should
+            # actually be non-zero, but be defensive)
+            if util > cur["util"]:
+                cur["util"] = util
+                cur["flops"] = (
+                    float(flops) if isinstance(flops, (int, float)) else cur["flops"]
+                )
+                if v3d_sub:
+                    cur["v3d_sub"] = v3d_sub
+            elif cur["v3d_sub"] is None and v3d_sub:
+                cur["v3d_sub"] = v3d_sub
+            # memory: take the largest non-zero report. The "owning"
+            # runtime fills it in; sibling runtimes fill in zeros.
+            if mem_total > cur["mem"]:
+                cur["mem"] = mem_total
+
+    for nc_id, agg in aggregated.items():
+        out[nc_id] = NeuronCoreSample(
+            nc_id=nc_id,
+            utilisation=agg["util"],
+            flops=agg["flops"],
+            v3d_sub=agg["v3d_sub"],
+            memory_used_bytes=agg["mem"] or None,
+        )
     return [out[k] for k in sorted(out.keys())]
 
 
@@ -215,11 +250,143 @@ def _extract_chips(
     return out
 
 
+def _vcpu_from_average(payload: Any) -> Optional[VcpuUsage]:
+    """Build VcpuUsage from neuron-monitor's `average_usage` block.
+
+    Two shapes appear in the wild:
+      - system_data.vcpu_usage:
+          { period, average_usage: {user, system, idle, io_wait, irq, soft_irq}, usage_data: ... }
+        -> read from .average_usage
+      - neuron_runtime_data[].report.neuron_runtime_vcpu_usage:
+          { period, vcpu_usage: {user, system}, error }
+        -> read from .vcpu_usage (only user/system; idle is implied)
+    Both go through this helper.
+    """
+    if not isinstance(payload, dict):
+        return None
+    block = payload.get("average_usage")
+    if not isinstance(block, dict):
+        block = payload.get("vcpu_usage")
+    if not isinstance(block, dict):
+        return None
+    try:
+        user = float(block.get("user", 0.0))
+        sysm = float(block.get("system", 0.0))
+        # `idle` is only present in the system_data shape. For runtime
+        # vcpu, infer idle from busy so the bar still adds up to 100%.
+        if "idle" in block:
+            idle = float(block["idle"])
+        else:
+            idle = max(0.0, 100.0 - user - sysm)
+        return VcpuUsage(
+            user=user,
+            system=sysm,
+            idle=idle,
+            io_wait=float(block.get("io_wait", 0.0)),
+            irq=float(block.get("irq", 0.0)),
+            soft_irq=float(block.get("soft_irq", 0.0)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_system(
+    raw: dict[str, Any],
+    runtime_data: list[dict[str, Any]],
+    chips: list[ChipSample],
+) -> SystemStats:
+    """Pull host vCPU + memory rollup out of the same neuron-monitor frame.
+
+    Sources:
+      system_data.vcpu_usage             -> system_vcpu (all processes)
+      system_data.memory_info            -> host_memory total/used
+      neuron_runtime_data[].vcpu_usage   -> runtime_vcpu (neuron-runtime processes)
+      neuron_runtime_data[].memory_used  -> host/device breakdowns
+    """
+    sd = raw.get("system_data") or {}
+    system_vcpu = _vcpu_from_average(sd.get("vcpu_usage"))
+    mem_info = sd.get("memory_info") or {}
+    host_total = int(mem_info.get("memory_total_bytes") or 0)
+    host_used = int(mem_info.get("memory_used_bytes") or 0)
+
+    # Aggregate across runtimes. Multiple neuron-runtime processes are rare
+    # but legal (e.g. one per model server). Sum their breakdowns and pick
+    # the runtime with the highest user-mode CPU as the "primary" for the
+    # vCPU bar — averaging would smear a busy runtime under idle ones.
+    runtime_vcpu: Optional[VcpuUsage] = None
+    best_user = -1.0
+    host_tensors = host_consts = host_dma = host_app = 0
+    dev_tensors = dev_consts = dev_code = dev_runtime = dev_scratch = 0
+    for runtime in runtime_data or []:
+        report = runtime.get("report") or {}
+        # neuron-monitor publishes per-runtime CPU usage under
+        # `neuron_runtime_vcpu_usage` (the metric name configured in the
+        # JSON). The block inside is `vcpu_usage: {user, system}` rather
+        # than the system-wide `average_usage` shape.
+        rv = _vcpu_from_average(report.get("neuron_runtime_vcpu_usage"))
+        if rv is not None and rv.user > best_user:
+            runtime_vcpu = rv
+            best_user = rv.user
+        used_bytes = (
+            (report.get("memory_used") or {}).get("neuron_runtime_used_bytes") or {}
+        )
+        host_bd = (used_bytes.get("usage_breakdown") or {}).get("host") or {}
+        host_tensors += int(host_bd.get("tensors", 0) or 0)
+        host_consts += int(host_bd.get("constants", 0) or 0)
+        host_dma += int(host_bd.get("dma_buffers", 0) or 0)
+        host_app += int(host_bd.get("application_memory", 0) or 0)
+        ncm = (used_bytes.get("usage_breakdown") or {}).get(
+            "neuroncore_memory_usage"
+        ) or {}
+        for _, per_core in ncm.items():
+            if not isinstance(per_core, dict):
+                continue
+            dev_tensors += int(per_core.get("tensors", 0) or 0)
+            dev_consts += int(per_core.get("constants", 0) or 0)
+            dev_code += int(per_core.get("model_code", 0) or 0)
+            dev_runtime += int(per_core.get("runtime_memory", 0) or 0)
+            dev_scratch += int(per_core.get("model_shared_scratchpad", 0) or 0)
+
+    host_memory = HostMemory(
+        total_bytes=host_total,
+        used_bytes=host_used,
+        tensors_bytes=host_tensors,
+        constants_bytes=host_consts,
+        dma_buffers_bytes=host_dma,
+        application_memory_bytes=host_app,
+    )
+
+    # Device totals: sum chips' HBM capacity for total, and sum the per-core
+    # breakdown for used (so the bar adds up to the same number the chip
+    # tiles' hbm_used_bytes sum to).
+    dev_total = sum(c.hbm_total_bytes for c in chips)
+    dev_used = (
+        dev_tensors + dev_consts + dev_code + dev_runtime + dev_scratch
+    )
+    device_memory = DeviceMemory(
+        total_bytes=dev_total,
+        used_bytes=dev_used,
+        tensors_bytes=dev_tensors,
+        constants_bytes=dev_consts,
+        model_code_bytes=dev_code,
+        runtime_memory_bytes=dev_runtime,
+        model_shared_scratchpad_bytes=dev_scratch,
+    )
+
+    return SystemStats(
+        system_vcpu=system_vcpu,
+        runtime_vcpu=runtime_vcpu,
+        host_memory=host_memory,
+        device_memory=device_memory,
+    )
+
+
 def _normalize_line(raw: dict[str, Any]) -> Snapshot:
     runtimes_data = raw.get("neuron_runtime_data") or []
     cores = _extract_cores(runtimes_data)
     chips = _extract_chips(cores, raw)
     runtimes = [_summarize_runtime(r) for r in runtimes_data]
+    system = _extract_system(raw, runtimes_data, chips)
 
     # If neuron_hardware_info is present, refresh the topology cache.
     hw = raw.get("neuron_hardware_info") or {}
@@ -234,6 +401,7 @@ def _normalize_line(raw: dict[str, Any]) -> Snapshot:
         chips=chips,
         cores=cores,
         runtimes=runtimes,
+        system=system,
         raw=raw if _INCLUDE_RAW else None,
     )
 
@@ -450,12 +618,52 @@ class MonitorService:
                         )
                     )
             chips = _extract_chips(cores, raw={})
+            # Fake but visually plausible host stats so the new system
+            # panel has something to render in offline dev runs.
+            cpu_user = 12.0 + 5.0 * math.sin(t * 0.4)
+            cpu_sys = 4.0 + 2.0 * math.cos(t * 0.3)
+            sys_vcpu = VcpuUsage(
+                user=max(0.0, cpu_user),
+                system=max(0.0, cpu_sys),
+                idle=max(0.0, 100.0 - cpu_user - cpu_sys),
+            )
+            rt_vcpu = VcpuUsage(
+                user=max(0.0, cpu_user * 0.4),
+                system=max(0.0, cpu_sys * 0.6),
+                idle=max(0.0, 100.0 - cpu_user * 0.4 - cpu_sys * 0.6),
+            )
+            host_total = 192 * 1024 ** 3
+            host_used = int(host_total * (0.20 + 0.05 * math.sin(t * 0.2)))
+            dev_used_per_core = int(20_000_000 + 5_000_000 * math.sin(t * 0.3))
+            num_cores = sum(len(c.neuroncore_ids) for c in topology_cache._cached.chips) if topology_cache._cached else 0
+            system = SystemStats(
+                system_vcpu=sys_vcpu,
+                runtime_vcpu=rt_vcpu,
+                host_memory=HostMemory(
+                    total_bytes=host_total,
+                    used_bytes=host_used,
+                    tensors_bytes=int(host_used * 0.05),
+                    constants_bytes=int(host_used * 0.10),
+                    dma_buffers_bytes=int(host_used * 0.02),
+                    application_memory_bytes=int(host_used * 0.83),
+                ),
+                device_memory=DeviceMemory(
+                    total_bytes=sum(c.hbm_total_bytes for c in chips),
+                    used_bytes=dev_used_per_core * num_cores,
+                    tensors_bytes=int(dev_used_per_core * num_cores * 0.55),
+                    constants_bytes=int(dev_used_per_core * num_cores * 0.08),
+                    model_code_bytes=int(dev_used_per_core * num_cores * 0.12),
+                    runtime_memory_bytes=int(dev_used_per_core * num_cores * 0.05),
+                    model_shared_scratchpad_bytes=int(dev_used_per_core * num_cores * 0.20),
+                ),
+            )
             snap = Snapshot(
                 ts_ms=int(time.time() * 1000),
                 available=True,
                 chips=chips,
                 cores=cores,
                 runtimes=[],
+                system=system,
                 raw=None,
             )
             await self._publish(snap)

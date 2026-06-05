@@ -238,21 +238,58 @@ def replace_variables(text, variables):
         text = text.replace(f"{{{{{key}}}}}", str(value))
     return text
 
-# Normalise S3 presigned URLs into a stable identifier so that fingerprints
-# are content-addressed rather than sensitive to per-request signatures.
-# A URL like https://my-bucket.s3.us-east-2.amazonaws.com/staging/x.tar.gz?
-# X-Amz-Algorithm=...&X-Amz-Signature=... must collapse to
-# "s3://my-bucket/staging/x.tar.gz" so two presigned URLs that point at the
-# same object share the same fingerprint.
+# Normalise S3 presigned URLs into a content-addressed identifier so that
+# fingerprints invalidate when the underlying object actually changes,
+# but stay stable across re-presigns of the SAME object.
+#
+# Earlier versions collapsed presigned URLs to just "s3://bucket/key"; that
+# was strictly safer than hashing the raw URL (which always changed thanks
+# to per-request signatures + X-Amz-Date), but it also masked legitimate
+# updates: a deploy that uploads a fresh tarball under the SAME key kept
+# the same fingerprint and the task was incorrectly skipped. We now reach
+# out to S3 once per URL we see and fold the object's ETag (typically the
+# MD5, or a marker hash for multipart uploads) into the fingerprint, so:
+#   - Fresh deploy with new tarball   -> ETag changes -> fingerprint flips -> task runs
+#   - Re-run with same tarball        -> ETag stable  -> fingerprint stable -> task skipped
+#   - Two presigned URLs to same key  -> share ETag   -> share fingerprint
+# When the ETag lookup fails (network blip, transient IAM denial) we fall
+# back to the URL-key-only behaviour rather than blowing up the deploy.
 _S3_PRESIGN_RE = re.compile(
     r"https?://([a-z0-9.\-]+)\.s3[.\-][a-z0-9\-]+\.amazonaws\.com(/[^\s\"']*)"
 )
+
+# Cache: (bucket, key) -> etag string. Avoids re-hitting S3 once per
+# command in a task list (the URL appears in many rendered commands).
+_etag_cache = {}
+
+def _s3_etag(bucket, key):
+    cache_key = (bucket, key)
+    if cache_key in _etag_cache:
+        return _etag_cache[cache_key]
+    try:
+        result = subprocess.run(
+            ["aws", "s3api", "head-object", "--bucket", bucket, "--key", key,
+             "--query", "ETag", "--output", "text"],
+            capture_output=True, text=True, timeout=20,
+        )
+        if result.returncode == 0:
+            etag = (result.stdout or "").strip().strip('"')
+        else:
+            etag = ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        etag = ""
+    _etag_cache[cache_key] = etag
+    return etag
+
 def _stabilise_url_match(match):
     bucket, key = match.group(1), match.group(2)
-    # Drop the query string (signature, expiry) -- only the canonical S3 URI matters.
     if "?" in key:
         key = key.split("?", 1)[0]
-    return f"s3://{bucket}{key}"
+    key = key.lstrip("/")
+    etag = _s3_etag(bucket, key)
+    if etag:
+        return f"s3://{bucket}/{key}#etag={etag}"
+    return f"s3://{bucket}/{key}"
 
 def stabilise_for_fingerprint(text):
     return _S3_PRESIGN_RE.sub(_stabilise_url_match, text)
@@ -260,11 +297,9 @@ def stabilise_for_fingerprint(text):
 def task_fingerprint(replaced_commands):
     """Hash the rendered commands for cache invalidation.
 
-    Two runs of the same task with identical variables hash to the same
-    digest; if any byte of any rendered command changes (e.g. a new
-    tarball, a renamed env var, a port change), the digest changes and
-    the task re-executes. Presigned S3 URLs are normalised to s3://<bucket>/<key>
-    so they do not invalidate the cache spuriously.
+    Two runs of the same task with identical variables AND the same
+    underlying S3 objects hash to the same digest; uploading a new
+    tarball under the same key flips the ETag and re-executes the task.
     """
     h = hashlib.sha256()
     for cmd in replaced_commands:

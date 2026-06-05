@@ -144,18 +144,22 @@ async def echo(
 
 
 class PipelineRequest(BaseModel):
-    """4 段パイプラインの入力。
+    """Edit pipeline input.
 
-    - image_b64: BEFORE 画像 (base64 / data URL prefix なし)
-    - user_instruction: ユーザー指示テキスト (ASR 後 or 直接入力)
-    - vlm_engine / edit_engine: optional override (None なら server default)
-    - request_id: なければ stream backend 側で発番する
+    Fields:
+      - image_b64: BEFORE image (base64; no data: prefix)
+      - user_instruction: voice-derived (or directly typed) instruction
+      - vlm_engine / edit_engine / tts_engine: optional overrides
+      - enable_tts: when true, append a tts stage that reads the review aloud
+      - request_id: stream backend allocates one when missing
     """
 
     image_b64: str = Field(..., min_length=1)
     user_instruction: str = Field(..., min_length=1)
     vlm_engine: Optional[str] = None
     edit_engine: Optional[str] = None
+    tts_engine: Optional[str] = None
+    enable_tts: bool = False
     request_id: Optional[str] = None
 
 
@@ -401,6 +405,39 @@ async def _run_pipeline(req: PipelineRequest) -> AsyncIterator[bytes]:
                     },
                 )
 
+        # ---- Stage 5 (optional): TTS readout of the review --------------
+        # Only runs when the operator opts in via enable_tts. Non-fatal:
+        # on failure we emit stage_error and still finish the pipeline.
+        review_text = (review_res or {}).get("text") if "review_res" in locals() else None
+        if req.enable_tts and review_text:
+            yield _sse_event("stage_start", {"stage": "tts"})
+            tts_body: dict[str, Any] = {"text": review_text, "request_id": request_id}
+            if req.tts_engine:
+                tts_body["engine"] = req.tts_engine
+            async for kind, payload in _stage_with_heartbeat(
+                _post_edit_api(client, "/tts", tts_body, _HTTP_TIMEOUT_VLM_S),
+                "tts",
+            ):
+                if kind == "heartbeat":
+                    yield payload
+                elif kind == "error":
+                    log.warning("pipeline tts failed: %s", payload)
+                    yield _sse_event("stage_error", _stage_error_payload("tts", payload))
+                    break
+                else:
+                    tts_res = payload or {}
+                    yield _sse_event(
+                        "stage_complete",
+                        {
+                            "stage": "tts",
+                            "engine": tts_res.get("engine"),
+                            "audio_url": tts_res.get("audio_url"),
+                            "audio_format": tts_res.get("audio_format"),
+                            "audio_bytes": tts_res.get("audio_bytes"),
+                            "metadata": tts_res.get("metadata", {}),
+                        },
+                    )
+
         yield _sse_event("pipeline_complete", {"request_id": request_id})
 
 
@@ -409,3 +446,166 @@ async def pipeline(req: PipelineRequest) -> StreamingResponse:
     if not req.image_b64 or not req.user_instruction:
         raise HTTPException(status_code=400, detail="image_b64 and user_instruction are required")
     return StreamingResponse(_run_pipeline(req), media_type="text/event-stream", headers=_pipeline_headers())
+
+
+# ---------------------------------------------------------------------------
+# /stream/generate: text-only generation pipeline (no input image)
+# ---------------------------------------------------------------------------
+# Two stages:
+#   1) vlm_translate (optional): rewrite the user prompt as a concise English
+#      image-gen prompt. Stability content-filters non-English prompts very
+#      aggressively, returning an empty `images` payload with finish_reasons=
+#      ["Filter reason: prompt"]. Routing through the VLM slot lets the
+#      operator pick which engine does the rewrite — Bedrock Claude/Nova or
+#      Trainium Qwen3-VL — so a Trainium demo can stay end-to-end on-device.
+#      The translate step is skipped when the prompt is already mostly ASCII
+#      (i.e. likely English), so an English-only flow stays single-stage.
+#   2) generate: text -> image via the chosen GENERATE engine.
+# stage names match frontend StageId:
+#   stage_start vlm_translate -> stage_complete vlm_translate
+#   stage_start generate      -> stage_complete generate
+
+
+def _looks_english(text: str) -> bool:
+    """Heuristic: skip translation when the input is already ~English.
+
+    Counts how many characters are 7-bit ASCII. >=90% ASCII is taken as a
+    cheap proxy for "no translation needed". Imperfect (e.g. an English
+    sentence with a single emoji still scores 100%) but correct enough for
+    a demo-time gate.
+    """
+    if not text:
+        return True
+    ascii_count = sum(1 for ch in text if ord(ch) < 128)
+    return ascii_count / len(text) >= 0.9
+
+
+class GeneratePipelineRequest(BaseModel):
+    """Text-to-image pipeline input.
+
+    Fields:
+      - user_instruction: post-ASR (or directly typed) text used as the prompt.
+      - vlm_engine:       optional override for the translate step.
+      - generate_engine:  optional override for the image generator.
+      - skip_translate:   force-disable the translate step even for non-English.
+    """
+
+    user_instruction: str = Field(..., min_length=1)
+    vlm_engine: Optional[str] = None
+    generate_engine: Optional[str] = None
+    skip_translate: bool = False
+    request_id: Optional[str] = None
+
+
+async def _run_generate_pipeline(req: GeneratePipelineRequest) -> AsyncIterator[bytes]:
+    request_id = req.request_id or str(uuid.uuid4())
+    yield _sse_event("pipeline_start", {"request_id": request_id})
+
+    if not _EDIT_API_BASE_URL or not _ORIGIN_VERIFY_HEADER_VALUE:
+        yield _sse_event(
+            "stage_error",
+            {
+                "stage": "config",
+                "code": "config_missing",
+                "message": "EDIT_API_BASE_URL / ORIGIN_VERIFY_HEADER_VALUE is not set",
+            },
+        )
+        yield _sse_event("pipeline_complete", {"request_id": request_id})
+        return
+
+    async with httpx.AsyncClient(http2=False) as client:
+        # ---- Stage 1: VLM (translate) ----------------------------------
+        prompt_for_generator = req.user_instruction
+        translated: Optional[str] = None
+        do_translate = (
+            not req.skip_translate and not _looks_english(req.user_instruction)
+        )
+        if do_translate:
+            yield _sse_event("stage_start", {"stage": "vlm_translate"})
+            vlm_body: dict[str, Any] = {
+                "prompt": req.user_instruction,
+                "mode": "translate",
+                "request_id": request_id,
+            }
+            if req.vlm_engine:
+                vlm_body["engine"] = req.vlm_engine
+            vlm_res = None
+            async for kind, payload in _stage_with_heartbeat(
+                _post_edit_api(client, "/vlm", vlm_body, _HTTP_TIMEOUT_VLM_S),
+                "vlm_translate",
+            ):
+                if kind == "heartbeat":
+                    yield payload
+                elif kind == "error":
+                    # Translation is best-effort: log it, but fall back to
+                    # the original prompt so the demo keeps working even if
+                    # the chosen VLM is down.
+                    log.warning("vlm_translate failed (using original): %s", payload)
+                    yield _sse_event(
+                        "stage_error", _stage_error_payload("vlm_translate", payload)
+                    )
+                    break
+                else:
+                    vlm_res = payload
+            if vlm_res:
+                translated = (vlm_res.get("text") or "").strip() or None
+                if translated:
+                    prompt_for_generator = translated
+                yield _sse_event(
+                    "stage_complete",
+                    {
+                        "stage": "vlm_translate",
+                        "engine": vlm_res.get("engine"),
+                        "text": translated or req.user_instruction,
+                        "metadata": vlm_res.get("metadata", {}),
+                    },
+                )
+
+        # ---- Stage 2: GENERATE -----------------------------------------
+        yield _sse_event("stage_start", {"stage": "generate"})
+        body: dict[str, Any] = {
+            "prompt": prompt_for_generator,
+            "request_id": request_id,
+        }
+        if req.generate_engine:
+            body["engine"] = req.generate_engine
+        gen_res = None
+        async for kind, payload in _stage_with_heartbeat(
+            _post_edit_api(client, "/generate", body, _HTTP_TIMEOUT_EDIT_S),
+            "generate",
+        ):
+            if kind == "heartbeat":
+                yield payload
+            elif kind == "error":
+                log.warning("pipeline generate failed: %s", payload)
+                yield _sse_event("stage_error", _stage_error_payload("generate", payload))
+                yield _sse_event("pipeline_complete", {"request_id": request_id})
+                return
+            else:
+                gen_res = payload
+
+        gen_res = gen_res or {}
+        yield _sse_event(
+            "stage_complete",
+            {
+                "stage": "generate",
+                "engine": gen_res.get("engine"),
+                "image_url": gen_res.get("image_url"),
+                "image_format": gen_res.get("image_format"),
+                "image_bytes": gen_res.get("image_bytes"),
+                "metadata": gen_res.get("metadata", {}),
+                "translated_prompt": translated,
+            },
+        )
+        yield _sse_event("pipeline_complete", {"request_id": request_id})
+
+
+@app.post("/stream/generate")
+async def generate_pipeline(req: GeneratePipelineRequest) -> StreamingResponse:
+    if not req.user_instruction:
+        raise HTTPException(status_code=400, detail="user_instruction is required")
+    return StreamingResponse(
+        _run_generate_pipeline(req),
+        media_type="text/event-stream",
+        headers=_pipeline_headers(),
+    )

@@ -74,12 +74,48 @@ export interface RuntimeSample {
   latency_p99_ms: number | null;
 }
 
+export interface VcpuUsage {
+  user: number;
+  system: number;
+  idle: number;
+  io_wait: number;
+  irq: number;
+  soft_irq: number;
+}
+
+export interface HostMemory {
+  total_bytes: number;
+  used_bytes: number;
+  tensors_bytes: number;
+  constants_bytes: number;
+  dma_buffers_bytes: number;
+  application_memory_bytes: number;
+}
+
+export interface DeviceMemory {
+  total_bytes: number;
+  used_bytes: number;
+  tensors_bytes: number;
+  constants_bytes: number;
+  model_code_bytes: number;
+  runtime_memory_bytes: number;
+  model_shared_scratchpad_bytes: number;
+}
+
+export interface SystemStats {
+  system_vcpu: VcpuUsage | null;
+  runtime_vcpu: VcpuUsage | null;
+  host_memory: HostMemory | null;
+  device_memory: DeviceMemory | null;
+}
+
 export interface Snapshot {
   ts_ms: number;
   available: boolean;
   chips: ChipSample[];
   cores: NeuronCoreSample[];
   runtimes: RuntimeSample[];
+  system: SystemStats | null;
   raw: Record<string, unknown> | null;
 }
 

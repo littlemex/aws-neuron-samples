@@ -1,8 +1,8 @@
-"""3 スロット (ASR / VLM / EDIT) 統合 registry。
+"""5 slot (ASR / VLM / EDIT / GENERATE / TTS) unified registry.
 
-UI / Lambda は本モジュール経由でスロット別の registry にアクセスする。
-新しい実装を追加する時は、対応する slot サブモジュールの ENGINES に
-1 行加えるだけ。本モジュールはエクスポート集約だけで状態を持たない。
+The UI and the API route handlers go through this module to reach a slot's
+sub-registry. To add a new engine, append one line to the matching slot
+sub-module's ``ENGINES`` dict — this file is just a thin aggregator.
 """
 from __future__ import annotations
 
@@ -11,18 +11,22 @@ from typing import Any
 from contracts import EngineError
 from engines import asr as _asr
 from engines import edit as _edit
+from engines import generate as _generate
+from engines import tts as _tts
 from engines import vlm as _vlm
 
-# slot 名 → サブモジュール
+# slot name -> sub-module
 _SLOTS: dict[str, Any] = {
     "asr": _asr,
     "vlm": _vlm,
     "edit": _edit,
+    "generate": _generate,
+    "tts": _tts,
 }
 
 
 def list_slots() -> list[str]:
-    return ["asr", "vlm", "edit"]
+    return ["asr", "vlm", "edit", "generate", "tts"]
 
 
 def list_engines(slot: str) -> list[str]:

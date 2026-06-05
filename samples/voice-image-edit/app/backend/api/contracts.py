@@ -119,15 +119,19 @@ class AsrResponse:
 
 @dataclass
 class VlmRequest:
-    """VLM スロットへの入力。
+    """VLM slot input.
 
-    mode は 2 種類:
-      - "instruction": 音声指示 + before 画像 → EDIT スロット用編集プロンプト
-      - "review"     : 編集指示 + after 画像 → 編集結果のレビューコメント
+    Three supported modes:
+      - "instruction": voice instruction + BEFORE image -> editing prompt for EDIT slot
+      - "review"     : editing instruction + AFTER image -> review comment
+      - "translate"  : free-text only (no image) -> English image-generation prompt
+                       used by the GENERATE slot to localise non-English input.
+    For modes other than "translate" image_b64 is required; for "translate"
+    it is ignored even if supplied.
     """
 
-    image_b64: str
     prompt: str
+    image_b64: str = ""
     mode: str = "instruction"
     engine: Optional[str] = None
     request_id: Optional[str] = None
@@ -136,15 +140,18 @@ class VlmRequest:
     def from_dict(cls, d: dict[str, Any]) -> "VlmRequest":
         if not isinstance(d, dict):
             raise EngineError("invalid_request", "request body must be JSON object")
-        if not d.get("image_b64"):
-            raise EngineError("invalid_request", "image_b64 is required")
         if not d.get("prompt"):
             raise EngineError("invalid_request", "prompt is required")
         mode = d.get("mode") or "instruction"
-        if mode not in {"instruction", "review"}:
+        if mode not in {"instruction", "review", "translate"}:
             raise EngineError("invalid_request", f"unknown mode: {mode}")
+        image_b64 = d.get("image_b64") or ""
+        if mode != "translate" and not image_b64:
+            raise EngineError(
+                "invalid_request", "image_b64 is required for mode != translate"
+            )
         return cls(
-            image_b64=d["image_b64"],
+            image_b64=image_b64,
             prompt=d["prompt"],
             mode=mode,
             engine=d.get("engine"),
@@ -225,6 +232,132 @@ class EditResponse:
         return {
             "engine": self.engine,
             "image_b64": self.image_b64,
+            "metadata": asdict(self.metadata),
+        }
+
+
+# ---------------------------------------------------------------------------
+# GENERATE (text -> image)
+# ---------------------------------------------------------------------------
+# Intentionally symmetrical to the Edit slot, except the input has no image
+# so the Options struct is leaner (no strength / mask). The response shape
+# is identical to EditResponse (image_b64 + metadata), so the frontend can
+# reuse a single display path.
+
+
+@dataclass
+class GenerateOptions:
+    seed: Optional[int] = None
+    negative_prompt: Optional[str] = None
+    aspect_ratio: Optional[str] = None  # e.g. "1:1", "16:9"
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict[str, Any]]) -> "GenerateOptions":
+        if not d:
+            return cls()
+        return cls(
+            seed=d.get("seed"),
+            negative_prompt=d.get("negative_prompt"),
+            aspect_ratio=d.get("aspect_ratio"),
+        )
+
+
+@dataclass
+class GenerateRequest:
+    prompt: str
+    engine: Optional[str] = None
+    options: GenerateOptions = field(default_factory=GenerateOptions)
+    request_id: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "GenerateRequest":
+        if not isinstance(d, dict):
+            raise EngineError("invalid_request", "request body must be JSON object")
+        if not d.get("prompt"):
+            raise EngineError("invalid_request", "prompt is required")
+        return cls(
+            prompt=d["prompt"],
+            engine=d.get("engine"),
+            options=GenerateOptions.from_dict(d.get("options")),
+            request_id=d.get("request_id"),
+        )
+
+
+@dataclass
+class GenerateResponse:
+    engine: str
+    image_b64: str
+    metadata: EngineMetadata
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "engine": self.engine,
+            "image_b64": self.image_b64,
+            "metadata": asdict(self.metadata),
+        }
+
+
+# ---------------------------------------------------------------------------
+# TTS (text -> synthesized speech audio)
+# ---------------------------------------------------------------------------
+# Optional pipeline stage that reads the VLM review aloud. Cloud (Polly via
+# the "bedrock_polly_*" engines) and on-device (Trainium-hosted XTTS / F5-TTS,
+# stubbed for now) live behind the same contract.
+
+
+@dataclass
+class TtsOptions:
+    voice: Optional[str] = None  # provider-specific voice id (e.g. "Tomoko")
+    language: Optional[str] = None  # BCP-47 (e.g. "ja-JP"); None -> engine default
+    speed: Optional[float] = None  # 0.5..2.0; None -> engine default
+    audio_format: Optional[str] = None  # "mp3" | "ogg_vorbis" | "pcm" -> engine default
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict[str, Any]]) -> "TtsOptions":
+        if not d:
+            return cls()
+        speed = d.get("speed")
+        return cls(
+            voice=d.get("voice"),
+            language=d.get("language"),
+            speed=float(speed) if speed is not None else None,
+            audio_format=d.get("audio_format"),
+        )
+
+
+@dataclass
+class TtsRequest:
+    text: str
+    engine: Optional[str] = None
+    options: TtsOptions = field(default_factory=TtsOptions)
+    request_id: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "TtsRequest":
+        if not isinstance(d, dict):
+            raise EngineError("invalid_request", "request body must be JSON object")
+        if not d.get("text"):
+            raise EngineError("invalid_request", "text is required")
+        return cls(
+            text=d["text"],
+            engine=d.get("engine"),
+            options=TtsOptions.from_dict(d.get("options")),
+            request_id=d.get("request_id"),
+        )
+
+
+@dataclass
+class TtsResponse:
+    engine: str
+    audio_b64: str  # base64 of the binary audio body
+    audio_format: str  # "mp3" / "ogg_vorbis" / "pcm" — matches the bytes above
+    metadata: EngineMetadata
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "engine": self.engine,
+            "audio_b64": self.audio_b64,
+            "audio_format": self.audio_format,
             "metadata": asdict(self.metadata),
         }
 

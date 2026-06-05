@@ -11,13 +11,16 @@ from typing import Callable
 
 from contracts import EngineError
 from engines.edit.base import ImageEditEngine
-from engines.edit.bedrock import BedrockEditEngine
+from engines.edit.bedrock import (
+    NovaCanvasEditEngine,
+    StabilitySd35EditEngine,
+)
 from engines.edit.dummy import DummyEditEngine
 from engines.edit.trainium import TrainiumEditEngine
 
 
 def _bedrock_nova_canvas() -> ImageEditEngine:
-    return BedrockEditEngine(
+    return NovaCanvasEditEngine(
         model_id=os.environ.get(
             "BEDROCK_NOVA_CANVAS_MODEL_ID", "amazon.nova-canvas-v1:0"
         ),
@@ -25,14 +28,25 @@ def _bedrock_nova_canvas() -> ImageEditEngine:
     )
 
 
+def _bedrock_stability_sd35() -> ImageEditEngine:
+    # Region and model id are resolved inside the class so the registry
+    # stays a thin one-liner. SD 3.5 lives in us-west-2; the class does
+    # NOT fall back to BEDROCK_REGION (us-east-1) on purpose.
+    return StabilitySd35EditEngine(engine_name="bedrock_stability_sd35")
+
+
 ENGINES: dict[str, Callable[[], ImageEditEngine]] = {
     "dummy": DummyEditEngine,
     "bedrock_nova_canvas": _bedrock_nova_canvas,
+    "bedrock_stability_sd35": _bedrock_stability_sd35,
     "trainium": TrainiumEditEngine,
 }
 
 DEFAULT_ENV_VAR = "EDIT_ENGINE_DEFAULT"
-DEFAULT_FALLBACK = "dummy"
+# Stability SD 3.5 is the only ACTIVE Bedrock image-to-image SKU today; pick
+# it as the fallback so a fresh deploy does not silently land on the LEGACY
+# Nova Canvas. Operators can still flip back via env or /manage.
+DEFAULT_FALLBACK = "bedrock_stability_sd35"
 
 _cache: dict[str, ImageEditEngine] = {}
 

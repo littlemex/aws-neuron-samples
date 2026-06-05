@@ -1,10 +1,11 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useNeuronStream } from '../hooks/useNeuronStream';
 import { useNeuronTopology } from '../hooks/useNeuronTopology';
 import { buildCoreLookup, formatBytes } from '../lib/derive';
 import { utilToColor } from '../lib/layout';
 import { ChipDiagram } from './ChipDiagram';
 import { ChipGrid } from './ChipGrid';
+import { SystemStatsPanel } from './SystemStatsPanel';
 
 /**
  * Top-level drawer to embed inside another sample (e.g. voice-image-edit).
@@ -39,6 +40,26 @@ export const NeuronDrawer: React.FC<NeuronDrawerProps> = ({
   expandedHeight = 320,
 }) => {
   const [open, setOpen] = useState(defaultOpen);
+  // Three-state size:
+  //   'compact' = the historical fixed expandedHeight (kept as default so
+  //               existing embedders are unaffected),
+  //   'tall'    = ~70vh, large enough to read the chip silhouettes clearly,
+  //   'full'    = ~95vh fullscreen-style overlay for demos and screenshots.
+  const [size, setSize] = useState<'compact' | 'tall' | 'full'>('compact');
+  const [vh, setVh] = useState<number>(() =>
+    typeof window === 'undefined' ? 800 : window.innerHeight,
+  );
+  const [vw, setVw] = useState<number>(() =>
+    typeof window === 'undefined' ? 1280 : window.innerWidth,
+  );
+  useEffect(() => {
+    const onResize = () => {
+      setVh(window.innerHeight);
+      setVw(window.innerWidth);
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
   const [selected, setSelected] = useState<number | null>(null);
   const { topology } = useNeuronTopology(base);
   const { snapshot, status } = useNeuronStream({ enabled: open, base });
@@ -56,11 +77,17 @@ export const NeuronDrawer: React.FC<NeuronDrawerProps> = ({
 
   const totalUtil = headerStats?.avgUtil ?? 0;
   const isSingleChip = (topology?.neuron_device_count ?? 0) <= 1;
+  const effectiveExpanded =
+    size === 'full' ? Math.round(vh * 0.95)
+      : size === 'tall' ? Math.round(vh * 0.7)
+      : expandedHeight;
+  const innerHeight = effectiveExpanded - collapsedHeight - 24;
+  const sysPanelWidth = Math.max(220, Math.min(320, Math.round(vw * 0.18)));
 
   return (
     <div
       style={{
-        height: open ? expandedHeight : collapsedHeight,
+        height: open ? effectiveExpanded : collapsedHeight,
         transition: 'height 220ms ease',
         background: 'linear-gradient(180deg, rgba(8,12,20,0.96), rgba(4,6,12,0.96))',
         borderTop: '1px solid rgba(255,255,255,0.1)',
@@ -110,6 +137,14 @@ export const NeuronDrawer: React.FC<NeuronDrawerProps> = ({
             <span style={{ color: 'rgba(255,80,80,0.85)' }}>ECC! {headerStats.eccUncorrected}</span>
           ) : null}
           <span style={{ color: 'rgba(255,255,255,0.4)' }}>{status}</span>
+          {open && (
+            <SizeToggle
+              size={size}
+              onChange={(s) => {
+                setSize(s);
+              }}
+            />
+          )}
         </span>
       </button>
 
@@ -117,10 +152,15 @@ export const NeuronDrawer: React.FC<NeuronDrawerProps> = ({
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: isSingleChip ? '1fr' : 'minmax(0, 2fr) minmax(0, 1fr)',
+            // grid columns:
+            //   single-chip: chip diagram + system stats
+            //   multi-chip:  chip grid    + chip detail + system stats
+            gridTemplateColumns: isSingleChip
+              ? `minmax(0, 1fr) ${sysPanelWidth}px`
+              : `minmax(0, 2fr) minmax(0, 1fr) ${sysPanelWidth}px`,
             gap: 12,
             padding: 12,
-            height: expandedHeight - collapsedHeight,
+            height: effectiveExpanded - collapsedHeight,
             boxSizing: 'border-box',
           }}
         >
@@ -128,8 +168,8 @@ export const NeuronDrawer: React.FC<NeuronDrawerProps> = ({
             <ChipGrid
               topology={topology}
               snapshot={snapshot}
-              width={Math.max(400, gridWidthFor(topology))}
-              height={expandedHeight - collapsedHeight - 24}
+              width={Math.max(400, gridWidthFor(topology, vw, size))}
+              height={innerHeight}
               selectedChip={selected}
               onSelectChip={setSelected}
             />
@@ -147,25 +187,95 @@ export const NeuronDrawer: React.FC<NeuronDrawerProps> = ({
                   cores={lookup?.byChip.get(selectedChip.neuron_device) ?? []}
                   engineSpecs={topology.chip_engine_specs}
                   showV3dSplit={(topology.logical_neuroncore_config ?? 1) >= 2}
-                  width={300}
-                  height={expandedHeight - collapsedHeight - 24}
+                  width={Math.max(280, Math.min(420, Math.round(vw * 0.18)))}
+                  height={innerHeight}
                 />
               )}
             </div>
           )}
+          <div style={{ minWidth: 0, overflow: 'auto' }}>
+            <SystemStatsPanel
+              system={snapshot?.system}
+              width={sysPanelWidth}
+              height={innerHeight}
+              variant="global"
+            />
+          </div>
         </div>
       )}
     </div>
   );
 };
 
-function gridWidthFor(topology: { neuron_device_count: number }): number {
-  // Tuned per chip count: 1 -> wide single panel, 16 -> 4x4 grid,
-  // anything larger (UltraServer) -> spread out further.
-  if (topology.neuron_device_count <= 1) return 720;
-  if (topology.neuron_device_count <= 16) return 720;
-  return 880;
+function gridWidthFor(
+  topology: { neuron_device_count: number },
+  viewportWidth: number,
+  size: 'compact' | 'tall' | 'full',
+): number {
+  // The grid used to be capped at 720/880 px regardless of how big the
+  // viewport was, so on a 27" display the chips stayed tiny. Scale with
+  // the viewport instead, but keep a sane lower bound for the original
+  // compact embedding (so existing demos still render the same).
+  const isFull = size === 'full';
+  const isTall = size === 'tall';
+  // Reserve roughly: (system stats ~280px) + (chip detail ~360px) + paddings.
+  // Whatever's left is the grid width budget.
+  const reserved = (isFull || isTall) ? 700 : 380;
+  const budget = Math.max(400, viewportWidth - reserved);
+  if (size === 'compact') {
+    if (topology.neuron_device_count <= 16) return Math.min(budget, 720);
+    return Math.min(budget, 880);
+  }
+  // tall / full: let the grid breathe up to ~70% of the viewport
+  return Math.min(budget, Math.round(viewportWidth * 0.7));
 }
+
+const SizeToggle: React.FC<{
+  size: 'compact' | 'tall' | 'full';
+  onChange: (s: 'compact' | 'tall' | 'full') => void;
+}> = ({ size, onChange }) => {
+  const opts: Array<{ key: 'compact' | 'tall' | 'full'; label: string; title: string }> = [
+    { key: 'compact', label: 'S', title: 'Compact (default)' },
+    { key: 'tall', label: 'M', title: 'Tall (~70% viewport)' },
+    { key: 'full', label: 'L', title: 'Fullscreen (~95% viewport)' },
+  ];
+  return (
+    <span
+      onClick={(e) => e.stopPropagation()}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'stretch',
+        border: '1px solid rgba(255,255,255,0.15)',
+        borderRadius: 6,
+        overflow: 'hidden',
+        height: 22,
+      }}
+    >
+      {opts.map((o) => (
+        <button
+          key={o.key}
+          title={o.title}
+          onClick={(e) => {
+            e.stopPropagation();
+            onChange(o.key);
+          }}
+          style={{
+            background: size === o.key ? 'rgba(98,212,128,0.22)' : 'transparent',
+            color: size === o.key ? '#62d480' : 'rgba(255,255,255,0.7)',
+            border: 'none',
+            padding: '0 8px',
+            fontSize: 11,
+            fontWeight: 600,
+            cursor: 'pointer',
+            fontFamily: 'inherit',
+          }}
+        >
+          {o.label}
+        </button>
+      ))}
+    </span>
+  );
+};
 
 function computeHeaderStats(snapshot: ReturnType<typeof useNeuronStream>['snapshot']): {
   avgUtil: number;

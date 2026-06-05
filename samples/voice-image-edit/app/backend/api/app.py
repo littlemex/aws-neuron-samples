@@ -36,7 +36,14 @@ from botocore.config import Config as BotoConfig
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from contracts import AsrRequest, EditRequest, EngineError, VlmRequest
+from contracts import (
+    AsrRequest,
+    EditRequest,
+    EngineError,
+    GenerateRequest,
+    TtsRequest,
+    VlmRequest,
+)
 import engines as registry
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -180,6 +187,124 @@ async def post_edit(request: Request) -> JSONResponse:
             status_code=500,
             content={"error": {"code": "internal", "message": str(exc), "retryable": False}},
         )
+
+
+@app.post("/api/edit/tts")
+async def post_tts(request: Request) -> JSONResponse:
+    """Text-to-speech via the TTS slot.
+
+    Returns ``{audio_url, audio_format, metadata}`` so the frontend can
+    play the result without inlining the (potentially MB-sized) audio
+    bytes through the SSE stream. The audio is uploaded to the same
+    short-lived bucket used for edit / generate results, under an
+    ``audio/`` key prefix so an operator can find them quickly.
+    """
+    try:
+        body = await _read_json(request)
+        req = TtsRequest.from_dict(body)
+        engine = registry.get_engine("tts", req.engine)
+        result = await asyncio.to_thread(engine.synthesize, req)
+        payload = await asyncio.to_thread(_audio_to_presigned, result.to_dict())
+        return JSONResponse(payload)
+    except EngineError as exc:
+        log.warning("tts engine error code=%s message=%s", exc.code, exc.message)
+        return _error_response(exc)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("tts unhandled exception")
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"code": "internal", "message": str(exc), "retryable": False}},
+        )
+
+
+@app.post("/api/edit/generate")
+async def post_generate(request: Request) -> JSONResponse:
+    """Text-to-image generation via Stability on Bedrock.
+
+    Mirrors /api/edit/edit but the request carries no input image. The
+    response shape is identical (image_url + metadata), so the frontend
+    can re-use the same display path.
+    """
+    try:
+        body = await _read_json(request)
+        req = GenerateRequest.from_dict(body)
+        engine = registry.get_engine("generate", req.engine)
+        result = await asyncio.to_thread(engine.invoke, req)
+        # _edit_to_presigned only cares about payload['image_b64']; reuse
+        # it so a single S3 bucket / TTL / key prefix governs both slots.
+        payload = await asyncio.to_thread(_edit_to_presigned, result.to_dict())
+        return JSONResponse(payload)
+    except EngineError as exc:
+        log.warning("generate engine error code=%s message=%s", exc.code, exc.message)
+        return _error_response(exc)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("generate unhandled exception")
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"code": "internal", "message": str(exc), "retryable": False}},
+        )
+
+
+_AUDIO_RESULT_PREFIX = os.environ.get("AUDIO_RESULT_PREFIX", "audio/")
+_AUDIO_CONTENT_TYPES = {
+    "mp3": "audio/mpeg",
+    "ogg_vorbis": "audio/ogg",
+    "pcm": "audio/L16",
+    "wav": "audio/wav",
+}
+
+
+def _audio_to_presigned(payload: dict[str, Any]) -> dict[str, Any]:
+    """Move the synthesized audio out of the JSON body into S3 presigned URL.
+
+    Mirrors ``_edit_to_presigned`` but for the TTS slot. Same bucket, but
+    a separate key prefix (``audio/``) so an operator can clean up either
+    family independently. ``audio_format`` decides the file extension
+    and the Content-Type header.
+    """
+    if not _EDIT_RESULT_BUCKET or _s3_client is None:
+        raise EngineError(
+            "config_missing",
+            "EDIT_RESULT_BUCKET env var is required for TTS slot",
+        )
+    audio_b64 = payload.get("audio_b64")
+    if not audio_b64:
+        return payload
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+    except (ValueError, TypeError) as exc:
+        raise EngineError(
+            "provider_invalid_response",
+            f"engine returned non-base64 audio: {exc}",
+        ) from exc
+    audio_format = (payload.get("audio_format") or "mp3").lower()
+    content_type = _AUDIO_CONTENT_TYPES.get(audio_format, "application/octet-stream")
+    request_id = (payload.get("metadata") or {}).get("request_id") or str(uuid.uuid4())
+    key = f"{_AUDIO_RESULT_PREFIX}{request_id}.{audio_format}"
+    try:
+        _s3_client.put_object(
+            Bucket=_EDIT_RESULT_BUCKET,
+            Key=key,
+            Body=audio_bytes,
+            ContentType=content_type,
+            CacheControl="no-store",
+        )
+        url = _s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _EDIT_RESULT_BUCKET, "Key": key},
+            ExpiresIn=_EDIT_RESULT_TTL,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise EngineError(
+            "provider_error",
+            f"failed to upload tts audio to S3: {exc}",
+            retryable=True,
+        ) from exc
+    out = {k: v for k, v in payload.items() if k != "audio_b64"}
+    out["audio_url"] = url
+    out["audio_format"] = audio_format
+    out["audio_bytes"] = len(audio_bytes)
+    return out
 
 
 def _edit_to_presigned(payload: dict[str, Any]) -> dict[str, Any]:
