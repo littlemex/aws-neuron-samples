@@ -21,11 +21,17 @@ from __future__ import annotations
 import json
 import os
 import time
+from typing import Any
 
 import urllib3
 
 from contracts import EngineError, VlmRequest, VlmResponse
 from engines.vlm.base import VlmEngine
+from engines.vlm._prompts import (
+    DEFAULT_INSTRUCTION_PROMPT,
+    DEFAULT_REVIEW_PROMPT,
+    DEFAULT_TRANSLATE_PROMPT,
+)
 from engines._common import (
     build_metadata,
     decode_image_b64,
@@ -35,18 +41,9 @@ from engines._common import (
     raise_for_status,
     strip_thinking,
 )
-
-_DEFAULT_INSTRUCTION_PROMPT = (
-    "You are an assistant that converts a user's voice instruction into an"
-    " image-editing prompt for a downstream image editor."
-    " Look at the BEFORE image and the user's instruction, then output ONE concise"
-    " English sentence describing the edit (no preface, no quotes, no explanation)."
-)
-_DEFAULT_REVIEW_PROMPT = (
-    "あなたは画像編集の品質をレビューするアシスタントです。"
-    " 編集指示と編集後画像 (AFTER) を見て、3 行以内の日本語で"
-    " (1) 指示が反映されているか / (2) 違和感や破綻がないか / (3) 改善案 を簡潔に述べてください。"
-)
+# All prompt strings live in engines/vlm/_prompts.py so Bedrock and Trainium
+# share the exact same instruction / review / translate text. Engine-specific
+# wording shifts here would silently diverge the two providers.
 
 
 class TrainiumVlmEngine(VlmEngine):
@@ -66,28 +63,29 @@ class TrainiumVlmEngine(VlmEngine):
 
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
-        image_bytes = decode_image_b64(req.image_b64)
+        system_prompt = _resolve_system_prompt(req.mode)
 
-        mime = guess_image_mime(image_bytes)
-        data_uri = f"data:{mime};base64,{req.image_b64}"
-        system_prompt = (
-            os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE") or _DEFAULT_REVIEW_PROMPT
-            if req.mode == "review"
-            else os.environ.get("VLM_INSTRUCTION_PROMPT_OVERRIDE")
-            or _DEFAULT_INSTRUCTION_PROMPT
-        )
+        # Build user content: image+text for instruction/review, text-only
+        # for translate. The OpenAI Chat schema accepts either a string or
+        # a list of content parts; we always send the list form for image
+        # modes and a plain string for translate so models that reject
+        # vision-style content for text-only prompts still work.
+        if req.mode == "translate":
+            user_content: Any = req.prompt
+        else:
+            image_bytes = decode_image_b64(req.image_b64)
+            mime = guess_image_mime(image_bytes)
+            data_uri = f"data:{mime};base64,{req.image_b64}"
+            user_content = [
+                {"type": "image_url", "image_url": {"url": data_uri}},
+                {"type": "text", "text": req.prompt},
+            ]
 
         body = {
             "model": self.model_id,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": data_uri}},
-                        {"type": "text", "text": req.prompt},
-                    ],
-                },
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0.2,
             "max_tokens": 512,
@@ -155,6 +153,14 @@ class TrainiumVlmEngine(VlmEngine):
                 extra=extra,
             ),
         )
+
+
+def _resolve_system_prompt(mode: str) -> str:
+    if mode == "review":
+        return os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE") or DEFAULT_REVIEW_PROMPT
+    if mode == "translate":
+        return os.environ.get("VLM_TRANSLATE_PROMPT_OVERRIDE") or DEFAULT_TRANSLATE_PROMPT
+    return os.environ.get("VLM_INSTRUCTION_PROMPT_OVERRIDE") or DEFAULT_INSTRUCTION_PROMPT
 
 
 def _extract_text(payload: dict) -> str:

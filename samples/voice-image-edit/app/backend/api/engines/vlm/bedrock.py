@@ -1,30 +1,38 @@
-"""Bedrock 系 VLM エンジン (Claude Sonnet / Nova Pro / Nova Lite)。
+"""Bedrock VLM engine (Claude Sonnet / Nova Pro / Nova Lite).
 
-実装方針:
-  - Bedrock Converse API (``bedrock-runtime.converse``) を使い、Claude / Nova 系の
-    リクエスト形式差を吸収する。Converse API は ``messages[*].content[*]`` で
-    image / text を混ぜて送る統一インタフェースを提供する。
-  - mode は 2 種類:
-      "instruction" : 音声指示 + before 画像 → EDIT 用編集プロンプトを 1 行で返す。
-      "review"      : 編集指示 + after 画像 → 日本語の短いレビューコメントを返す。
-    どちらも system prompt で出力フォーマットを縛る。
+Design:
+  - Use the Bedrock Converse API so the request shape stays uniform across
+    Claude and Nova families. Converse takes mixed image/text content via
+    ``messages[*].content[*]``.
+  - Three modes are honoured via system prompt selection:
+      "instruction" : voice instruction + BEFORE image -> 1-line edit prompt
+      "review"      : edit instruction + AFTER image  -> short review comment
+      "translate"   : text only (no image)            -> English image prompt
+                      used by the GENERATE slot to localise non-English voice.
 
-環境変数:
-  - BEDROCK_REGION (必須)
-  - BEDROCK_VLM_MODEL_ID  (registry 側でモデル ID を渡すケースが主、env は fallback)
-  - VLM_INSTRUCTION_PROMPT_OVERRIDE / VLM_REVIEW_PROMPT_OVERRIDE (任意)
+Environment:
+  - BEDROCK_REGION (required)
+  - BEDROCK_VLM_MODEL_ID  (the registry passes a model id; env is a fallback)
+  - VLM_INSTRUCTION_PROMPT_OVERRIDE / VLM_REVIEW_PROMPT_OVERRIDE
+  - VLM_TRANSLATE_PROMPT_OVERRIDE  (optional; default is the canonical
+    "rewrite as concise English image-gen prompt" template)
 """
 from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from typing import Any, Optional
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from contracts import EngineError, VlmRequest, VlmResponse
 from engines.vlm.base import VlmEngine
+from engines.vlm._prompts import (
+    DEFAULT_INSTRUCTION_PROMPT,
+    DEFAULT_REVIEW_PROMPT,
+    DEFAULT_TRANSLATE_PROMPT,
+)
 from engines._common import (
     build_metadata,
     decode_image_b64,
@@ -33,21 +41,10 @@ from engines._common import (
 )
 
 
-_DEFAULT_INSTRUCTION_PROMPT = (
-    "You are an assistant that converts a user's voice instruction into an"
-    " image-editing prompt for a downstream image editor."
-    " Look at the BEFORE image and the user's instruction, then output ONE concise"
-    " English sentence describing the edit (no preface, no quotes, no explanation)."
-    " Keep nouns and modifiers explicit (color, material, position) so the editor"
-    " can act without ambiguity. Do not invent edits the user did not request."
-)
-
-_DEFAULT_REVIEW_PROMPT = (
-    "あなたは画像編集の品質をレビューするアシスタントです。"
-    " ユーザーの編集指示と編集後画像 (AFTER) を見て、3 行以内の日本語で"
-    " (1) 指示が反映されているか / (2) 違和感や破綻がないか / (3) 改善案"
-    " を簡潔に述べてください。前置きや謝辞は不要です。"
-)
+# All prompt strings live in engines/vlm/_prompts.py so Bedrock and Trainium
+# share the exact same instruction / review / translate text. Engine-specific
+# wording shifts here would silently diverge the two providers, which is the
+# bug we just fixed.
 
 
 class BedrockVlmEngine(VlmEngine):
@@ -71,29 +68,31 @@ class BedrockVlmEngine(VlmEngine):
 
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
-        image_bytes = decode_image_b64(req.image_b64)
-
         system_prompt = _resolve_system_prompt(req.mode)
-        image_format = guess_image_format(image_bytes)
+        # mode="translate" is text-only and intentionally skips the image
+        # input. Other modes (instruction / review) require the BEFORE/AFTER
+        # image like before.
+        if req.mode == "translate":
+            user_content: list[dict[str, Any]] = [{"text": req.prompt}]
+            image_format: Optional[str] = None
+        else:
+            image_bytes = decode_image_b64(req.image_b64)
+            image_format = guess_image_format(image_bytes)
+            user_content = [
+                {
+                    "image": {
+                        "format": image_format,
+                        "source": {"bytes": image_bytes},
+                    }
+                },
+                {"text": req.prompt},
+            ]
 
         try:
             resp = self._client.converse(
                 modelId=self.model_id,
                 system=[{"text": system_prompt}],
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "image": {
-                                    "format": image_format,
-                                    "source": {"bytes": image_bytes},
-                                }
-                            },
-                            {"text": req.prompt},
-                        ],
-                    }
-                ],
+                messages=[{"role": "user", "content": user_content}],
                 inferenceConfig={"maxTokens": 512, "temperature": 0.2},
             )
         except (ClientError, BotoCoreError) as exc:
@@ -132,10 +131,12 @@ class BedrockVlmEngine(VlmEngine):
 
 def _resolve_system_prompt(mode: str) -> str:
     if mode == "review":
-        return os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE") or _DEFAULT_REVIEW_PROMPT
+        return os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE") or DEFAULT_REVIEW_PROMPT
+    if mode == "translate":
+        return os.environ.get("VLM_TRANSLATE_PROMPT_OVERRIDE") or DEFAULT_TRANSLATE_PROMPT
     return (
         os.environ.get("VLM_INSTRUCTION_PROMPT_OVERRIDE")
-        or _DEFAULT_INSTRUCTION_PROMPT
+        or DEFAULT_INSTRUCTION_PROMPT
     )
 
 

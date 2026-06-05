@@ -30,7 +30,7 @@ export interface EngineErrorBody {
 // /api/edit/engines
 // ---------------------------------------------------------------------------
 
-export type SlotName = 'asr' | 'vlm' | 'edit';
+export type SlotName = 'asr' | 'vlm' | 'edit' | 'generate' | 'tts';
 
 export interface SlotInfo {
   engines: string[];
@@ -137,6 +137,63 @@ export async function invokeEdit(body: EditRequestBody): Promise<EditResponseBod
   return jsonPost<EditResponseBody>(`${EDIT_API_PATH}/edit`, body);
 }
 
+// ---------------------------------------------------------------------------
+// GENERATE (text-to-image, no input image)
+// ---------------------------------------------------------------------------
+
+export interface GenerateOptions {
+  seed?: number | null;
+  negative_prompt?: string | null;
+  aspect_ratio?: string | null;
+}
+
+export interface GenerateRequestBody {
+  prompt: string;
+  engine?: string;
+  options?: GenerateOptions;
+  request_id?: string;
+}
+
+// Generate's response shape mirrors Edit (image_url + metadata) so the
+// frontend renderer can use a single display path; we alias the type.
+export type GenerateResponseBody = EditResponseBody;
+
+export async function invokeGenerate(body: GenerateRequestBody): Promise<GenerateResponseBody> {
+  return jsonPost<GenerateResponseBody>(`${EDIT_API_PATH}/generate`, body);
+}
+
+// ---------------------------------------------------------------------------
+// TTS (text -> audio). Response mirrors the edit/generate shape: the audio
+// is staged to S3 and returned as a presigned URL so the JSON body stays
+// small and the SSE pipeline does not have to carry MB-scale base64 audio.
+// ---------------------------------------------------------------------------
+
+export interface TtsOptions {
+  voice?: string;
+  language?: string;
+  speed?: number;
+  audio_format?: 'mp3' | 'ogg_vorbis' | 'pcm' | 'wav';
+}
+
+export interface TtsRequestBody {
+  text: string;
+  engine?: string;
+  options?: TtsOptions;
+  request_id?: string;
+}
+
+export interface TtsResponseBody {
+  engine: string;
+  audio_url: string;
+  audio_format: string;
+  audio_bytes?: number;
+  metadata: EngineMetadata;
+}
+
+export async function invokeTts(body: TtsRequestBody): Promise<TtsResponseBody> {
+  return jsonPost<TtsResponseBody>(`${EDIT_API_PATH}/tts`, body);
+}
+
 /**
  * presigned S3 URL を fetch して base64 に再変換する。
  * Stage 4 (VLM review) は VLM engine に image_b64 を渡す必要があるため、
@@ -181,6 +238,9 @@ export interface StreamPipelineRequestBody {
   user_instruction: string;
   vlm_engine?: string;
   edit_engine?: string;
+  /** Run an extra TTS stage that reads the review aloud. Default false. */
+  enable_tts?: boolean;
+  tts_engine?: string;
   request_id?: string;
 }
 
@@ -244,6 +304,73 @@ export async function* streamPipeline(
       }
     }
     // tail (no trailing blank line) — ベストエフォートで捌く
+    if (buffer.trim().length > 0) {
+      const evt = parseSseChunk(buffer);
+      if (evt) yield evt;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /stream/generate (text-to-image only): VLM is optional (translate stage);
+// the ASR text becomes the prompt directly. stage_complete payload uses
+// the same shape as the edit pipeline:
+//   {engine, image_url, image_format, image_bytes, metadata}.
+// ---------------------------------------------------------------------------
+
+export interface StreamGeneratePipelineRequestBody {
+  user_instruction: string;
+  vlm_engine?: string;
+  generate_engine?: string;
+  /** Disable the upstream translate-mode VLM call even when the prompt
+   *  is non-English. Useful when the operator wants the raw prompt fed
+   *  to Stability verbatim. */
+  skip_translate?: boolean;
+  request_id?: string;
+}
+
+export async function* streamGeneratePipeline(
+  body: StreamGeneratePipelineRequestBody,
+  signal?: AbortSignal,
+): AsyncGenerator<StreamPipelineEvent, void, void> {
+  const res = await fetch(`${STREAM_API_PATH}/generate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    let detail = res.statusText;
+    try {
+      const json = await res.json();
+      const err = (json as EngineErrorBody)?.error;
+      if (err?.message) detail = `${err.code ?? 'http_' + res.status}: ${err.message}`;
+    } catch {
+      /* swallow */
+    }
+    throw new Error(`generate pipeline failed (${res.status}): ${detail}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sepIdx: number;
+      while ((sepIdx = findSseBoundary(buffer)) !== -1) {
+        const chunk = buffer.slice(0, sepIdx);
+        buffer = buffer.slice(sepIdx).replace(/^(\r?\n){1,2}/, '');
+        const evt = parseSseChunk(chunk);
+        if (evt) yield evt;
+      }
+    }
     if (buffer.trim().length > 0) {
       const evt = parseSseChunk(buffer);
       if (evt) yield evt;

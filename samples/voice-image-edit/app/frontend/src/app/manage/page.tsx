@@ -16,11 +16,21 @@ const SLOT_LABELS: Record<SlotName, { title: string; description: string }> = {
   },
   edit: {
     title: 'EDIT',
-    description: '画像 + プロンプト → 編集後画像。実際の画像生成 / 編集を担当する。',
+    description: '画像 + プロンプト → 編集後画像。実際の画像編集を担当する。',
+  },
+  generate: {
+    title: 'GENERATE',
+    description:
+      'プロンプト → 新規画像。画像入力なしのテキスト→画像生成 (Stability AI on Bedrock)。',
+  },
+  tts: {
+    title: 'TTS',
+    description:
+      'テキスト → 音声。VLM の講評を読み上げるオプションステージで使う (Bedrock 系は Polly、Trainium 系は self-hosted XTTS / F5-TTS)。',
   },
 };
 
-const SLOTS: SlotName[] = ['asr', 'vlm', 'edit'];
+const SLOTS: SlotName[] = ['asr', 'vlm', 'edit', 'generate', 'tts'];
 
 export default function ManagePage() {
   const { catalog, catalogError, catalogLoading, config, resolved, setSlot, clear } =

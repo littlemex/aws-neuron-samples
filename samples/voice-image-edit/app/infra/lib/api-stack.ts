@@ -127,6 +127,17 @@ export class ApiStack extends cdk.Stack {
         resources: ['*'],
       }),
     );
+    // Amazon Polly is the cloud TTS provider for the optional review-readout
+    // stage (engine: bedrock_polly_*). SynthesizeSpeech does not take a
+    // resource ARN — '*' is the documented form. We grant the action in
+    // every region the CDK app may run in so the stack stays portable.
+    apiInstanceRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        sid: 'PollySynthesizeForEditApi',
+        actions: ['polly:SynthesizeSpeech', 'polly:DescribeVoices'],
+        resources: ['*'],
+      }),
+    );
     editResultBucket.grantPut(apiInstanceRole);
     editResultBucket.grantRead(apiInstanceRole);
 

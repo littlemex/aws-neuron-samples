@@ -33,7 +33,7 @@ function readStorage(): EngineConfig {
       const obj = parsed as EngineConfig;
       // 値が文字列の slot だけ採用
       const out: EngineConfig = {};
-      (['asr', 'vlm', 'edit'] as SlotName[]).forEach((slot) => {
+      (['asr', 'vlm', 'edit', 'generate', 'tts'] as SlotName[]).forEach((slot) => {
         const v = obj[slot];
         if (typeof v === 'string' && v.length > 0) out[slot] = v;
       });
@@ -128,6 +128,8 @@ export function useEngineConfig() {
       asr: undefined,
       vlm: undefined,
       edit: undefined,
+      generate: undefined,
+      tts: undefined,
     };
     (['asr', 'vlm', 'edit'] as SlotName[]).forEach((slot) => {
       out[slot] = config[slot] ?? catalog?.[slot]?.default;

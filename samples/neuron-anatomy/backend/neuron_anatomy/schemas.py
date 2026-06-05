@@ -177,6 +177,75 @@ class RuntimeSample(BaseModel):
     latency_p99_ms: Optional[float] = None
 
 
+class VcpuUsage(BaseModel):
+    """vCPU usage rolled up across all logical CPUs."""
+
+    user: float = Field(..., ge=0.0, le=100.0, description="user-mode percent")
+    system: float = Field(..., ge=0.0, le=100.0, description="kernel-mode percent")
+    idle: float = Field(..., ge=0.0, le=100.0)
+    io_wait: float = Field(0.0, ge=0.0, le=100.0)
+    irq: float = Field(0.0, ge=0.0, le=100.0)
+    soft_irq: float = Field(0.0, ge=0.0, le=100.0)
+
+
+class HostMemory(BaseModel):
+    """System-wide host memory + neuron-runtime host-side breakdown.
+
+    Fields mirror neuron-monitor:
+      - memory_total_bytes / memory_used_bytes come from system_data.memory_info
+      - tensors / constants / dma_buffers / application_memory come from
+        neuron_runtime_data[].report.memory_used.usage_breakdown.host
+    """
+
+    total_bytes: int = Field(..., description="Total host RAM (memory_info.memory_total_bytes)")
+    used_bytes: int = Field(..., description="System used host RAM (memory_info.memory_used_bytes)")
+    tensors_bytes: int = Field(0, description="Runtime tensors in host RAM")
+    constants_bytes: int = Field(0, description="Runtime constants in host RAM")
+    dma_buffers_bytes: int = Field(0, description="DMA buffers")
+    application_memory_bytes: int = Field(0, description="Other process app memory")
+
+
+class DeviceMemory(BaseModel):
+    """Aggregate device (HBM) memory breakdown across all NeuronCores.
+
+    Fields mirror the per-NeuronCore neuron_runtime_used_bytes.usage_breakdown
+    summed across cores. total_bytes / used_bytes come from topology +
+    neuron_runtime_used_bytes.neuron_device.
+    """
+
+    total_bytes: int = Field(..., description="Total HBM across all chips")
+    used_bytes: int = Field(..., description="Sum of neuron_device used bytes")
+    tensors_bytes: int = Field(0)
+    constants_bytes: int = Field(0)
+    model_code_bytes: int = Field(0)
+    runtime_memory_bytes: int = Field(0)
+    model_shared_scratchpad_bytes: int = Field(0)
+
+
+class SystemStats(BaseModel):
+    """Host- and runtime-level stats that complement the chip view.
+
+    All values are derived from neuron-monitor's system_metrics +
+    neuron_runtime_data[].report.{vcpu_usage,memory_used}.
+    """
+
+    system_vcpu: Optional[VcpuUsage] = Field(
+        None,
+        description=(
+            "system_data.vcpu_usage.average_usage. Reflects ALL processes on the host."
+        ),
+    )
+    runtime_vcpu: Optional[VcpuUsage] = Field(
+        None,
+        description=(
+            "neuron_runtime_data[0].report.vcpu_usage.average_usage. Reflects only "
+            "the neuron-runtime processes."
+        ),
+    )
+    host_memory: Optional[HostMemory] = None
+    device_memory: Optional[DeviceMemory] = None
+
+
 class Snapshot(BaseModel):
     """Single snapshot emitted over SSE.
 
@@ -190,6 +259,10 @@ class Snapshot(BaseModel):
     chips: list[ChipSample]
     cores: list[NeuronCoreSample]
     runtimes: list[RuntimeSample] = Field(default_factory=list)
+    system: Optional[SystemStats] = Field(
+        None,
+        description="Host vCPU + memory rollup. Absent until first sample arrives.",
+    )
     raw: Optional[dict[str, Any]] = Field(
         None,
         description=(
