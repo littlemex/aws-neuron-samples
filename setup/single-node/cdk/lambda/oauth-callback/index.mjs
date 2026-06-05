@@ -41,7 +41,11 @@ import { b64url, b64urlDecode, makeSessionCookie } from './cookie.mjs';
 const COGNITO_DOMAIN = process.env.COGNITO_DOMAIN; // e.g. xxx.auth.<region>.amazoncognito.com
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID;
 const HMAC_SECRET = process.env.HMAC_SECRET; // shared with CF Function
-const SESSION_TTL_SECONDS = parseInt(process.env.SESSION_TTL_SECONDS || '3600', 10);
+// Default 86400 (1 day) so a missing CDK context (`-c sessionTtlSeconds=...`)
+// degrades to a usable demo cookie lifetime instead of forcing re-login
+// every hour. The CDK side (alb-backend-stack.ts) defaults to the same
+// value, so both fallbacks now agree.
+const SESSION_TTL_SECONDS = parseInt(process.env.SESSION_TTL_SECONDS || '86400', 10);
 const AWS_REGION = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION;
 
 const cognitoIdp = new CognitoIdentityProviderClient({ region: AWS_REGION });
