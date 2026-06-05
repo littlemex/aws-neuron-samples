@@ -27,7 +27,11 @@ Options:
     -r, --region REGION                 AWS region (default: sa-east-1)
         --explorer-user USER            User that owns the systemd unit
                                         (default: coder)
-        --explorer-port PORT            UI port (default: 8081)
+        --explorer-port PORT            UI port (default: 8181 — 8081 is
+                                        used by qwen-image-edit on
+                                        voice-image-edit deploys, so the
+                                        default was bumped to 8181 to keep
+                                        --enable-explorer collision-free)
         --explorer-api-port PORT        API port the binary opens on
                                         (default: 3002, not configurable
                                         on neuron-explorer 2.29; keep in
@@ -52,7 +56,7 @@ EOF
 INSTANCE_ID=""
 REGION="sa-east-1"
 EXPLORER_USER="coder"
-EXPLORER_PORT="8081"
+EXPLORER_PORT="8181"
 EXPLORER_API_PORT="3002"
 EXPLORER_DATA_DIR="/var/lib/neuron-explorer"
 EXPLORER_DISPLAY_NAME="workshop"

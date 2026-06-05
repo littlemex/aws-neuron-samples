@@ -13,24 +13,37 @@
 #   revert : ./alb-sg-stream-ingress.sh revert <alb-sg> <ec2-sg>
 #   status : ./alb-sg-stream-ingress.sh status <alb-sg> <ec2-sg>
 #
-# 既定値: P9 環境
-#   alb-sg = sg-0ccdb138f81426e3b
-#   ec2-sg = sg-0cb00913ca0c675ef
+# Required:
+#   AWS_REGION      env var or, after a stack redeploy, derived from the
+#                   ALB ARN. The previous default of sa-east-1 silently
+#                   pointed live-traffic SG mutations at the wrong region
+#                   when invoked from a fresh shell.
+#   ALB_SG / EC2_SG positional args 2 and 3, OR ALB_SG / EC2_SG env vars.
+#                   The previous defaults (sg-0ccdb138f81426e3b /
+#                   sg-0cb00913ca0c675ef) belong to the original P9 deploy
+#                   and are wrong for any other account, region or
+#                   re-created stack -- mutating ingress on someone else's
+#                   security group is a serious accident.
 #
-# 注意:
-#   描画の都合上 neuron-ws-alb stack の SG drift になる。stack 再デプロイ時に
-#   消える可能性があるので、その場合は再 apply する。
+# Note: this script intentionally drifts neuron-ws-alb stack's SG state.
+# A stack redeploy may revert the rule; re-run after.
 
 set -euo pipefail
 
 ACTION="${1:-}"
-ALB_SG="${2:-sg-0ccdb138f81426e3b}"
-EC2_SG="${3:-sg-0cb00913ca0c675ef}"
+ALB_SG="${2:-${ALB_SG:-}}"
+EC2_SG="${3:-${EC2_SG:-}}"
 PORT="${PORT:-80}"
 DESC="${DESC:-voice-image-edit stream EC2 to ALB for /api/edit/* (P9-D)}"
 
 if [[ -z "$ACTION" ]]; then
-  echo "Usage: $0 {apply|revert|status} [<alb-sg>] [<ec2-sg>]" >&2
+  echo "Usage: $0 {apply|revert|status} <alb-sg> <ec2-sg>" >&2
+  echo "  ALB_SG / EC2_SG env vars are honoured if positional args are omitted." >&2
+  exit 2
+fi
+if [[ -z "$ALB_SG" || -z "$EC2_SG" ]]; then
+  echo "[ERROR] ALB_SG and EC2_SG are required (pass as args 2,3 or set env vars)" >&2
+  echo "        Resolve them from CFN outputs of <stack>-alb rather than guessing." >&2
   exit 2
 fi
 if [[ -z "${AWS_PROFILE:-}" ]]; then
@@ -38,7 +51,11 @@ if [[ -z "${AWS_PROFILE:-}" ]]; then
   exit 2
 fi
 
-AWS_REGION="${AWS_REGION:-sa-east-1}"
+AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
+if [[ -z "$AWS_REGION" ]]; then
+  echo "[ERROR] AWS_REGION (or AWS_DEFAULT_REGION) is required" >&2
+  exit 2
+fi
 
 find_rule() {
   aws ec2 describe-security-group-rules \

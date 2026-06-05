@@ -1,13 +1,15 @@
 {
-  "name": "Qwen-Image-Edit-2511 model download + Neuron compile (V3 CFG, TP=4 DP=2)",
-  "description": "trn2.48xlarge 上で (1) HF model snapshot 取得, (2) compile.sh v3_cfg を 1 回だけ走らせて Transformer / VAE / Vision Encoder / Language Model を compile し COMPILED_MODELS_DIR に置く。冪等: COMPILED_MODELS_DIR に transformer_v3_cfg/ + vae_encoder/ + vae_decoder/ + language_model_v3/ + vision_encoder_v3/ が揃っていれば SKIP。 NeuronCore 16-23 (8 cores, world_size=8 with DP=2) を専有。 ~60-90 min かかるので TASK_MAX_WAIT_SECONDS=7200 を必ず設定。 source tarball は presigned S3 URL で配布。",
+  "name": "Qwen-Image-Edit-2511 model download + Neuron compile (V3 TP16, TP=16 DP=2)",
+  "description": "trn2.48xlarge 上で (1) HF model snapshot 取得, (2) compile.sh v3_tp16 を 1 回だけ走らせて Transformer / VAE / Vision Encoder / Language Model を compile し COMPILED_MODELS_DIR に置く。冪等: COMPILED_MODELS_DIR に transformer_v3_cfg/ + vae_encoder/ + vae_decoder/ + language_model_v3/ + vision_encoder_v3/ が揃っていれば SKIP。 NeuronCore 0-31 (32 cores, world_size=32, TP=16 DP=2) を専有。 ~90-120 min かかるので TASK_MAX_WAIT_SECONDS=7200 を必ず設定。 source tarball は presigned S3 URL で配布。",
   "variables": {
     "MODEL_ID": "Qwen/Qwen-Image-Edit-2511",
     "HF_CACHE_DIR": "/models/hf-cache",
-    "COMPILED_MODELS_DIR": "/mnt/local/compiled_models",
+    "COMPILED_MODELS_DIR": "/mnt/local/compiled_models_tp16",
     "COMPILER_WORKDIR": "/mnt/local/compiler_workdir",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference",
-    "NEURON_CORES": "16-23",
+    "NEURON_CORES": "0-31",
+    "WORLD_SIZE": "32",
+    "SERVE_USER": "ubuntu",
     "WORK_DIR": "/opt/voice-image-edit/qwen-image-edit-compile",
     "SOURCE_TARBALL_URL": "",
     "HEIGHT": "1024",
@@ -84,8 +86,8 @@
     },
     {
       "id": "40-compile",
-      "name": "Run compile.sh v3_cfg (~60-90 min, NeuronCore {{NEURON_CORES}}, world_size=8)",
-      "description": "compile.sh v3_cfg は VAE + Transformer (V3 CFG) + Language Model + Vision Encoder の 4 コンポーネントを順に compile する。 NeuronCore は 16-23 (8 cores, world_size=8, TP=4, DP=2)。",
+      "name": "Run compile.sh v3_tp16 (~90-120 min, NeuronCore {{NEURON_CORES}}, world_size=32)",
+      "description": "compile.sh v3_tp16 は VAE + Transformer (V3 TP16) + Language Model + Vision Encoder の 4 コンポーネントを順に compile する。 NeuronCore は 0-31 (32 cores, world_size=32, TP=16, DP=2)。 24 attention heads は 32 にパディングされ 16 rank に分割 (2 heads/rank、25% padding overhead)。 edit ステージのレイテンシ削減を最優先。",
       "commands": [
         "set -e",
         "if [ -f {{COMPILED_MODELS_DIR}}/.precompile_skipped ] && [ '{{FORCE_RECOMPILE}}' != 'true' ]; then echo '[OK] skipped (cached)'; exit 0; fi",
@@ -94,14 +96,16 @@
         ". {{VENV}}/bin/activate",
         "export PYTHONPATH={{WORK_DIR}}:${PYTHONPATH:-}",
         "export NEURON_RT_VISIBLE_CORES='{{NEURON_CORES}}'",
-        "export NEURON_RT_NUM_CORES=8",
+        "export NEURON_RT_NUM_CORES={{WORLD_SIZE}}",
         "export NEURON_RT_VIRTUAL_CORE_SIZE=2",
         "export NEURON_LOGICAL_NC_CONFIG=2",
         "export HUGGINGFACE_CACHE_DIR={{HF_CACHE_DIR}}",
         "export HF_HOME={{HF_CACHE_DIR}}",
-        "echo '[INFO] starting compile.sh v3_cfg (this populates Neuron compile cache, ~60-90 min)'",
-        "bash compile.sh v3_cfg {{HEIGHT}} {{WIDTH}} {{IMAGE_SIZE}} 8 {{MAX_SEQ_LEN}} {{PATCH_MULTIPLIER}} 1",
-        "echo '[OK] compile.sh v3_cfg finished'"
+        "ln -sfn {{HF_CACHE_DIR}} /mnt/local/qwen_image_edit_hf_cache_dir",
+        "echo '[INFO] starting compile.sh v3_tp16 (this populates Neuron compile cache, ~90-120 min)'",
+        "bash compile.sh v3_tp16 {{HEIGHT}} {{WIDTH}} {{IMAGE_SIZE}} 8 {{MAX_SEQ_LEN}} {{PATCH_MULTIPLIER}} 1",
+        "echo '[OK] compile.sh v3_tp16 finished'",
+        "id {{SERVE_USER}} >/dev/null 2>&1 && { chown -R {{SERVE_USER}}:{{SERVE_USER}} {{COMPILED_MODELS_DIR}} && chmod -R u+rwX,go+rX {{COMPILED_MODELS_DIR}}; } || echo '[WARN] {{SERVE_USER}} missing on this host; skipping chown (server will need manual ownership fix)'"
       ]
     },
     {

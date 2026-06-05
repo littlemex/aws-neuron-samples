@@ -12,6 +12,7 @@ import {
   type VlmResponseBody,
 } from '@/lib/api';
 import { useEngineConfig } from '@/lib/engineConfig';
+import { NeuronDrawer } from '@aws-neuron-samples/neuron-anatomy';
 
 type StageId = 'asr' | 'vlm_instruction' | 'edit' | 'vlm_review';
 type StageStatus = 'pending' | 'running' | 'done' | 'error' | 'skipped';
@@ -295,6 +296,7 @@ export default function EditPage() {
           <ReviewPanel review={reviewResult} editPrompt={editPrompt} />
         </section>
       </div>
+      <NeuronDrawer base="/neuron" defaultOpen />
     </main>
   );
 }

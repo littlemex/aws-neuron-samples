@@ -1,0 +1,30 @@
+[Unit]
+Description=neuron-anatomy live dashboard backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/neuron-anatomy/backend
+Environment=PYTHONUNBUFFERED=1
+Environment=LOG_LEVEL=INFO
+Environment=NEURON_MONITOR_BIN=/opt/aws/neuron/bin/neuron-monitor
+Environment=NEURON_LS_BIN=/opt/aws/neuron/bin/neuron-ls
+Environment=NEURON_MONITOR_PERIOD_S=1
+# Bind 0.0.0.0 so the ALB target group (IP target on the EC2 private IP)
+# can reach uvicorn. The instance security group only allows ingress from
+# the ALB SG, so this is not exposed to the internet.
+ExecStart=/opt/neuron-anatomy/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8810 --workers 1
+Restart=always
+RestartSec=3
+# neuron-monitor does not require root. The ubuntu user is already a member
+# of the neuron group on Neuron DLAMIs, so /dev/neuron* access works.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

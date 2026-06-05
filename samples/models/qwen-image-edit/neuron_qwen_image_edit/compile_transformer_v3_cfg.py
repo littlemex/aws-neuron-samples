@@ -73,7 +73,15 @@ _flash_fwd_call = nki_jit()(attention_isa_kernel)
 
 print("NKI Flash Attention kernel loaded successfully")
 
-CACHE_DIR = "/mnt/local/qwen_image_edit_hf_cache_dir"
+# Cache location precedence: explicit HF_CACHE_DIR -> standard HF_HOME ->
+# the legacy /mnt/local path used by compile.sh. The other compile_*.py
+# scripts under this directory pull from /opt/dlami/nvme; both paths
+# resolve via HF_HOME when set, so any host that exports HF_HOME picks
+# one cache rather than maintaining two separate copies.
+CACHE_DIR = os.environ.get(
+    "HF_CACHE_DIR",
+    os.environ.get("HF_HOME", "/mnt/local/qwen_image_edit_hf_cache_dir"),
+)
 MODEL_ID = "Qwen/Qwen-Image-Edit-2511"
 
 

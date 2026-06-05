@@ -157,12 +157,15 @@ export DRY_RUN
 
 # Execute tasks
 python3 << 'PYTHON_EOF'
+import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
 import os
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 # Read parameters from environment
 instance_id = os.environ.get('INSTANCE_ID')
@@ -234,6 +237,40 @@ def replace_variables(text, variables):
     for key, value in variables.items():
         text = text.replace(f"{{{{{key}}}}}", str(value))
     return text
+
+# Normalise S3 presigned URLs into a stable identifier so that fingerprints
+# are content-addressed rather than sensitive to per-request signatures.
+# A URL like https://my-bucket.s3.us-east-2.amazonaws.com/staging/x.tar.gz?
+# X-Amz-Algorithm=...&X-Amz-Signature=... must collapse to
+# "s3://my-bucket/staging/x.tar.gz" so two presigned URLs that point at the
+# same object share the same fingerprint.
+_S3_PRESIGN_RE = re.compile(
+    r"https?://([a-z0-9.\-]+)\.s3[.\-][a-z0-9\-]+\.amazonaws\.com(/[^\s\"']*)"
+)
+def _stabilise_url_match(match):
+    bucket, key = match.group(1), match.group(2)
+    # Drop the query string (signature, expiry) -- only the canonical S3 URI matters.
+    if "?" in key:
+        key = key.split("?", 1)[0]
+    return f"s3://{bucket}{key}"
+
+def stabilise_for_fingerprint(text):
+    return _S3_PRESIGN_RE.sub(_stabilise_url_match, text)
+
+def task_fingerprint(replaced_commands):
+    """Hash the rendered commands for cache invalidation.
+
+    Two runs of the same task with identical variables hash to the same
+    digest; if any byte of any rendered command changes (e.g. a new
+    tarball, a renamed env var, a port change), the digest changes and
+    the task re-executes. Presigned S3 URLs are normalised to s3://<bucket>/<key>
+    so they do not invalidate the cache spuriously.
+    """
+    h = hashlib.sha256()
+    for cmd in replaced_commands:
+        h.update(stabilise_for_fingerprint(cmd).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
 
 # SSM send-command execution function
 def execute_task(task_id, commands):
@@ -374,11 +411,30 @@ for idx, task in enumerate(task_definition['tasks'], 1):
             log_info(f"[{idx}/{total_tasks}] Skipping: {task_id} - {task_name}")
             continue
 
-    # Skip tasks that have already succeeded (tasks reset by --start-from pass through)
+    # Compute the per-task fingerprint up front so we can use it in the
+    # skip check below. This intentionally includes *every* rendered
+    # command so changes to commands, variable values, or task ordering
+    # all cause the digest to change and the task to re-execute.
+    commands = task.get('commands', [])
+    replaced_commands = [replace_variables(cmd, variables) for cmd in commands]
+    current_fp = task_fingerprint(replaced_commands)
+
+    # Skip tasks that have already succeeded *with the same fingerprint*.
+    # Tasks reset by --start-from fall through (status was rewritten to
+    # 'pending-rerun' above). Tasks whose rendered commands changed --
+    # for example a new tarball URL with a different S3 key, a bumped
+    # port, or a re-staged source -- fall through and execute again.
     if task_id in state['tasks'] and state['tasks'][task_id].get('status') == 'success':
-        log_success(f"[{idx}/{total_tasks}] Already completed: {task_id} - {task_name}")
-        completed_tasks += 1
-        continue
+        prev_fp = state['tasks'][task_id].get('fingerprint')
+        if prev_fp == current_fp:
+            log_success(f"[{idx}/{total_tasks}] Already completed: {task_id} - {task_name}")
+            completed_tasks += 1
+            continue
+        else:
+            log_info(
+                f"[{idx}/{total_tasks}] Re-running: {task_id} - {task_name} "
+                f"(fingerprint changed: {(prev_fp or 'none')[:8]}..{current_fp[:8]})"
+            )
 
     print("")
     print(f"{CYAN}{'='*80}{NC}")
@@ -387,19 +443,18 @@ for idx, task in enumerate(task_definition['tasks'], 1):
     print(f"  Description: {task_desc}")
     print(f"{CYAN}{'='*80}{NC}")
 
-    # Prepare commands
-    commands = task.get('commands', [])
-    replaced_commands = [replace_variables(cmd, variables) for cmd in commands]
-
     # Execute task
     result = execute_task(task_id, replaced_commands)
 
-    # Update state
+    # Update state. The fingerprint we computed above is what the next
+    # run will compare against, so two consecutive successful runs with
+    # identical inputs will short-circuit the second time.
     state['tasks'][task_id] = {
         'name': task_name,
         'status': result['status'],
         'timestamp': datetime.now().isoformat(),
         'command_id': result.get('command_id', ''),
+        'fingerprint': current_fp,
     }
 
     if result['status'] == 'success':

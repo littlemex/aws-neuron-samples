@@ -2,6 +2,10 @@
 # deploy.sh - one-shot CDK deploy + code-server setup for a single Neuron DLAMI instance.
 
 set -e
+# Surface failures of any command in a pipeline. Without pipefail, a failing
+# setup-code-server.sh piped through `tee` would let the wrapper exit 0 and
+# silently leave the box half-configured.
+set -o pipefail
 
 # ANSI colors
 RED='\033[0;31m'
@@ -1040,6 +1044,143 @@ describe_existing_shape() {
 }
 
 # ----------------------------------------------------------------------
+# Helper: resolve a usable EFS file system id, in priority order:
+#
+#   1. CLI flag --efs-id (passed in as $1)
+#   2. base CFN stack's EfsId output (set when --create-efs was used previously)
+#   3. sibling stack "<base>-efs" EfsId output (when EFS is provisioned in a
+#      separate stack, e.g. storeai-validation-use2 + storeai-validation-use2-efs)
+#
+# Echoes the first non-empty, non-"none"/"None" value and returns 0. If
+# nothing matches, echoes nothing and returns 1 so the caller can treat
+# this run as "EFS-less".
+#
+# Without this resolver the base stack output of "none" (when EFS lives in
+# a sibling stack) caused the RECOVER fast path to silently skip
+# setup-persistence and exit 0, breaking one-shot recovery.
+# ----------------------------------------------------------------------
+resolve_efs_id() {
+    local cli_value="$1"
+    local stack_name="$2"
+    local rg="$3"
+    local v=""
+
+    # 1. CLI flag wins. Anything non-empty other than literal "none"/"None"
+    #    is treated as an explicit operator decision.
+    if [[ -n "$cli_value" ]] && [[ "$cli_value" != "none" ]] && [[ "$cli_value" != "None" ]]; then
+        echo "$cli_value"
+        return 0
+    fi
+
+    # 2. Base stack EfsId output.
+    v=$(aws cloudformation describe-stacks --stack-name "$stack_name" --region "$rg" \
+        --query 'Stacks[0].Outputs[?OutputKey==`EfsId`].OutputValue' --output text 2>/dev/null)
+    if [[ -n "$v" ]] && [[ "$v" != "None" ]] && [[ "$v" != "none" ]]; then
+        echo "$v"
+        return 0
+    fi
+
+    # 3. Sibling "<base>-efs" stack output. Covers the split-stack pattern
+    #    (e.g. storeai-validation-use2 + storeai-validation-use2-efs).
+    v=$(aws cloudformation describe-stacks --stack-name "${stack_name}-efs" --region "$rg" \
+        --query 'Stacks[0].Outputs[?OutputKey==`EfsId`].OutputValue' --output text 2>/dev/null)
+    if [[ -n "$v" ]] && [[ "$v" != "None" ]] && [[ "$v" != "none" ]]; then
+        echo "$v"
+        return 0
+    fi
+
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# Helper: install CDK node_modules if missing. Prevents the recurring
+# "tsc: command not found" failure that blocked one-shot recovery on a
+# fresh workstation. Idempotent: no-op when node_modules already exists.
+# ----------------------------------------------------------------------
+ensure_cdk_node_modules() {
+    local cdk_dir="$1"
+    if [[ ! -d "$cdk_dir/node_modules" ]]; then
+        echo -e "${BLUE}[BOOTSTRAP] CDK node_modules not found — running npm install${NC}"
+        (cd "$cdk_dir" && npm install --silent) || {
+            echo -e "${RED}[NG] npm install failed at $cdk_dir${NC}"
+            return 1
+        }
+    fi
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Helper: re-register the current EC2 instance into every empty
+# instance-type Target Group attached to the base ALB.
+#
+# Why this exists:
+#   When --recover replaces the EC2, the base ALB stack
+#   (<stack>-alb) still references the old instance ID via CFN
+#   InstanceIdTarget resources. ELBv2 deregisters terminated instances
+#   automatically, leaving those TGs empty. The catch-all listener rule
+#   (priority 1000, /*) then returns 503 to every browser hit on the
+#   CloudFront site.
+#
+# CDK redeploy of <stack>-alb would fix this in principle but in
+# practice the templates trigger a delete/recreate of resources whose
+# CFN exports are still consumed by <stack>-frontend, causing a
+# rollback. The cleanest workaround is to call register-targets
+# directly. Idempotent: skips TGs that already contain this instance.
+#
+# Args:
+#   $1 = base stack name (we look for the ALB whose name embeds this)
+#   $2 = EC2 instance id to register
+#   $3 = AWS region
+# ----------------------------------------------------------------------
+reregister_alb_targets() {
+    local stack_name="$1"
+    local instance_id="$2"
+    local rg="$3"
+
+    # Resolve the ALB ARN from the base stack's CloudFormation outputs.
+    # We look up via the load balancer name pattern instead of the alb
+    # stack output because the alb stack may not exist yet on a fresh
+    # repo.
+    local alb_arn
+    alb_arn=$(aws elbv2 describe-load-balancers --region "$rg" \
+        --query "LoadBalancers[?contains(LoadBalancerName, 'storea') || contains(LoadBalancerName, 'Alb')].LoadBalancerArn | [0]" \
+        --output text 2>/dev/null)
+    if [[ -z "$alb_arn" || "$alb_arn" == "None" ]]; then
+        # No ALB attached to this stack family. Nothing to do.
+        return 0
+    fi
+
+    echo -e "${BLUE}[ALB-TG] Re-registering ${instance_id} into empty instance-type target groups${NC}"
+    echo "  ALB: $alb_arn"
+
+    local tgs
+    tgs=$(aws elbv2 describe-target-groups --load-balancer-arn "$alb_arn" --region "$rg" \
+        --query 'TargetGroups[?TargetType==`instance`].TargetGroupArn' --output text 2>/dev/null)
+
+    local tg_arn tg_name tg_port targets
+    for tg_arn in $tgs; do
+        tg_name=$(aws elbv2 describe-target-groups --target-group-arns "$tg_arn" --region "$rg" \
+            --query 'TargetGroups[0].TargetGroupName' --output text 2>/dev/null)
+        tg_port=$(aws elbv2 describe-target-groups --target-group-arns "$tg_arn" --region "$rg" \
+            --query 'TargetGroups[0].Port' --output text 2>/dev/null)
+        targets=$(aws elbv2 describe-target-health --target-group-arn "$tg_arn" --region "$rg" \
+            --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null)
+
+        if [[ "$targets" == *"$instance_id"* ]]; then
+            echo "    [OK] $tg_name (port=$tg_port) already has $instance_id"
+            continue
+        fi
+
+        echo "    [REGISTER] $tg_name (port=$tg_port) <- $instance_id"
+        aws elbv2 register-targets --target-group-arn "$tg_arn" --region "$rg" \
+            --targets "Id=${instance_id},Port=${tg_port}" >/dev/null 2>&1 || {
+            echo -e "      ${YELLOW}[WARN] register-targets failed for $tg_name${NC}"
+        }
+    done
+    echo -e "${GREEN}    [OK] ALB target groups synced${NC}"
+}
+
+# ----------------------------------------------------------------------
 # Pre-deploy: heal a stuck stack so the new context can land cleanly.
 #
 # Treatment:
@@ -1154,13 +1295,26 @@ if [[ "$RECOVER" == true ]]; then
             --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text)
         CDK_SG_ID=$(aws cloudformation describe-stack-resources --stack-name "$STACK_NAME" --region "$REGION" \
             --query 'StackResources[?ResourceType==`AWS::EC2::SecurityGroup`].PhysicalResourceId | [0]' --output text)
-        STACK_EFS_ID=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-            --query 'Stacks[0].Outputs[?OutputKey==`EfsId`].OutputValue' --output text 2>/dev/null)
+
+        # Resolve EFS in priority order: CLI > base output > sibling "<base>-efs"
+        # output. Even if the base stack reports EfsId="none", a sibling stack
+        # is picked up here, so STACK_EFS_ID becomes authoritative for the rest
+        # of the fast path (NFS ingress / SSM invocation). EFS_ID is kept in
+        # sync so the normal deploy path (FORCE_RECREATE + setup-code-server.sh)
+        # also forwards the right value.
+        if STACK_EFS_ID=$(resolve_efs_id "$EFS_ID" "$STACK_NAME" "$REGION"); then
+            EFS_ID="${EFS_ID:-$STACK_EFS_ID}"
+        else
+            STACK_EFS_ID=""
+        fi
 
         echo "  Instance ID:  $INSTANCE_ID"
         echo "  CDK SG:       $CDK_SG_ID"
-        [[ -n "$STACK_EFS_ID" ]] && [[ "$STACK_EFS_ID" != "None" ]] && [[ "$STACK_EFS_ID" != "none" ]] && \
+        if [[ -n "$STACK_EFS_ID" ]]; then
             echo "  EFS:          $STACK_EFS_ID"
+        else
+            echo -e "  EFS:          ${YELLOW}(none — persistence will be skipped)${NC}"
+        fi
 
         # Diagnose
         INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --output json 2>/dev/null)
@@ -1272,10 +1426,35 @@ if [[ "$RECOVER" == true ]]; then
                 [[ "$P" == "Online" ]] && break
             done
 
-            # Step: setup-persistence.sh (idempotent rebuild of NVMe / EFS / NEFF cache).
-            if [[ -n "$STACK_EFS_ID" ]] && [[ "$STACK_EFS_ID" != "None" ]] && \
-               [[ "$STACK_EFS_ID" != "none" ]] && [[ -f "$PERSIST_LOCAL" ]]; then
-                echo -e "${BLUE}[RECOVER] Re-running setup-persistence.sh${NC}"
+            # Step: authorize NFS ingress on the EFS mount target SG. The fast
+            # path bypasses CDK redeploy, so normal-path manage_efs_mt_ingress
+            # at the end of deploy.sh never runs. Mirror it here. Idempotent.
+            if [[ -n "$STACK_EFS_ID" ]] && [[ -n "$CDK_SG_ID" ]] && \
+               [[ "$CDK_SG_ID" != "None" ]]; then
+                echo -e "${BLUE}[RECOVER] Authorizing NFS ingress on EFS mount target SG${NC}"
+                manage_efs_mt_ingress authorize "$STACK_EFS_ID" "$CDK_SG_ID" \
+                    "$STACK_NAME NFS" "$REGION" || {
+                    echo -e "${YELLOW}    [WARN] EFS mount target SG authorize failed — setup-persistence may time out${NC}"
+                }
+            fi
+
+            # Step: re-register the (possibly new) instance into every empty
+            # InstanceIdTarget Target Group attached to the base ALB.
+            # Without this the catch-all listener rule (priority 1000, /*)
+            # routes browser traffic to an empty CodeServer TG and the user
+            # sees a 503 immediately after Cognito login.
+            reregister_alb_targets "$STACK_NAME" "$INSTANCE_ID" "$REGION" || true
+
+            # Step: setup-persistence.sh (idempotent rebuild of NVMe / EFS /
+            # NEFF cache). Previously this block was gated on STACK_EFS_ID
+            # being literally non-"none", which caused split-stack deployments
+            # (base EfsId="none" + sibling EFS stack) to skip persistence and
+            # exit 0. Now that resolve_efs_id has filled STACK_EFS_ID with the
+            # authoritative value, the block runs whenever EFS is in scope.
+            # The $PERSIST_LOCAL existence check is kept as a guard against
+            # a broken repository.
+            if [[ -n "$STACK_EFS_ID" ]] && [[ -f "$PERSIST_LOCAL" ]]; then
+                echo -e "${BLUE}[RECOVER] Re-running setup-persistence.sh (EFS=$STACK_EFS_ID)${NC}"
                 PERSIST_B64=$(base64 < "$PERSIST_LOCAL" | tr -d '\n')
                 EFS_SUBPATH_VALUE="${EFS_SUBPATH:-/neuron-workspace}"
                 PERSIST_CMD_ID=$(aws ssm send-command --region "$REGION" \
@@ -1301,6 +1480,63 @@ if [[ "$RECOVER" == true ]]; then
                         echo -e "    ${YELLOW}[WARN] setup-persistence.sh status=$PS${NC}"
                         echo "$PO" | tail -10 | sed 's/^/    /'
                     fi
+                fi
+            fi
+
+            # ----------------------------------------------------------
+            # Step: run the 20-task code-server setup runner.
+            # Previously the fast path called exit 0 here, so the 20-task
+            # runner (nginx / Neuron driver / persistence-aware systemd units
+            # / etc.) never ran during recovery. Unless --skip-setup is set,
+            # call the same setup-code-server.sh that the CDK redeploy path
+            # uses; each task has its own skip_if so already-configured items
+            # are no-ops.
+            # ----------------------------------------------------------
+            if [[ "$SKIP_SETUP" != true ]]; then
+                SECRET_ARN=$(aws secretsmanager list-secrets \
+                    --region "$REGION" \
+                    --query "SecretList[?contains(Name, 'CodeServerPassword') && Tags[?Key=='aws:cloudformation:stack-name' && Value=='$STACK_NAME']].ARN | [0]" \
+                    --output text 2>/dev/null)
+
+                SETUP_ARGS=(-i "$INSTANCE_ID" -r "$REGION" -s "$SECRET_ARN")
+                if [[ "$NO_EFS" == true ]]; then
+                    SETUP_ARGS+=(--efs-id none)
+                elif [[ -n "$EFS_ID" ]]; then
+                    SETUP_ARGS+=(--efs-id "$EFS_ID")
+                fi
+                if [[ -n "$EFS_SUBPATH" ]]; then
+                    SETUP_ARGS+=(--efs-subpath "$EFS_SUBPATH")
+                fi
+                if [[ "$INSTALL_CLAUDE_CODE" == true ]]; then
+                    SETUP_ARGS+=(--install-claude-code)
+                fi
+                echo ""
+                echo -e "${BLUE}[RECOVER] Running setup-code-server.sh (20-task runner)${NC}"
+                bash "$SCRIPT_DIR/setup-code-server.sh" "${SETUP_ARGS[@]}" || {
+                    echo -e "${RED}[NG] code-server setup failed${NC}"
+                    echo -e "${YELLOW}Re-run manually:${NC}"
+                    echo "  bash $SCRIPT_DIR/setup-code-server.sh ${SETUP_ARGS[*]}"
+                    exit 1
+                }
+
+                # Optional: install Neuron Explorer behind /explorer/. The
+                # normal deploy path runs this block too (line ~1904); we
+                # mirror it here so --recover --enable-explorer is a true
+                # one-shot. Idempotent: setup-explorer.sh skips when the
+                # systemd unit + nginx snippet are already in place.
+                if [[ "$ENABLE_EXPLORER" == true ]]; then
+                    EXPLORER_ARGS=(
+                        -i "$INSTANCE_ID"
+                        -r "$REGION"
+                        --explorer-display-name "$EXPLORER_DISPLAY_NAME"
+                    )
+                    echo ""
+                    echo -e "${BLUE}[RECOVER] Installing Neuron Explorer (--enable-explorer)${NC}"
+                    bash "$SCRIPT_DIR/setup-explorer-wrapper.sh" "${EXPLORER_ARGS[@]}" || {
+                        echo -e "${YELLOW}[WARN] Neuron Explorer setup failed${NC}"
+                        echo -e "${YELLOW}Re-run manually:${NC}"
+                        echo "  bash $SCRIPT_DIR/setup-explorer-wrapper.sh ${EXPLORER_ARGS[*]}"
+                    }
                 fi
             fi
 
@@ -1478,6 +1714,7 @@ if [[ "$FORCE_RECREATE" == true ]]; then
 fi
 
 echo -e "${BLUE}[BUILD] Compiling CDK app...${NC}"
+ensure_cdk_node_modules "$CDK_DIR"
 cd "$CDK_DIR"
 npm run build
 
@@ -1614,6 +1851,16 @@ if [[ -n "$SG_ID" ]] && [[ "$SG_ID" != "None" ]] && \
         echo -e "${YELLOW}       NFS mount in setup-persistence may time out.${NC}"
     }
 fi
+
+# Re-register the (possibly newly created) EC2 into every empty
+# instance-type Target Group attached to the base ALB. CDK's
+# AWS::ElasticLoadBalancingV2::TargetGroup pins targets to the original
+# instance ID, so a FORCE_RECREATE -> EC2 replace leaves the TGs empty
+# until we rewrite them via the API. Skips silently when no ALB exists.
+if [[ -n "$INSTANCE_ID" ]] && [[ "$INSTANCE_ID" != "None" ]]; then
+    reregister_alb_targets "$STACK_NAME" "$INSTANCE_ID" "$REGION" || true
+fi
+
 echo "Public DNS: $PUBLIC_DNS"
 echo "Secret ARN: $SECRET_ARN"
 

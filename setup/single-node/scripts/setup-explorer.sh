@@ -10,7 +10,9 @@
 #
 # Required env (set by the task wrapper):
 #   EXPLORER_USER         user that owns the systemd unit (default: coder)
-#   EXPLORER_PORT         UI port the service listens on (default: 8081)
+#   EXPLORER_PORT         UI port the service listens on (default: 8181;
+#                         8081 is occupied by qwen-image-edit on
+#                         voice-image-edit deployments)
 #   EXPLORER_API_PORT     API port the service binds to (default: 3002,
 #                         not configurable on neuron-explorer 2.29 - keep
 #                         in sync with the upstream tool)
@@ -26,7 +28,7 @@
 set -euo pipefail
 
 EXPLORER_USER="${EXPLORER_USER:-coder}"
-EXPLORER_PORT="${EXPLORER_PORT:-8081}"
+EXPLORER_PORT="${EXPLORER_PORT:-8181}"
 EXPLORER_API_PORT="${EXPLORER_API_PORT:-3002}"
 EXPLORER_DATA_DIR="${EXPLORER_DATA_DIR:-/var/lib/neuron-explorer}"
 EXPLORER_SEED_DIR="${EXPLORER_SEED_DIR:-$EXPLORER_DATA_DIR/seed}"
@@ -81,13 +83,18 @@ Environment=HOME=/home/${EXPLORER_USER}
 WorkingDirectory=${EXPLORER_DATA_DIR}
 
 # neuron-explorer 2.29 binds two ports under one PID:
-#   * UI / static assets on -p (configurable, default 8081)
+#   * UI / static assets on -p (configurable, default 8181)
 #   * REST API on a fixed internal port (currently 3002)
 # Both bind to 127.0.0.1 only.  nginx is the single ingress.
+#
+# We do NOT pass -d EXPLORER_SEED_DIR here. neuron-explorer 2.30 treats
+# the seed dir as a required input profile bundle and exits with status=1
+# if it has no *.ntff or trace_info.pb. Operators upload profiles later
+# via 'neuron-explorer upload' (or capture-and-upload.sh), so the
+# steady-state UI must be able to start with an empty inbox.
 ExecStart=${NEURON_EXPLORER_BIN} view \\
     --display-name ${EXPLORER_DISPLAY_NAME} \\
     --data-path ${EXPLORER_DATA_DIR}/data \\
-    -d ${EXPLORER_SEED_DIR} \\
     -p ${EXPLORER_PORT}
 
 Restart=on-failure

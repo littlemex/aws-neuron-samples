@@ -27,6 +27,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# venv resolution: pinned path encodes the PyTorch version (2.9 today)
+# and breaks on every DLAMI bump. Fall back to a glob-based discovery
+# that picks the highest-version nxd_inference venv present.
+if [[ ! -x "${VENV}/bin/python" ]]; then
+  _newest=$(ls -d /opt/aws_neuronx_venv_pytorch_*_nxd_inference 2>/dev/null | sort -V | tail -1)
+  if [[ -n "$_newest" ]] && [[ -x "${_newest}/bin/python" ]]; then
+    VENV="$_newest"
+    echo "[whisper] using auto-detected venv: $VENV"
+  fi
+fi
+
 LOG_DIR="${LOG_DIR:-$(cd "$(dirname "$0")" && pwd)/logs}"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/whisper.log"

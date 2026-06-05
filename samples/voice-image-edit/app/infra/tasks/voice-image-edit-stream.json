@@ -22,6 +22,7 @@
         "command -v curl >/dev/null || { echo '[NG] curl missing'; exit 1; }",
         "command -v tar >/dev/null || { echo '[NG] tar missing'; exit 1; }",
         "id {{STREAM_USER}} >/dev/null 2>&1 || { echo '[NG] user {{STREAM_USER}} missing'; exit 1; }",
+        "python3 -m venv --help >/dev/null 2>&1 || { echo '[NG] python3-venv module missing; run: apt-get install python3-venv'; exit 1; }",
         "echo '[OK] precheck'"
       ]
     },
@@ -59,7 +60,7 @@
       "description": "system python は触らない。venv を作って FastAPI / uvicorn を pip install。",
       "commands": [
         "set -e",
-        "apt-get -y install python3-venv >/dev/null 2>&1 || true",
+        "apt-get -y install python3-venv || { echo '[NG] apt-get install python3-venv failed'; exit 1; }",
         "python3 -m venv {{STREAM_DIR}}/venv",
         "{{STREAM_DIR}}/venv/bin/pip install --upgrade pip --quiet",
         "{{STREAM_DIR}}/venv/bin/pip install --quiet -r {{STREAM_DIR}}/requirements.txt",
