@@ -1,0 +1,44 @@
+# XTTSv2 server image — DLC + Coqui TTS runtime deps baked in.
+#
+# We extend the official AWS Neuron DLC (SDK 2.28.0) so we can pin
+# neuronx-cc 2.23.6484, which is the last release that compiles this
+# model's KV-cache scatter without tripping NCC_IXRO002. The newer SDK
+# 2.30.0 + neuronx-cc 2.25.3371 image hits an internal compiler bug on
+# the same graph.
+#
+# coqui-tts 0.26.* is the last upstream release that does NOT hard-import
+# torchcodec at module load — torchcodec has no working CPU build for
+# this AMI. torchaudio is installed from the CPU index for the same
+# reason; XTTS only needs torchaudio.load on a tiny reference WAV, which
+# the server further routes through soundfile via a runtime monkey patch.
+
+FROM public.ecr.aws/neuron/pytorch-inference-neuronx:2.9.0-neuronx-py312-sdk2.28.0-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    COQUI_TOS_AGREED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
+
+RUN pip install --no-cache-dir \
+        'coqui-tts==0.26.*' \
+        'soundfile>=0.12' \
+        'fastapi>=0.110' \
+        'uvicorn>=0.27' \
+        'cutlet>=0.5' \
+        'unidic-lite>=1.0.8' \
+    && pip install --no-cache-dir \
+        'torchaudio==2.9.*' \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+    && python -c "import TTS, torchaudio, soundfile, fastapi, uvicorn, cutlet; print('[OK] deps:', TTS.__version__, torchaudio.__version__)"
+
+WORKDIR /app
+
+# server source is bind-mounted at runtime so a redeploy is `systemctl
+# restart` rather than `docker build`. This image only carries the
+# python dependency closure.
+
+# Bypass the SageMaker entrypoint that ships in the DLC; the unit file
+# overrides it explicitly with --entrypoint /bin/bash anyway, but a sane
+# default helps interactive `docker run` invocations.
+ENTRYPOINT []
+CMD ["/bin/bash"]

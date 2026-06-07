@@ -79,9 +79,11 @@ ALL_STEPS=(
   whisper-precompile
   qwen3-vl-prepare
   qwen-image-edit-prepare
+  xttsv2-precompile
   whisper-server
   qwen3-vl-server
   qwen-image-edit-server
+  xttsv2-server
   voice-image-edit-app
 )
 
@@ -164,6 +166,8 @@ RUNNER="$REPO_ROOT/setup/single-node/scripts/run-tasks.sh"
 WHISPER_TASKS="$REPO_ROOT/samples/models/whisper/tasks"
 QWEN3VL_TASKS="$REPO_ROOT/samples/models/qwen3-vl/tasks"
 QIE_TASKS="$REPO_ROOT/samples/models/qwen-image-edit/tasks"
+XTTSV2_TASKS="$REPO_ROOT/samples/models/xttsv2/tasks"
+XTTSV2_DIR="$REPO_ROOT/samples/models/xttsv2"
 SCRIPTS_TASKS="$VIE_DIR/scripts/tasks"
 APP_INFRA_DIR="$VIE_DIR/app/infra"
 
@@ -199,7 +203,31 @@ step_precheck() {
     return 1
   fi
   ok "EC2_INSTANCE_ID=$EC2_INSTANCE_ID  EFS_ID=${EFS_ID:-(unknown)}  PUBLIC_IP=${EC2_PUBLIC_IP:-(unknown)}"
-  export EC2_INSTANCE_ID EC2_PUBLIC_IP EFS_ID
+  EC2_INSTANCE_TYPE=$(aws ec2 describe-instances \
+    --instance-ids "$EC2_INSTANCE_ID" --region "$REGION" \
+    --query 'Reservations[0].Instances[0].InstanceType' --output text 2>/dev/null || true)
+  ok "EC2_INSTANCE_TYPE=${EC2_INSTANCE_TYPE:-(unknown)}"
+  export EC2_INSTANCE_ID EC2_PUBLIC_IP EFS_ID EC2_INSTANCE_TYPE
+}
+
+# --- helper: pick xttsv2 profile per host (TP, NeuronCores, compile path) ---
+# trn2.3xlarge has a single chip (cores 0-3). trn2.48xlarge has 16 chips (0-63);
+# whisper occupies 48-55, qwen3-vl 32-47, qwen-image-edit 0-31, leaving 56-63
+# (= 2 chips, 8 cores) free for xttsv2 — TP=8 is the largest power-of-two that
+# fits and roughly halves prefill latency over TP=4. The compile artefact path
+# is suffixed with the TP degree because the NEFFs are not interchangeable
+# across degrees and /models is shared via EFS.
+xttsv2_profile_for_instance() {
+  local itype="$1"
+  case "$itype" in
+    trn2.48xlarge)
+      echo "8 56-63 /models/xttsv2-neuron-nxd-tp8"
+      ;;
+    *)
+      # trn2.3xlarge / unknown — assume the single-chip path.
+      echo "4 0-3 /models/xttsv2-neuron-nxd-tp4"
+      ;;
+  esac
 }
 
 # --- helper: run a task JSON via run-tasks.sh ---
@@ -288,6 +316,59 @@ step_whisper_server() {
     run_task_json "$WHISPER_TASKS/whisper-nxd-server.json" "$vars" whisper-nxd-server
 }
 
+# --- step: xttsv2-precompile ---
+# XTTSv2 GPT decoder compile inside the SDK 2.28 DLC. The same source tarball
+# carries compile_xttsv2_nxd.py + neuron_xttsv2/ + xttsv2_server.py +
+# Dockerfile.server, so xttsv2-server can later re-extract it without
+# restaging. The TP / cores / output path are picked per instance type by
+# xttsv2_profile_for_instance() so /models stays clean across hosts that share
+# the same EFS.
+step_xttsv2_precompile() {
+  section "xttsv2-precompile (DLC, BF16)"
+  local tarball_url
+  tarball_url=$(stage_dir_to_s3 "$XTTSV2_DIR" xttsv2-source.tar.gz) || return 1
+  local profile xtts_tp xtts_cores xtts_path
+  profile=$(xttsv2_profile_for_instance "$EC2_INSTANCE_TYPE")
+  xtts_tp=$(awk '{print $1}' <<< "$profile")
+  xtts_cores=$(awk '{print $2}' <<< "$profile")
+  xtts_path=$(awk '{print $3}' <<< "$profile")
+  log "xttsv2 profile: TP=$xtts_tp cores=$xtts_cores path=$xtts_path  (host=$EC2_INSTANCE_TYPE)"
+  local vars
+  vars=$(jq -nc \
+    --arg url   "$tarball_url" \
+    --arg tp    "$xtts_tp" \
+    --arg cores "$xtts_cores" \
+    --arg path  "$xtts_path" \
+    '{SOURCE_TARBALL_URL:$url, TP_DEGREE:$tp, NEURON_CORES:$cores, COMPILED_MODEL_PATH:$path}')
+  TASK_MAX_WAIT_SECONDS=7200 \
+    run_task_json "$XTTSV2_TASKS/xttsv2-precompile.json" "$vars" xttsv2-precompile
+}
+
+# --- step: xttsv2-server ---
+# Same per-instance profile as xttsv2-precompile so the server reads the right
+# compiled artefact directory and pins to the cores that were actually
+# compiled for. Health check waits up to 600s for warm-up.
+step_xttsv2_server() {
+  section "xttsv2-server (DLC)"
+  local tarball_url
+  tarball_url=$(stage_dir_to_s3 "$XTTSV2_DIR" xttsv2-source.tar.gz) || return 1
+  local profile xtts_tp xtts_cores xtts_path
+  profile=$(xttsv2_profile_for_instance "$EC2_INSTANCE_TYPE")
+  xtts_tp=$(awk '{print $1}' <<< "$profile")
+  xtts_cores=$(awk '{print $2}' <<< "$profile")
+  xtts_path=$(awk '{print $3}' <<< "$profile")
+  log "xttsv2 profile: TP=$xtts_tp cores=$xtts_cores path=$xtts_path  (host=$EC2_INSTANCE_TYPE)"
+  local vars
+  vars=$(jq -nc \
+    --arg url   "$tarball_url" \
+    --arg tp    "$xtts_tp" \
+    --arg cores "$xtts_cores" \
+    --arg path  "$xtts_path" \
+    '{SOURCE_TARBALL_URL:$url, TP_DEGREE:$tp, NEURON_CORES:$cores, COMPILED_MODEL_PATH:$path}')
+  TASK_MAX_WAIT_SECONDS=1800 \
+    run_task_json "$XTTSV2_TASKS/xttsv2-server.json" "$vars" xttsv2-server
+}
+
 # --- step: qwen3-vl-server ---
 step_qwen3vl_server() {
   section "qwen3-vl-server"
@@ -316,8 +397,9 @@ step_voice_image_edit_app() {
   local asr_url="http://127.0.0.1:8765/transcribe"
   local vlm_url="http://127.0.0.1:8090/v1/chat/completions"
   local edit_url="http://127.0.0.1:8081/infer"
+  local tts_url="http://127.0.0.1:8770/synthesize"
   if [[ "$DRY_RUN" == true ]]; then
-    log "[dry] cd $APP_INFRA_DIR && bash deploy.sh --base-stack-name $BASE_STACK_NAME --region $REGION --trainium-asr-url $asr_url --trainium-vlm-url $vlm_url --trainium-edit-url $edit_url"
+    log "[dry] cd $APP_INFRA_DIR && bash deploy.sh --base-stack-name $BASE_STACK_NAME --region $REGION --trainium-asr-url $asr_url --trainium-vlm-url $vlm_url --trainium-edit-url $edit_url --trainium-tts-url $tts_url"
     return 0
   fi
   ( cd "$APP_INFRA_DIR" && bash deploy.sh \
@@ -325,7 +407,8 @@ step_voice_image_edit_app() {
     --region "$REGION" \
     --trainium-asr-url "$asr_url" \
     --trainium-vlm-url "$vlm_url" \
-    --trainium-edit-url "$edit_url" )
+    --trainium-edit-url "$edit_url" \
+    --trainium-tts-url "$tts_url" )
 }
 
 # --- helper: stage a single file or directory tar to the stage S3 bucket ---
@@ -333,12 +416,31 @@ step_voice_image_edit_app() {
 STAGE_BUCKET=""
 ensure_stage_bucket() {
   if [[ -n "$STAGE_BUCKET" ]]; then return 0; fi
-  # voice-image-edit-stage-<region>-<random> から既存を 1 つ拾う。 無ければ作る。
-  STAGE_BUCKET=$(aws s3api list-buckets --query "Buckets[?starts_with(Name,'voice-image-edit-stage-')].Name | [0]" --output text)
-  if [[ "$STAGE_BUCKET" == "None" || -z "$STAGE_BUCKET" ]]; then
-    STAGE_BUCKET="voice-image-edit-stage-$(echo $REGION|tr -d '-')-$RANDOM-$RANDOM"
-    log "creating stage bucket $STAGE_BUCKET"
-    aws s3 mb "s3://$STAGE_BUCKET" --region "$REGION" >&2
+  # Pick any voice-image-edit-stage-* bucket whose LocationConstraint
+  # matches $REGION. A bucket in another region will produce
+  # SignatureMismatch when presigned via --region "$REGION", which
+  # silently breaks `curl | tar -xzf` on the instance ("not in gzip
+  # format"). We therefore explicitly verify each candidate's region
+  # before adopting it.
+  local candidates loc
+  candidates=$(aws s3api list-buckets --query "Buckets[?starts_with(Name,'voice-image-edit-stage-')].Name" --output text)
+  for cand in $candidates; do
+    [[ -z "$cand" || "$cand" == "None" ]] && continue
+    loc=$(aws s3api get-bucket-location --bucket "$cand" --query 'LocationConstraint' --output text 2>/dev/null || true)
+    # us-east-1 reports None / null; everything else reports the region literal.
+    if [[ "$loc" == "$REGION" || ( "$REGION" == "us-east-1" && ( "$loc" == "None" || "$loc" == "null" || -z "$loc" ) ) ]]; then
+      STAGE_BUCKET="$cand"
+      log "STAGE_BUCKET=$STAGE_BUCKET (region matched: $loc)"
+      return 0
+    fi
+  done
+  STAGE_BUCKET="voice-image-edit-stage-$(echo $REGION|tr -d '-')-$RANDOM-$RANDOM"
+  log "creating stage bucket $STAGE_BUCKET in $REGION"
+  if [[ "$REGION" == "us-east-1" ]]; then
+    aws s3api create-bucket --bucket "$STAGE_BUCKET" --region "$REGION" >&2
+  else
+    aws s3api create-bucket --bucket "$STAGE_BUCKET" --region "$REGION" \
+      --create-bucket-configuration "LocationConstraint=$REGION" >&2
   fi
   log "STAGE_BUCKET=$STAGE_BUCKET"
 }
@@ -391,9 +493,11 @@ for step in "${ALL_STEPS[@]}"; do
     whisper-precompile)      step_whisper_precompile ;;
     qwen3-vl-prepare)        step_qwen3vl_prepare ;;
     qwen-image-edit-prepare) step_qie_prepare ;;
+    xttsv2-precompile)       step_xttsv2_precompile ;;
     whisper-server)          step_whisper_server ;;
     qwen3-vl-server)         step_qwen3vl_server ;;
     qwen-image-edit-server)  step_qie_server ;;
+    xttsv2-server)           step_xttsv2_server ;;
     voice-image-edit-app)    step_voice_image_edit_app ;;
     *) err "unknown step: $step"; exit 1 ;;
   esac

@@ -56,6 +56,7 @@
 #   --trainium-asr-url URL             例: http://internal-...:8000/transcribe
 #   --trainium-vlm-url URL             例: http://internal-...:8090/v1/chat/completions
 #   --trainium-edit-url URL            例: http://internal-...:8100/edit
+#   --trainium-tts-url URL             例: http://127.0.0.1:8770/synthesize  (XTTSv2 NxD DLC)
 #
 # 操作:
 #   --skip-api                    VoiceImageEditApiStack を deploy しない
@@ -112,6 +113,7 @@ BEDROCK_EDIT_MODEL_ID="amazon.nova-canvas-v1:0"
 TRAINIUM_ASR_URL=""
 TRAINIUM_VLM_URL=""
 TRAINIUM_EDIT_URL=""
+TRAINIUM_TTS_URL=""
 
 ALB_ARN_OVERRIDE=""
 LISTENER_ARN_OVERRIDE=""
@@ -160,6 +162,7 @@ while [[ $# -gt 0 ]]; do
         --trainium-asr-url)             TRAINIUM_ASR_URL="$2"; shift 2 ;;
         --trainium-vlm-url)             TRAINIUM_VLM_URL="$2"; shift 2 ;;
         --trainium-edit-url)            TRAINIUM_EDIT_URL="$2"; shift 2 ;;
+        --trainium-tts-url)             TRAINIUM_TTS_URL="$2"; shift 2 ;;
         --alb-arn)                      ALB_ARN_OVERRIDE="$2"; shift 2 ;;
         --listener-arn)                 LISTENER_ARN_OVERRIDE="$2"; shift 2 ;;
         --alb-security-group-id)        ALB_SG_ID_OVERRIDE="$2"; shift 2 ;;
@@ -525,6 +528,7 @@ echo "  Bedrock EDIT model         : $BEDROCK_EDIT_MODEL_ID"
 echo "  Trainium ASR URL           : ${TRAINIUM_ASR_URL:-(none)}"
 echo "  Trainium VLM URL           : ${TRAINIUM_VLM_URL:-(none)}"
 echo "  Trainium EDIT URL          : ${TRAINIUM_EDIT_URL:-(none)}"
+echo "  Trainium TTS URL           : ${TRAINIUM_TTS_URL:-(none)}"
 if [[ "$SKIP_API" != "true" ]]; then
     echo "  Api PathPattern            : $PATH_PATTERN"
     echo "  Api RulePriority           : $RULE_PRIORITY"
@@ -813,6 +817,7 @@ deploy_api_service() {
         --arg trainium_asr "$TRAINIUM_ASR_URL" \
         --arg trainium_vlm "$TRAINIUM_VLM_URL" \
         --arg trainium_edit "$TRAINIUM_EDIT_URL" \
+        --arg trainium_tts "$TRAINIUM_TTS_URL" \
         '{
           API_TARBALL_URL: $api_tarball,
           API_PORT: $api_port,
@@ -831,7 +836,8 @@ deploy_api_service() {
           BEDROCK_VLM_MODEL_ID: $nova_lite,
           TRAINIUM_ASR_URL: $trainium_asr,
           TRAINIUM_VLM_URL: $trainium_vlm,
-          TRAINIUM_EDIT_URL: $trainium_edit
+          TRAINIUM_EDIT_URL: $trainium_edit,
+          TRAINIUM_TTS_URL: $trainium_tts
         }')
 
     run_task "$EC2_INSTANCE_ID" "$INFRA_DIR/tasks/voice-image-edit-api.json" "$vars_json" "voice-image-edit-api"
