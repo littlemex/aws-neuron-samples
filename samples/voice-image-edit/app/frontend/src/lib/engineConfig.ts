@@ -1,13 +1,16 @@
 /**
- * 3 スロット (ASR / VLM / EDIT) のエンジン選択を localStorage で永続化する。
+ * Persists the per-slot engine selection (ASR / VLM / EDIT / GENERATE / TTS)
+ * in localStorage so the user's choice survives reloads and tab switches.
  *
- * 設計:
- *   - localStorage の単一 key (`vie.engineConfig`) に
- *     `{asr, vlm, edit}` 3 フィールドだけを JSON で保存する。
- *   - 値が無い / 壊れている時は backend の /engines 既定値にフォールバック。
- *   - ページ間で値が変わったら storage event で他タブにも伝搬させる。
- *   - リクエスト送信時は getEngineConfig() で読み込み、
- *     `body.engine = config[slot]` を載せて送る。
+ * Design:
+ *   - A single localStorage key (`vie.engineConfig`) holds a JSON object
+ *     keyed by slot name.
+ *   - Missing or corrupt values fall back to the backend's /engines default.
+ *   - Cross-tab updates propagate via the native storage event; same-tab
+ *     listeners get a custom event because storage doesn't fire in the
+ *     originating tab.
+ *   - At request time, read via getEngineConfig() and attach
+ *     `body.engine = config[slot]` to the outgoing request body.
  */
 'use client';
 
@@ -31,7 +34,7 @@ function readStorage(): EngineConfig {
     const parsed = JSON.parse(raw) as unknown;
     if (parsed && typeof parsed === 'object') {
       const obj = parsed as EngineConfig;
-      // 値が文字列の slot だけ採用
+      // Only accept slots whose stored value is a non-empty string.
       const out: EngineConfig = {};
       (['asr', 'vlm', 'edit', 'generate', 'tts'] as SlotName[]).forEach((slot) => {
         const v = obj[slot];
@@ -48,8 +51,8 @@ function readStorage(): EngineConfig {
 function writeStorage(cfg: EngineConfig) {
   if (typeof window === 'undefined') return;
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
-  // 同一タブ内の他リスナにも届かせるため CustomEvent を併用
-  // (storage event は別タブにしか飛ばないので両方用意する)
+  // Dispatch a custom event so listeners in the same tab are notified;
+  // the native storage event only fires in other tabs, so we need both.
   window.dispatchEvent(new CustomEvent(STORAGE_EVENT));
 }
 
@@ -72,9 +75,11 @@ export function clearEngineConfig() {
 }
 
 /**
- * 設定 + backend の候補一覧を併せて返す React hook。
- * - 候補一覧はマウント時に 1 回だけ取得 (no-store)。
- * - localStorage 変更は storage / 同一タブの custom event で同期する。
+ * React hook that returns the current engine config alongside the backend's
+ * engine catalog.
+ * - The catalog is fetched once on mount (no-store).
+ * - localStorage changes are synced via the storage event and a same-tab
+ *   custom event.
  */
 export function useEngineConfig() {
   const [catalog, setCatalog] = useState<SlotsCatalog | null>(null);
@@ -118,10 +123,10 @@ export function useEngineConfig() {
   }, []);
 
   /**
-   * リクエスト送信時の解決済みエンジン名を返す。
-   * 1) localStorage に値がある → それを使う
-   * 2) backend の default が catalog にあればそれ
-   * 3) 何も無ければ undefined (Lambda 側の DEFAULT_FALLBACK に委ねる)
+   * Returns the resolved engine name to attach to outgoing requests.
+   * 1) If localStorage has a value, use it.
+   * 2) Otherwise use the backend default from the catalog if present.
+   * 3) Otherwise undefined (defer to the API's DEFAULT_FALLBACK).
    */
   const resolved: Record<SlotName, string | undefined> = useMemo(() => {
     const out: Record<SlotName, string | undefined> = {
@@ -131,7 +136,7 @@ export function useEngineConfig() {
       generate: undefined,
       tts: undefined,
     };
-    (['asr', 'vlm', 'edit'] as SlotName[]).forEach((slot) => {
+    (['asr', 'vlm', 'edit', 'generate', 'tts'] as SlotName[]).forEach((slot) => {
       out[slot] = config[slot] ?? catalog?.[slot]?.default;
     });
     return out;
