@@ -411,7 +411,14 @@ async def _run_pipeline(req: PipelineRequest) -> AsyncIterator[bytes]:
         review_text = (review_res or {}).get("text") if "review_res" in locals() else None
         if req.enable_tts and review_text:
             yield _sse_event("stage_start", {"stage": "tts"})
-            tts_body: dict[str, Any] = {"text": review_text, "request_id": request_id}
+            # Belt-and-braces: even if the review prompt is honoured and
+            # produces a single short sentence, occasional long-form
+            # responses must not crash the synthesizer. XTTSv2 asserts at
+            # 400 input tokens (~70-150 JA chars depending on glyph mix);
+            # we cap at 200 chars before send. The xttsv2 server does its
+            # own sentence-aware chunking on top.
+            safe_text = _truncate_for_tts(review_text)
+            tts_body: dict[str, Any] = {"text": safe_text, "request_id": request_id}
             if req.tts_engine:
                 tts_body["engine"] = req.tts_engine
             async for kind, payload in _stage_with_heartbeat(
@@ -478,6 +485,30 @@ def _looks_english(text: str) -> bool:
         return True
     ascii_count = sum(1 for ch in text if ord(ch) < 128)
     return ascii_count / len(text) >= 0.9
+
+
+def _truncate_for_tts(text: str, *, max_chars: int = 200) -> str:
+    """Trim review text so XTTSv2 cannot crash on its 400-token assert.
+
+    Even with a one-sentence review prompt, the model occasionally
+    over-runs (e.g. when describing dense edits). XTTSv2 asserts at
+    ~400 GPT tokens which the JA tokenizer hits between 70 and 150
+    characters depending on the glyph mix. We pick a conservative cap
+    (200 chars) and prefer a sentence boundary so the cut is natural.
+    """
+    if not text:
+        return text
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    # Prefer cutting at the last Japanese / English sentence terminator
+    # within the budget so the audible output ends naturally.
+    head = text[:max_chars]
+    for terminator in ("。", "!", "?", ".", "!", "?"):
+        idx = head.rfind(terminator)
+        if idx >= max_chars // 2:
+            return head[: idx + 1]
+    return head
 
 
 class GeneratePipelineRequest(BaseModel):

@@ -38,11 +38,13 @@ import base64
 import io
 import logging
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException
@@ -119,6 +121,55 @@ class _ServerState:
 
 
 STATE = _ServerState()
+
+
+def _split_for_xtts(text: str, language: str) -> list[str]:
+    """Split text into chunks XTTSv2 will not crash on.
+
+    XTTSv2's GPT decoder asserts at 400 input tokens. The Coqui
+    ``tokenizer.py`` exposes per-language soft character limits (71 for
+    ``ja``, ~250 for ``en``) — we use those as the chunk budget. We
+    first split on sentence terminators so cut points feel natural; any
+    sentence still over the budget is then cut at clause-ish breaks
+    (commas / spaces) and finally at a hard char window so a single
+    un-punctuated paragraph still synthesises instead of asserting.
+    """
+    if not text:
+        return [""]
+    text = text.strip()
+    # Per-language soft cap, mirrors Coqui's tokenizer table.
+    soft_caps = {"ja": 60, "zh": 60, "ko": 60, "en": 200, "es": 200}
+    cap = soft_caps.get(language, 200)
+    if len(text) <= cap:
+        return [text]
+
+    # Sentence split first. We keep terminators with the preceding
+    # sentence (look-behind) so playback still pauses naturally.
+    sentences = [s.strip() for s in re.split(r"(?<=[。!?\.!\?])\s*", text) if s and s.strip()]
+    chunks: list[str] = []
+    for sent in sentences:
+        if len(sent) <= cap:
+            chunks.append(sent)
+            continue
+        # Sentence is too long on its own. Try clause-level breaks.
+        parts = [p.strip() for p in re.split(r"[、,;]", sent) if p and p.strip()]
+        buf = ""
+        for part in parts:
+            if not buf:
+                buf = part
+            elif len(buf) + 1 + len(part) <= cap:
+                buf = f"{buf}, {part}" if part else buf
+            else:
+                chunks.append(buf)
+                buf = part
+        if buf:
+            # Still too long? Hard window as the last resort.
+            while len(buf) > cap:
+                chunks.append(buf[:cap])
+                buf = buf[cap:]
+            if buf:
+                chunks.append(buf)
+    return chunks or [text[:cap]]
 
 
 def _voice_speaker_wavs(voice_name: Optional[str]) -> list[str]:
@@ -305,30 +356,56 @@ def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
     if speaker_name:
         extra_kwargs["speaker_id"] = speaker_name
 
+    # XTTSv2's GPT decoder asserts at 400 input tokens. The Coqui JA
+    # tokenizer hits that ceiling between roughly 70 and 150 source
+    # characters (varies with the glyph mix), so anything that runs over
+    # the warning threshold has to be split into shorter pieces and
+    # concatenated. We split on sentence terminators first, then fall
+    # back to a hard char window so a single un-punctuated paragraph
+    # still completes instead of crashing the model.
+    chunks = _split_for_xtts(req.text, language)
     t_start = time.monotonic()
     try:
-        out = STATE.cpu_model.synthesize(
-            req.text,
-            STATE.xtts_cfg,
-            speaker_wavs or None,
-            language,
-            **extra_kwargs,
-        )
+        wav_pieces: list[Any] = []
+        for chunk in chunks:
+            out = STATE.cpu_model.synthesize(
+                chunk,
+                STATE.xtts_cfg,
+                speaker_wavs or None,
+                language,
+                **extra_kwargs,
+            )
+            wav_pieces.append(out["wav"])
     except Exception as exc:
         log.exception("synthesize failed")
         raise HTTPException(status_code=500, detail=f"synthesize failed: {exc}") from exc
 
     elapsed = time.monotonic() - t_start
 
-    wav = out["wav"]
+    if len(wav_pieces) == 1:
+        wav = wav_pieces[0]
+    else:
+        # Insert a short silence between chunks so the joined audio does
+        # not sound like a single rushed run-on. 120 ms at the model's
+        # native sample rate keeps the cadence natural.
+        gap = np.zeros(int(STATE.sample_rate * 0.12), dtype=np.float32)
+        joined: list[Any] = []
+        for i, piece in enumerate(wav_pieces):
+            arr = piece if isinstance(piece, np.ndarray) else np.asarray(piece)
+            if arr.dtype != np.float32:
+                arr = arr.astype(np.float32)
+            joined.append(arr)
+            if i < len(wav_pieces) - 1:
+                joined.append(gap)
+        wav = np.concatenate(joined)
     buf = io.BytesIO()
     sf.write(buf, wav, STATE.sample_rate, format="WAV", subtype="PCM_16")
     audio_bytes = buf.getvalue()
     audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
     log.info(
-        "synthesize ok lang=%s voice=%s text_chars=%d audio_bytes=%d "
+        "synthesize ok lang=%s voice=%s text_chars=%d chunks=%d audio_bytes=%d "
         "audio_seconds=%.2f wall_seconds=%.2f rtf=%.2f",
-        language, req.voice or STATE.default_voice, len(req.text),
+        language, req.voice or STATE.default_voice, len(req.text), len(chunks),
         len(audio_bytes), len(wav) / STATE.sample_rate,
         elapsed, (len(wav) / STATE.sample_rate) / max(elapsed, 1e-3),
     )
