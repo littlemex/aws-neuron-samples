@@ -46,22 +46,23 @@
     {
       "id": "10-stop-service",
       "name": "Stop existing voice-image-edit-api service (if any)",
-      "description": "systemd unit があれば一旦止める。冪等性のため失敗しても続行。",
+      "description": "systemd unit があれば一旦止める。Re-deploy 時に古いプロセスが venv のファイルを掴んでいると 20-deploy-tarball の rm -rf が部分失敗するため、必ず先に止める。冪等性のため失敗しても続行。",
       "commands": [
         "systemctl stop voice-image-edit-api.service 2>/dev/null || true",
-        "echo '[OK] stop attempted'"
+        "systemctl reset-failed voice-image-edit-api.service 2>/dev/null || true",
+        "for i in 1 2 3 4 5; do systemctl is-active voice-image-edit-api.service >/dev/null 2>&1 || break; sleep 1; done",
+        "echo '[OK] stopped'"
       ]
     },
     {
       "id": "20-deploy-tarball",
-      "name": "Download + extract api backend tarball",
-      "description": "presigned URL で tarball を取得し /opt/voice-image-edit/api に展開する。",
+      "name": "Download + extract api backend tarball (preserves venv/)",
+      "description": "presigned URL で tarball を取得し {{API_DIR}} に展開する。venv/ は 30-create-venv が管理するので破壊しない (find -mindepth 1 で venv 以外の中身だけを消す)。tar 展開後に {{API_USER}} 所有権を必ず張り直し、後続 30 が ubuntu として書けるようにする。",
       "commands": [
         "set -e",
         "test -n '{{API_TARBALL_URL}}' || { echo '[NG] API_TARBALL_URL is empty'; exit 1; }",
-        "mkdir -p /opt/voice-image-edit",
-        "rm -rf {{API_DIR}}",
         "mkdir -p {{API_DIR}}",
+        "find {{API_DIR}} -mindepth 1 -maxdepth 1 -not -name venv -exec rm -rf {} +",
         "tmp=$(mktemp /tmp/voice-image-edit-api.XXXXXX.tar.gz)",
         "trap 'rm -f $tmp' EXIT",
         "curl -fsSL '{{API_TARBALL_URL}}' -o $tmp",
@@ -70,20 +71,24 @@
         "test -f {{API_DIR}}/requirements.txt || { echo '[NG] requirements.txt missing'; exit 1; }",
         "test -f {{API_DIR}}/contracts.py || { echo '[NG] contracts.py missing'; exit 1; }",
         "test -d {{API_DIR}}/engines || { echo '[NG] engines/ missing'; exit 1; }",
-        "echo '[OK] deployed'"
+        "find {{API_DIR}} -mindepth 1 -maxdepth 1 -not -name venv -exec chown -R {{API_USER}}:{{API_USER}} {} +",
+        "chown {{API_USER}}:{{API_USER}} {{API_DIR}}",
+        "echo '[OK] deployed (venv preserved)'"
       ]
     },
     {
       "id": "30-create-venv",
-      "name": "Create venv + install dependencies",
-      "description": "system python は触らない。venv を作って FastAPI / uvicorn / boto3 / amazon-transcribe を pip install。",
+      "name": "Ensure venv + install dependencies (idempotent on bin/python)",
+      "description": "venv の存在を fingerprint ではなく実体 (bin/python が実行可能か) で判定する。壊れた venv が残っている場合は黙って作り直す。requirements は毎回 pip install で更新 (差分があれば反映、無ければ noop)。最後に bin/uvicorn の存在を必ず検証して、後続 50-enable-start が ExecStart で 203/EXEC を踏まないよう保証する。",
       "commands": [
         "set -e",
-        "apt-get -y install python3-venv || { echo '[NG] apt-get install python3-venv failed'; exit 1; }",
-        "python3 -m venv {{API_DIR}}/venv",
-        "{{API_DIR}}/venv/bin/pip install --upgrade pip --quiet",
-        "{{API_DIR}}/venv/bin/pip install --quiet -r {{API_DIR}}/requirements.txt",
-        "chown -R {{API_USER}}:{{API_USER}} {{API_DIR}}",
+        "apt-get -y install python3-venv >/dev/null 2>&1 || { echo '[NG] apt-get install python3-venv failed'; exit 1; }",
+        "if ! {{API_DIR}}/venv/bin/python -c 'import sys' >/dev/null 2>&1; then echo '[INFO] venv missing or broken — recreating'; rm -rf {{API_DIR}}/venv; sudo -u {{API_USER}} python3 -m venv {{API_DIR}}/venv; fi",
+        "sudo -u {{API_USER}} {{API_DIR}}/venv/bin/pip install --upgrade pip --quiet",
+        "sudo -u {{API_USER}} {{API_DIR}}/venv/bin/pip install --quiet -r {{API_DIR}}/requirements.txt",
+        "test -x {{API_DIR}}/venv/bin/python || { echo '[NG] venv/bin/python not executable after setup'; exit 1; }",
+        "test -x {{API_DIR}}/venv/bin/uvicorn || { echo '[NG] venv/bin/uvicorn missing after pip install'; exit 1; }",
+        "chown -R {{API_USER}}:{{API_USER}} {{API_DIR}}/venv",
         "echo '[OK] venv ready'"
       ]
     },
@@ -140,13 +145,17 @@
     },
     {
       "id": "50-enable-start",
-      "name": "daemon-reload + enable + start",
-      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "name": "daemon-reload + enable + start (stop then start, not restart)",
+      "description": "systemd を再読込してサービスを有効化・起動する。restart は unit file を変更した直後に 'unit file changed on disk' 警告とともに古い unit で再起動するケースがあるので、必ず stop してから start する。最後に is-active で状態確認。",
       "commands": [
         "set -e",
         "systemctl daemon-reload",
         "systemctl enable voice-image-edit-api.service",
-        "systemctl restart voice-image-edit-api.service",
+        "systemctl stop voice-image-edit-api.service 2>/dev/null || true",
+        "systemctl reset-failed voice-image-edit-api.service 2>/dev/null || true",
+        "systemctl start voice-image-edit-api.service",
+        "for i in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active voice-image-edit-api.service >/dev/null 2>&1 && break; sleep 1; done",
+        "systemctl is-active voice-image-edit-api.service >/dev/null 2>&1 || { echo '[NG] service did not become active'; systemctl status voice-image-edit-api.service --no-pager | head -20; journalctl -u voice-image-edit-api.service -n 30 --no-pager; exit 1; }",
         "echo '[OK] service started'"
       ]
     },

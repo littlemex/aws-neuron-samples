@@ -29,42 +29,47 @@
     {
       "id": "10-stop-service",
       "name": "Stop existing voice-image-edit-stream service (if any)",
-      "description": "systemd unit があれば一旦止める。冪等性のため失敗しても続行。",
+      "description": "systemd unit があれば一旦止める。Re-deploy 時に古いプロセスが venv のファイルを掴んでいると 20-deploy-tarball の rm -rf が部分失敗するため、必ず先に止める。冪等性のため失敗しても続行。",
       "commands": [
         "systemctl stop voice-image-edit-stream.service 2>/dev/null || true",
-        "echo '[OK] stop attempted'"
+        "systemctl reset-failed voice-image-edit-stream.service 2>/dev/null || true",
+        "for i in 1 2 3 4 5; do systemctl is-active voice-image-edit-stream.service >/dev/null 2>&1 || break; sleep 1; done",
+        "echo '[OK] stopped'"
       ]
     },
     {
       "id": "20-deploy-tarball",
-      "name": "Download + extract stream backend tarball",
-      "description": "presigned URL で tarball を取得し /opt/voice-image-edit/stream に展開する。",
+      "name": "Download + extract stream backend tarball (preserves venv/)",
+      "description": "presigned URL で tarball を取得し {{STREAM_DIR}} に展開する。venv/ は 30-create-venv が管理するので破壊しない。tar 展開後に {{STREAM_USER}} 所有権を必ず張り直し、後続 30 が ubuntu として書けるようにする。",
       "commands": [
         "set -e",
         "test -n '{{STREAM_TARBALL_URL}}' || { echo '[NG] STREAM_TARBALL_URL is empty'; exit 1; }",
-        "mkdir -p /opt/voice-image-edit",
-        "rm -rf {{STREAM_DIR}}",
         "mkdir -p {{STREAM_DIR}}",
+        "find {{STREAM_DIR}} -mindepth 1 -maxdepth 1 -not -name venv -exec rm -rf {} +",
         "tmp=$(mktemp /tmp/voice-image-edit-stream.XXXXXX.tar.gz)",
         "trap 'rm -f $tmp' EXIT",
         "curl -fsSL '{{STREAM_TARBALL_URL}}' -o $tmp",
         "tar -C {{STREAM_DIR}} -xzf $tmp",
         "test -f {{STREAM_DIR}}/app.py || { echo '[NG] app.py missing after extract'; exit 1; }",
         "test -f {{STREAM_DIR}}/requirements.txt || { echo '[NG] requirements.txt missing'; exit 1; }",
-        "echo '[OK] deployed'"
+        "find {{STREAM_DIR}} -mindepth 1 -maxdepth 1 -not -name venv -exec chown -R {{STREAM_USER}}:{{STREAM_USER}} {} +",
+        "chown {{STREAM_USER}}:{{STREAM_USER}} {{STREAM_DIR}}",
+        "echo '[OK] deployed (venv preserved)'"
       ]
     },
     {
       "id": "30-create-venv",
-      "name": "Create venv + install dependencies",
-      "description": "system python は触らない。venv を作って FastAPI / uvicorn を pip install。",
+      "name": "Ensure venv + install dependencies (idempotent on bin/python)",
+      "description": "venv の存在を fingerprint ではなく実体 (bin/python が実行可能か) で判定する。壊れた venv が残っている場合は黙って作り直す。requirements は毎回 pip install で更新。最後に bin/uvicorn の存在を必ず検証して、後続 50-enable-start が ExecStart で 203/EXEC を踏まないよう保証する。",
       "commands": [
         "set -e",
-        "apt-get -y install python3-venv || { echo '[NG] apt-get install python3-venv failed'; exit 1; }",
-        "python3 -m venv {{STREAM_DIR}}/venv",
-        "{{STREAM_DIR}}/venv/bin/pip install --upgrade pip --quiet",
-        "{{STREAM_DIR}}/venv/bin/pip install --quiet -r {{STREAM_DIR}}/requirements.txt",
-        "chown -R {{STREAM_USER}}:{{STREAM_USER}} {{STREAM_DIR}}",
+        "apt-get -y install python3-venv >/dev/null 2>&1 || { echo '[NG] apt-get install python3-venv failed'; exit 1; }",
+        "if ! {{STREAM_DIR}}/venv/bin/python -c 'import sys' >/dev/null 2>&1; then echo '[INFO] venv missing or broken — recreating'; rm -rf {{STREAM_DIR}}/venv; sudo -u {{STREAM_USER}} python3 -m venv {{STREAM_DIR}}/venv; fi",
+        "sudo -u {{STREAM_USER}} {{STREAM_DIR}}/venv/bin/pip install --upgrade pip --quiet",
+        "sudo -u {{STREAM_USER}} {{STREAM_DIR}}/venv/bin/pip install --quiet -r {{STREAM_DIR}}/requirements.txt",
+        "test -x {{STREAM_DIR}}/venv/bin/python || { echo '[NG] venv/bin/python not executable after setup'; exit 1; }",
+        "test -x {{STREAM_DIR}}/venv/bin/uvicorn || { echo '[NG] venv/bin/uvicorn missing after pip install'; exit 1; }",
+        "chown -R {{STREAM_USER}}:{{STREAM_USER}} {{STREAM_DIR}}/venv",
         "echo '[OK] venv ready'"
       ]
     },
@@ -103,13 +108,17 @@
     },
     {
       "id": "50-enable-start",
-      "name": "daemon-reload + enable + start",
-      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "name": "daemon-reload + enable + start (stop then start, not restart)",
+      "description": "systemd を再読込してサービスを有効化・起動する。restart は unit file を変更した直後に古い unit で再起動するケースがあるので、必ず stop してから start する。最後に is-active で状態確認。",
       "commands": [
         "set -e",
         "systemctl daemon-reload",
         "systemctl enable voice-image-edit-stream.service",
-        "systemctl restart voice-image-edit-stream.service",
+        "systemctl stop voice-image-edit-stream.service 2>/dev/null || true",
+        "systemctl reset-failed voice-image-edit-stream.service 2>/dev/null || true",
+        "systemctl start voice-image-edit-stream.service",
+        "for i in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active voice-image-edit-stream.service >/dev/null 2>&1 && break; sleep 1; done",
+        "systemctl is-active voice-image-edit-stream.service >/dev/null 2>&1 || { echo '[NG] service did not become active'; systemctl status voice-image-edit-stream.service --no-pager | head -20; journalctl -u voice-image-edit-stream.service -n 30 --no-pager; exit 1; }",
         "echo '[OK] service started'"
       ]
     },

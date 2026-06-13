@@ -27,28 +27,30 @@
     {
       "id": "10-stop-service",
       "name": "Stop existing voice-image-edit-frontend service (if any)",
-      "description": "systemd unit があれば一旦止める。冪等性のため失敗しても続行。",
+      "description": "systemd unit があれば一旦止める。Re-deploy 時に古いプロセスがファイルを掴んでいると 20-deploy-tarball の rm -rf が部分失敗するため、必ず先に止める。冪等性のため失敗しても続行。",
       "commands": [
         "systemctl stop voice-image-edit-frontend.service 2>/dev/null || true",
-        "echo '[OK] stop attempted'"
+        "systemctl reset-failed voice-image-edit-frontend.service 2>/dev/null || true",
+        "for i in 1 2 3 4 5; do systemctl is-active voice-image-edit-frontend.service >/dev/null 2>&1 || break; sleep 1; done",
+        "echo '[OK] stopped'"
       ]
     },
     {
       "id": "20-deploy-tarball",
-      "name": "Download + extract Next.js standalone tarball",
-      "description": "presigned URL で tarball を取得し /opt/voice-image-edit/frontend に展開 (一旦旧版を消して clean install)。",
+      "name": "Download + extract Next.js standalone tarball (clean install)",
+      "description": "presigned URL で tarball を取得し {{FRONTEND_DIR}} に展開する。Frontend は venv を持たず Next.js standalone (server.js + node_modules + .next/) なので、tarball の中身全体を毎回入れ替える形で OK。展開後に server.js の存在を必ず検証して 40-enable-start が ExecStart で 203/EXEC を踏まないよう保証する。",
       "commands": [
         "set -e",
         "test -n '{{FRONTEND_TARBALL_URL}}' || { echo '[NG] FRONTEND_TARBALL_URL is empty'; exit 1; }",
-        "mkdir -p /opt/voice-image-edit",
-        "rm -rf {{FRONTEND_DIR}}",
         "mkdir -p {{FRONTEND_DIR}}",
+        "find {{FRONTEND_DIR}} -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
         "tmp=$(mktemp /tmp/voice-image-edit-frontend.XXXXXX.tar.gz)",
         "trap 'rm -f $tmp' EXIT",
         "curl -fsSL '{{FRONTEND_TARBALL_URL}}' -o $tmp",
         "tar -C {{FRONTEND_DIR}} -xzf $tmp",
-        "chown -R {{FRONTEND_USER}}:{{FRONTEND_USER}} {{FRONTEND_DIR}}",
         "test -f {{FRONTEND_DIR}}/server.js || { echo '[NG] server.js missing after extract'; exit 1; }",
+        "chown -R {{FRONTEND_USER}}:{{FRONTEND_USER}} {{FRONTEND_DIR}}",
+        "test -r {{FRONTEND_DIR}}/server.js || { echo '[NG] server.js not readable by root after chown'; exit 1; }",
         "echo '[OK] deployed'"
       ]
     },
@@ -86,13 +88,17 @@
     },
     {
       "id": "40-enable-start",
-      "name": "daemon-reload + enable + start",
-      "description": "systemd を再読込してサービスを有効化・起動する。",
+      "name": "daemon-reload + enable + start (stop then start, not restart)",
+      "description": "systemd を再読込してサービスを有効化・起動する。restart は unit file を変更した直後に古い unit で再起動するケースがあるので、必ず stop してから start する。最後に is-active で状態確認。",
       "commands": [
         "set -e",
         "systemctl daemon-reload",
         "systemctl enable voice-image-edit-frontend.service",
-        "systemctl restart voice-image-edit-frontend.service",
+        "systemctl stop voice-image-edit-frontend.service 2>/dev/null || true",
+        "systemctl reset-failed voice-image-edit-frontend.service 2>/dev/null || true",
+        "systemctl start voice-image-edit-frontend.service",
+        "for i in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active voice-image-edit-frontend.service >/dev/null 2>&1 && break; sleep 1; done",
+        "systemctl is-active voice-image-edit-frontend.service >/dev/null 2>&1 || { echo '[NG] service did not become active'; systemctl status voice-image-edit-frontend.service --no-pager | head -20; journalctl -u voice-image-edit-frontend.service -n 30 --no-pager; exit 1; }",
         "echo '[OK] service started'"
       ]
     },
