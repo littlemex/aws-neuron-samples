@@ -1,6 +1,6 @@
-# Qwen3-VL-8B-Thinking on Trainium2
+# Qwen3-VL-8B-Instruct on Trainium2
 
-Qwen3-VL-8B-Thinking を vLLM + NxD Inference で trn2.48xlarge 上で起動・テストするサンプル。
+Qwen3-VL-8B-Instruct を vLLM + NxD Inference で trn2.48xlarge 上で起動・テストするサンプル。
 他の 2 モデル (Qwen-Image-Edit / Whisper) とは独立して動作確認できます。
 
 ## 配置 (デフォルト)
@@ -12,7 +12,7 @@ Qwen3-VL-8B-Thinking を vLLM + NxD Inference で trn2.48xlarge 上で起動・�
 | Port | 8090 |
 | Endpoint | OpenAI 互換 (`/v1/chat/completions`) |
 | Venv | `/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16` |
-| Model dir | `/models/Qwen3-VL-8B-Thinking` (環境変数で上書き可) |
+| Model dir | `/models/Qwen3-VL-8B-Instruct` (環境変数で上書き可) |
 
 ## 単体起動
 

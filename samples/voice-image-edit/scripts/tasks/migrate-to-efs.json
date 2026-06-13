@@ -70,7 +70,7 @@
     {
       "id": "40-rsync-hf-cache",
       "name": "rsync HF cache -> EFS/models/hf-cache (~110GB)",
-      "description": "HF download (Qwen-Image-Edit-2511 + Qwen3-VL-8B-Thinking + tokenizers) の本体。 ~110GB なので ~15 min かかる。",
+      "description": "HF download (Qwen-Image-Edit-2511 + Qwen3-VL-8B-Instruct + tokenizers) の本体。 ~110GB なので ~15 min かかる。",
       "commands": [
         "set -e",
         "SRC=/opt/dlami/nvme/qwen_image_edit_hf_cache_dir",

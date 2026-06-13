@@ -17,7 +17,7 @@ cd samples/voice-image-edit/scripts
 EC2 (trn2.48xlarge)
 ├── /models                       -> EFS/neuron-workspace/models
 │   ├── whisper-large-v3-neuron/      (~1 GB, encoder/decoder/proj.pt)
-│   ├── Qwen3-VL-8B-Thinking/         (~16 GB, vLLM warmup artifact)
+│   ├── Qwen3-VL-8B-Instruct/         (~16 GB, vLLM warmup artifact)
 │   ├── hf-cache/                     (~110 GB, HF download)
 │   └── qwen-image-edit-compiled/     (alias for /mnt/local/compiled_models)
 ├── /opt/voice-image-edit         -> EFS/neuron-workspace/voice-image-edit

@@ -1,13 +1,13 @@
 {
-  "name": "Qwen3-VL-8B-Thinking vLLM Neuron server (OpenAI compatible) on EC2",
-  "description": "samples/models/qwen3-vl/start.sh を systemd で常駐起動する。事前に qwen3-vl-prepare.json で warm-up が完了 (= /models/Qwen3-VL-8B-Thinking/.neuron_warmup_done が存在) している必要がある。 NeuronCore 16-31 (TP=16) を専有し、 port {{PORT}} で OpenAI 互換 API (/v1/chat/completions, /health) を提供する。 start.sh は presigned URL 経由で配布。 Qwen-Image-Edit が cores 32-63 (TP=16 DP=2) を使う配分のため Qwen3-VL は 16-31 に配置。",
+  "name": "Qwen3-VL-8B-Instruct vLLM Neuron server (OpenAI compatible) on EC2",
+  "description": "samples/models/qwen3-vl/start.sh を systemd で常駐起動する。事前に qwen3-vl-prepare.json で warm-up が完了 (= /models/Qwen3-VL-8B-Instruct/.neuron_warmup_done が存在) している必要がある。 NeuronCore 16-31 (TP=16) を専有し、 port {{PORT}} で OpenAI 互換 API (/v1/chat/completions, /health) を提供する。 start.sh は presigned URL 経由で配布。 Qwen-Image-Edit が cores 32-63 (TP=16 DP=2) を使う配分のため Qwen3-VL は 16-31 に配置。",
   "variables": {
     "SERVER_TARBALL_URL": "",
     "SERVE_DIR": "/opt/voice-image-edit/qwen3-vl-server",
     "SERVE_USER": "ubuntu",
     "PORT": "8090",
-    "MODEL_ID": "Qwen/Qwen3-VL-8B-Thinking",
-    "MODEL_DIR": "/models/Qwen3-VL-8B-Thinking",
+    "MODEL_ID": "Qwen/Qwen3-VL-8B-Instruct",
+    "MODEL_DIR": "/models/Qwen3-VL-8B-Instruct",
     "NEURON_CORES": "16-31",
     "VENV": "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16"
   },
@@ -62,7 +62,7 @@
         "set -e",
         "cat > /etc/systemd/system/qwen3-vl.service <<'EOF'",
         "[Unit]",
-        "Description=Qwen3-VL-8B-Thinking vLLM Neuron server (OpenAI compatible)",
+        "Description=Qwen3-VL-8B-Instruct vLLM Neuron server (OpenAI compatible)",
         "After=network-online.target",
         "Wants=network-online.target",
         "",

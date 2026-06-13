@@ -5,7 +5,7 @@ trn2.48xlarge 上で起動・テストできる単体モデルサンプルを集
 
 | モデル | TP | NeuronCore | Port | ディレクトリ |
 |---|---|---|---|---|
-| Qwen3-VL-8B-Thinking | 16 | 0-15 | 8090 | `qwen3-vl/` |
+| Qwen3-VL-8B-Instruct | 16 | 0-15 | 8090 | `qwen3-vl/` |
 | Qwen-Image-Edit | 8 | 16-23 | 8081 | `qwen-image-edit/` |
 | Whisper-large-v3 | 1 | 48 | 8765 | `whisper/` |
 

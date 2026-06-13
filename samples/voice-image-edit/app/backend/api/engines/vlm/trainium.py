@@ -11,7 +11,7 @@
 
 環境変数 (ハードコード禁止):
   - TRAINIUM_VLM_URL  (例: http://internal-...:8090/v1/chat/completions)
-  - TRAINIUM_VLM_MODEL_ID (default: Qwen/Qwen3-VL-8B-Thinking)
+  - TRAINIUM_VLM_MODEL_ID (default: Qwen/Qwen3-VL-8B-Instruct)
   - TRAINIUM_VLM_TIMEOUT_SECONDS (default: 300)
   - TRAINIUM_VLM_API_KEY (任意。Bearer ヘッダで送る)
   - TRAINIUM_VLM_STRIP_THINKING (default: "1"。"0" で無効化)
@@ -52,7 +52,7 @@ class TrainiumVlmEngine(VlmEngine):
     def __init__(self) -> None:
         self.endpoint = env_required("TRAINIUM_VLM_URL")
         self.model_id = os.environ.get(
-            "TRAINIUM_VLM_MODEL_ID", "Qwen/Qwen3-VL-8B-Thinking"
+            "TRAINIUM_VLM_MODEL_ID", "Qwen/Qwen3-VL-8B-Instruct"
         )
         self.timeout = env_float("TRAINIUM_VLM_TIMEOUT_SECONDS", 300.0)
         self.api_key = os.environ.get("TRAINIUM_VLM_API_KEY")
@@ -134,7 +134,10 @@ class TrainiumVlmEngine(VlmEngine):
         # (the Neuron build of vLLM does not split reasoning_content even
         # when --reasoning-parser qwen3 is set). Other modes pass language=None
         # so the filter is a no-op and instruction / translate keep all text.
-        filter_lang = req.language if req.mode == "review" else None
+        # If the caller (frontend) did not send a language we default to the
+        # product spec language (Japanese) for review so the filter still
+        # runs and reasoning never reaches the UI.
+        filter_lang = (req.language or "ja") if req.mode == "review" else None
         text, was_stripped = (
             strip_thinking(raw_text, language=filter_lang)
             if self.strip_thinking

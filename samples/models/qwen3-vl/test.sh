@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3-VL-8B-Thinking 動作確認 (日本語応答 + 画像理解)
+# Qwen3-VL-8B-Instruct 動作確認 (日本語応答 + 画像理解)
 # - 1) 日本語チャット: 「自己紹介してください」→ 日本語文字を含むかを判定
 # - 2) 画像理解 + 日本語: ローカル合成した PNG (赤背景に黄色い円) を data:image/png;base64,... で渡す
 #
@@ -8,7 +8,7 @@
 set -uo pipefail
 
 PORT="${PORT:-8090}"
-MODEL="${MODEL:-/models/Qwen3-VL-8B-Thinking}"
+MODEL="${MODEL:-/models/Qwen3-VL-8B-Instruct}"
 TIMEOUT="${TIMEOUT:-300}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

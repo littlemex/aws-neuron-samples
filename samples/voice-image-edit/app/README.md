@@ -58,7 +58,7 @@ inline base64 で返さない理由は、SSE 経路の payload 肥大と CloudFr
 | スロット | Bedrock 系 | 自前サービング系 |
 |---|---|---|
 | **ASR** | Amazon Transcribe Streaming, Bedrock Nova Sonic | Whisper-large-v3 (Neuron) |
-| **VLM** | Claude Sonnet, Nova Pro, Nova Lite | Qwen3-VL-8B-Thinking (Neuron) |
+| **VLM** | Claude Sonnet, Nova Pro, Nova Lite | Qwen3-VL-8B-Instruct (Neuron) |
 | **EDIT** | Amazon Nova Canvas, Dummy (UI 配線確認) | Qwen-Image-Edit (Neuron) |
 
 Bedrock 系は **特定モデルに依存しない** ように設計する。同じスロット内で複数モデルを `engines/<slot>/__init__.py` に登録しておき、`/manage` ページから選び替えるだけで切り替わる。
