@@ -4,6 +4,13 @@ Centralising defaults here removes the bedrock vs trainium fork — both
 engines wrap the same prompt strings, so a wording change lives in one
 place. Each constant can still be overridden at runtime via the matching
 ``VLM_*_PROMPT_OVERRIDE`` environment variable on the engine side.
+
+Review prompts are language-aware: ``build_review_prompt(language)``
+returns the prompt for the requested output language. The output is fed
+straight into the TTS pipeline (XTTSv2 / Polly), so each language variant
+forbids tokens that would derail the synthesizer (parenthesised English
+inside Japanese output, romaji, emoji, URLs, code fragments). New
+languages can be added by extending ``REVIEW_PROMPTS``.
 """
 from __future__ import annotations
 
@@ -18,24 +25,51 @@ DEFAULT_INSTRUCTION_PROMPT = (
     " can act without ambiguity. Do not invent edits the user did not request."
 )
 
-# review: AFTER image + user's edit instruction -> short review comment.
-# Hard requirement (per product spec): the response MUST be written in
-# Japanese, regardless of the input language. The model is also instructed
-# to keep the response to three lines and to skip pleasantries / preambles.
-# The output is fed straight into the TTS pipeline (XTTSv2 / Polly), so any
-# English token, romaji, parenthesised English, code points or emoji breaks
-# the synthesizer. The prompt therefore forbids every non-Japanese token
-# explicitly and asks for plain prose only.
-DEFAULT_REVIEW_PROMPT = (
-    "あなたは画像編集の品質をレビューするアシスタントです。"
-    "編集指示と編集後画像を見て、必ず日本語のみで簡潔な散文として三行以内でまとめてください。"
-    "一行目は指示の反映度合い、二行目は違和感や破綻の有無、三行目は改善案を述べてください。"
-    "応答は読み上げに使われるため、絶対に守るべきルールがあります。"
-    "英単語、英文字、ローマ字、英訳の併記、括弧書き、箇条書きの記号、絵文字、URL、ファイル名、コード片を一切含めないでください。"
-    "数字も日本語の数詞ではなく算用数字をそのまま使い、不要な記号は付けないでください。"
-    "前置きや謝辞、ですます調以外の文体への切替は不要です。"
-    "入力がどの言語であっても応答は必ず日本語のみで出力してください。"
-)
+# review: AFTER image + user's edit instruction -> exactly one short sentence.
+# The structure is fixed across languages so the downstream TTS sees prose
+# that fits inside its character / token budget. Each variant explicitly
+# bans the token classes that break read-aloud (parenthesised translations,
+# emoji, code, URLs).
+REVIEW_PROMPTS: dict[str, str] = {
+    "ja": (
+        "あなたは画像編集の品質をレビューするアシスタントです。"
+        "編集指示と編集後画像を見て、必ず日本語の散文で一文だけ、八十文字以内で簡潔に評価してください。"
+        "前置き、謝辞、思考過程、複数文の併記、改行、箇条書き、引用符、括弧書きは禁止です。"
+        "英単語、ローマ字、英訳の併記、絵文字、URL、ファイル名、コード片、エスケープされたユニコードは一切含めないでください。"
+        "数字は算用数字、文末は句点で終えてください。"
+        "入力がどの言語でも応答は必ず日本語のみで出力してください。"
+    ),
+    "en": (
+        "You are an assistant that reviews image editing quality."
+        " Output exactly one concise English sentence (no more than 30 words) describing how well the edit reflects the instruction."
+        " Forbidden: prefaces, multiple sentences, line breaks, bullet points, quotes, parenthesised translations,"
+        " non-English words, emoji, URLs, filenames, code fragments, escaped unicode."
+        " Use plain prose only. End the sentence with a period."
+        " Always respond in English regardless of input language."
+    ),
+}
+
+DEFAULT_REVIEW_LANGUAGE = "ja"
+
+
+def build_review_prompt(language: str | None) -> str:
+    """Return the review system prompt for the requested language.
+
+    Falls back to the Japanese prompt when ``language`` is unknown so
+    legacy callers (no ``language`` field) keep working.
+    """
+    key = (language or DEFAULT_REVIEW_LANGUAGE).strip().lower()
+    # Accept BCP-47 forms like "ja-JP" / "en-US" by collapsing to base.
+    if "-" in key:
+        key = key.split("-", 1)[0]
+    if "_" in key:
+        key = key.split("_", 1)[0]
+    return REVIEW_PROMPTS.get(key, REVIEW_PROMPTS[DEFAULT_REVIEW_LANGUAGE])
+
+
+# Backwards-compat alias: existing imports still work, defaulting to Japanese.
+DEFAULT_REVIEW_PROMPT = REVIEW_PROMPTS[DEFAULT_REVIEW_LANGUAGE]
+
 
 # translate: free text (no image) -> concise English image-gen prompt.
 # Used by the GENERATE pipeline so non-English voice prompts pass through

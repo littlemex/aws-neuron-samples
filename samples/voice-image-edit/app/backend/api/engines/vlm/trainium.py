@@ -29,13 +29,14 @@ from contracts import EngineError, VlmRequest, VlmResponse
 from engines.vlm.base import VlmEngine
 from engines.vlm._prompts import (
     DEFAULT_INSTRUCTION_PROMPT,
-    DEFAULT_REVIEW_PROMPT,
     DEFAULT_TRANSLATE_PROMPT,
+    build_review_prompt,
 )
 from engines._common import (
     build_metadata,
     decode_image_b64,
     env_float,
+    env_int,
     env_required,
     guess_image_mime,
     raise_for_status,
@@ -63,7 +64,7 @@ class TrainiumVlmEngine(VlmEngine):
 
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
-        system_prompt = _resolve_system_prompt(req.mode)
+        system_prompt = _resolve_system_prompt(req.mode, req.language)
 
         # Build user content: image+text for instruction/review, text-only
         # for translate. The OpenAI Chat schema accepts either a string or
@@ -81,14 +82,31 @@ class TrainiumVlmEngine(VlmEngine):
                 {"type": "text", "text": req.prompt},
             ]
 
-        body = {
+        # Qwen3-VL-Thinking emits long English reasoning inside
+        # <think>...</think>. With the stock max_tokens=512 the closing tag
+        # never landed before truncation, so strip_thinking returned the
+        # raw English reasoning as the answer. We disable thinking via
+        # vLLM's ``chat_template_kwargs.enable_thinking=False`` and keep a
+        # generous output budget for review (still small for a sentence).
+        # Other modes (instruction / translate) keep the legacy budget.
+        is_review = req.mode == "review"
+        max_tokens = env_int(
+            "TRAINIUM_VLM_REVIEW_MAX_TOKENS" if is_review else "TRAINIUM_VLM_MAX_TOKENS",
+            256 if is_review else 1024,
+        )
+        body: dict[str, Any] = {
             "model": self.model_id,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
             ],
-            "temperature": 0.2,
-            "max_tokens": 512,
+            "temperature": 0.1 if is_review else 0.2,
+            "top_p": 0.9,
+            "max_tokens": max_tokens,
+            # Disable Qwen3 thinking so the worker spends its budget on
+            # the answer, not on English chain-of-thought. vLLM forwards
+            # this to the chat template (Qwen3 official param).
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -155,9 +173,12 @@ class TrainiumVlmEngine(VlmEngine):
         )
 
 
-def _resolve_system_prompt(mode: str) -> str:
+def _resolve_system_prompt(mode: str, language: str | None = None) -> str:
     if mode == "review":
-        return os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE") or DEFAULT_REVIEW_PROMPT
+        return (
+            os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE")
+            or build_review_prompt(language)
+        )
     if mode == "translate":
         return os.environ.get("VLM_TRANSLATE_PROMPT_OVERRIDE") or DEFAULT_TRANSLATE_PROMPT
     return os.environ.get("VLM_INSTRUCTION_PROMPT_OVERRIDE") or DEFAULT_INSTRUCTION_PROMPT

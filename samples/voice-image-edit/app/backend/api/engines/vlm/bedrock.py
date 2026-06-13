@@ -30,12 +30,13 @@ from contracts import EngineError, VlmRequest, VlmResponse
 from engines.vlm.base import VlmEngine
 from engines.vlm._prompts import (
     DEFAULT_INSTRUCTION_PROMPT,
-    DEFAULT_REVIEW_PROMPT,
     DEFAULT_TRANSLATE_PROMPT,
+    build_review_prompt,
 )
 from engines._common import (
     build_metadata,
     decode_image_b64,
+    env_int,
     env_required,
     guess_image_format,
 )
@@ -68,7 +69,7 @@ class BedrockVlmEngine(VlmEngine):
 
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
-        system_prompt = _resolve_system_prompt(req.mode)
+        system_prompt = _resolve_system_prompt(req.mode, req.language)
         # mode="translate" is text-only and intentionally skips the image
         # input. Other modes (instruction / review) require the BEFORE/AFTER
         # image like before.
@@ -88,12 +89,26 @@ class BedrockVlmEngine(VlmEngine):
                 {"text": req.prompt},
             ]
 
+        # review mode wants a single short sentence in the requested language.
+        # other modes keep the legacy budget so existing edit / translate
+        # quality is unchanged. Both are env-overridable for ad-hoc tuning.
+        is_review = req.mode == "review"
+        max_tokens = env_int(
+            "BEDROCK_VLM_REVIEW_MAX_TOKENS" if is_review else "BEDROCK_VLM_MAX_TOKENS",
+            120 if is_review else 512,
+        )
+        inference_config: dict[str, Any] = {
+            "maxTokens": max_tokens,
+            "temperature": 0.1 if is_review else 0.2,
+            "topP": 0.9,
+        }
+
         try:
             resp = self._client.converse(
                 modelId=self.model_id,
                 system=[{"text": system_prompt}],
                 messages=[{"role": "user", "content": user_content}],
-                inferenceConfig={"maxTokens": 512, "temperature": 0.2},
+                inferenceConfig=inference_config,
             )
         except (ClientError, BotoCoreError) as exc:
             raise EngineError(
@@ -129,9 +144,15 @@ class BedrockVlmEngine(VlmEngine):
         )
 
 
-def _resolve_system_prompt(mode: str) -> str:
+def _resolve_system_prompt(mode: str, language: str | None = None) -> str:
     if mode == "review":
-        return os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE") or DEFAULT_REVIEW_PROMPT
+        # Override (set per-deploy) wins; otherwise pick the language-specific
+        # prompt. Other modes (instruction / translate) are language-fixed by
+        # contract so no per-call language switch is needed.
+        return (
+            os.environ.get("VLM_REVIEW_PROMPT_OVERRIDE")
+            or build_review_prompt(language)
+        )
     if mode == "translate":
         return os.environ.get("VLM_TRANSLATE_PROMPT_OVERRIDE") or DEFAULT_TRANSLATE_PROMPT
     return (
