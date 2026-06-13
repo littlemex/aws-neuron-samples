@@ -15,6 +15,7 @@
 #   qwen3-vl-server     systemd unit install + start (port 8090)
 #   qwen-image-edit-server systemd unit install + start (port 8081)
 #   voice-image-edit-app  ApiStack/FrontendStack/StreamStack に TRAINIUM_*_URL を inject
+#   neuron-anatomy        sibling stack: ALB rule /neuron/* + backend on EC2 を再 wire
 #
 # 使い方:
 #   bash deploy-all.sh \
@@ -72,6 +73,13 @@ MIGRATE=false
 DRY_RUN=false
 
 # Step granularity: --skip prepare で 3 prepare 全部 skip / --skip setup-efs-paths で 1 step skip
+#
+# neuron-anatomy is a sibling stack that pins an ALB target group to the
+# voice-image-edit EC2 by private IP. Every recover gives the EC2 a new
+# private IP, so the anatomy target group goes unhealthy unless we also
+# re-run the anatomy deploy (CDK update + backend tarball redeploy). This
+# step is intentionally last so the ALB / app stacks have already settled
+# by the time anatomy updates the listener rule and target group.
 ALL_STEPS=(
   precheck
   setup-efs-paths
@@ -85,6 +93,7 @@ ALL_STEPS=(
   qwen-image-edit-server
   xttsv2-server
   voice-image-edit-app
+  neuron-anatomy
 )
 
 while [[ $# -gt 0 ]]; do
@@ -409,6 +418,30 @@ step_voice_image_edit_app() {
     --trainium-tts-url "$tts_url" )
 }
 
+# --- step: neuron-anatomy (sibling stack, must follow EC2 recover) ---
+# Re-runs the anatomy backend tarball deploy + CDK update so the
+# NeuronAnatomyStack target group gets re-pointed at the current EC2's
+# private IP. Without this step the anatomy ALB rule keeps the previous
+# host's IP (which gets a new value on every recover) and /neuron/* goes
+# 502 in the UI. We pass --only backend,infra to skip the optional
+# integrate step (the frontend already has the NeuronDrawer mount).
+step_neuron_anatomy() {
+  section "neuron-anatomy"
+  local anatomy_deploy="$REPO_ROOT/samples/neuron-anatomy/scripts/deploy.sh"
+  if [[ ! -x "$anatomy_deploy" ]]; then
+    warn "skip: $anatomy_deploy not found or not executable"
+    return 0
+  fi
+  if [[ "$DRY_RUN" == true ]]; then
+    log "[dry] $anatomy_deploy --base-stack-name $BASE_STACK_NAME --region $REGION --only backend,infra"
+    return 0
+  fi
+  bash "$anatomy_deploy" \
+    --base-stack-name "$BASE_STACK_NAME" \
+    --region "$REGION" \
+    --only backend,infra
+}
+
 # --- helper: stage a single file or directory tar to the stage S3 bucket ---
 # 出力: presigned URL (24h)
 STAGE_BUCKET=""
@@ -497,6 +530,7 @@ for step in "${ALL_STEPS[@]}"; do
     qwen-image-edit-server)  step_qie_server ;;
     xttsv2-server)           step_xttsv2_server ;;
     voice-image-edit-app)    step_voice_image_edit_app ;;
+    neuron-anatomy)          step_neuron_anatomy ;;
     *) err "unknown step: $step"; exit 1 ;;
   esac
 done
