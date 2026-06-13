@@ -95,6 +95,10 @@ NC='\033[0m'
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 BASE_STACK_NAME="neuron-code-server"
 BEDROCK_REGION="us-east-1"
+# Stability AI の text-to-image foundation models (`stability.stable-image-*`)
+# は us-west-2 のみで提供されているため、generate スロットだけ別リージョンを
+# 使う。IAM resource ARN と systemd Environment の両方に流す。
+GENERATE_BEDROCK_REGION="us-west-2"
 PATH_PATTERN="/api/edit/*"
 RULE_PRIORITY="100"
 API_PORT="8801"
@@ -147,6 +151,7 @@ while [[ $# -gt 0 ]]; do
         --base-stack-name)              BASE_STACK_NAME="$2"; shift 2 ;;
         -r|--region)                    REGION="$2"; shift 2 ;;
         --bedrock-region)               BEDROCK_REGION="$2"; shift 2 ;;
+        --generate-bedrock-region)      GENERATE_BEDROCK_REGION="$2"; shift 2 ;;
         --path-pattern)                 PATH_PATTERN="$2"; shift 2 ;;
         --rule-priority)                RULE_PRIORITY="$2"; shift 2 ;;
         --api-port)                     API_PORT="$2"; shift 2 ;;
@@ -507,6 +512,7 @@ echo "  AlbSecurityGroupId         : $ALB_SG_ID"
 echo "  OriginVerifySecretArn      : $ORIGIN_VERIFY_SECRET_ARN"
 echo "  OriginVerifyHeader         : $ORIGIN_VERIFY_HEADER"
 echo "  BedrockRegion              : $BEDROCK_REGION"
+echo "  GenerateBedrockRegion      : $GENERATE_BEDROCK_REGION"
 echo
 if [[ "$NEEDS_EC2" == "true" ]]; then
     echo "  Ec2 InstanceId             : $EC2_INSTANCE_ID"
@@ -579,6 +585,7 @@ CDK_CTX=(
     "-c" "originVerifyHeaderName=$ORIGIN_VERIFY_HEADER"
     "-c" "originVerifySecretArn=$ORIGIN_VERIFY_SECRET_ARN"
     "-c" "bedrockRegion=$BEDROCK_REGION"
+    "-c" "generateBedrockRegion=$GENERATE_BEDROCK_REGION"
 )
 
 STACKS_TO_DEPLOY=()
@@ -804,6 +811,7 @@ deploy_api_service() {
         --arg api_tarball "$presigned" \
         --arg api_port "$API_PORT" \
         --arg bedrock_region "$BEDROCK_REGION" \
+        --arg generate_bedrock_region "$GENERATE_BEDROCK_REGION" \
         --arg edit_bucket "$API_RESULT_BUCKET" \
         --arg edit_region "$REGION" \
         --arg asr "$ASR_ENGINE_DEFAULT" \
@@ -822,6 +830,7 @@ deploy_api_service() {
           API_TARBALL_URL: $api_tarball,
           API_PORT: $api_port,
           BEDROCK_REGION: $bedrock_region,
+          GENERATE_BEDROCK_REGION: $generate_bedrock_region,
           EDIT_RESULT_BUCKET: $edit_bucket,
           EDIT_RESULT_REGION: $edit_region,
           ASR_ENGINE_DEFAULT: $asr,

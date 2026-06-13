@@ -41,6 +41,7 @@ import { Construct } from 'constructs';
  *   - apiPort                      : default = 8801
  *   - apiPathPattern               : default = /api/edit/*
  *   - apiRulePriority              : default = 100
+ *   - generateBedrockRegion        : default = us-west-2 (Stability AI モデルの home region)
  */
 export interface ApiStackProps extends cdk.StackProps {}
 
@@ -73,6 +74,16 @@ export class ApiStack extends cdk.Stack {
     const apiPort = Number(ctx('apiPort') ?? '8801');
     const apiPathPattern = ctx('apiPathPattern') ?? '/api/edit/*';
     const apiRulePriority = Number(ctx('apiRulePriority') ?? '100');
+
+    // Stability AI image-generation models (`stability.stable-image-*`) only
+    // live in us-west-2. The default `bedrockRegion` (e.g. us-east-1) does
+    // not host them, so the GENERATE slot needs a separate region in both
+    // the IAM resource ARN and the runtime env. Configurable but defaults to
+    // us-west-2 so the demo works out of the box.
+    const generateBedrockRegion = ctx('generateBedrockRegion') ?? 'us-west-2';
+    const bedrockResourceRegions = Array.from(
+      new Set([bedrockRegion, generateBedrockRegion]),
+    );
 
     const vpc = ec2.Vpc.fromLookup(this, 'BaseVpc', { vpcId: apiVpcId });
 
@@ -116,7 +127,11 @@ export class ApiStack extends cdk.Stack {
           'bedrock:ConverseStream',
           'bedrock:InvokeModelWithResponseStream',
         ],
-        resources: [`arn:aws:bedrock:${bedrockRegion}::foundation-model/*`],
+        // Allow every region the API needs: bedrockRegion (Claude / Nova) +
+        // generateBedrockRegion (Stability image generation in us-west-2).
+        resources: bedrockResourceRegions.map(
+          (r) => `arn:aws:bedrock:${r}::foundation-model/*`,
+        ),
       }),
     );
     apiInstanceRole.addToPrincipalPolicy(
