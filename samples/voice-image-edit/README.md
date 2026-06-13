@@ -6,7 +6,7 @@
 | スロット | 役割 | Bedrock 実装 | 自前サービング実装 |
 |---|---|---|---|
 | **ASR** | 音声 → テキスト指示 | Amazon Transcribe Streaming, Bedrock Nova Sonic | Whisper-large-v3 (Neuron) |
-| **VLM** | 指示 + 画像 → 編集プロンプト / after 画像レビュー | Claude Sonnet, Nova Pro, Nova Lite | Qwen3-VL-8B-Thinking (Neuron) |
+| **VLM** | 指示 + 画像 → 編集プロンプト / after 画像レビュー | Claude Sonnet, Nova Pro, Nova Lite | Qwen3-VL-8B-Instruct (Neuron) |
 | **EDIT** | 画像 + プロンプト → 編集後画像 | Amazon Nova Canvas, Dummy (UI 配線確認) | Qwen-Image-Edit (Neuron) |
 
 UI の `/manage` ページで **スロット ✕ 実装** を選び、`/edit` ページで音声指示 → 画像編集を実行します。

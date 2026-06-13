@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3-VL-8B-Thinking 個別起動 (vLLM + Neuron)。
+# Qwen3-VL-8B-Instruct 個別起動 (vLLM + Neuron)。
 # Default core window = 32-47 on trn2.48xlarge (TP=16 LNC=2). voice-image-edit
 # 3-model layout: Qwen-Image-Edit=32-63, Qwen3-VL=16-31, Whisper=8-15, xttsv2=0-3.
 # trn2.3xlarge / trn2.8xlarge では --cores で上書きすること。
@@ -7,7 +7,7 @@
 set -euo pipefail
 
 PORT="${PORT:-8090}"
-MODEL_DIR="${MODEL_DIR:-/models/Qwen3-VL-8B-Thinking}"
+MODEL_DIR="${MODEL_DIR:-/models/Qwen3-VL-8B-Instruct}"
 VENV="${VENV:-/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16}"
 NEURON_CORES="${NEURON_CORES:-16-31}"
 
@@ -93,11 +93,19 @@ echo "[qwen3] launching vLLM on :${PORT} (TP=${TP}, cores=${NEURON_CORES}) (log 
 # stay in the foreground so systemd tracks the actual vllm process. We keep the
 # log file as a tee target for ad-hoc debugging.
 # vLLM が ``--model=`` に渡されたパス文字列をそのまま served-model-name として
-# 公開してしまうため (例: ``/models/Qwen3-VL-8B-Thinking``)、下流クライアント
+# 公開してしまうため (例: ``/models/Qwen3-VL-8B-Instruct``)、下流クライアント
 # (voice-image-edit-api の TrainiumVlmEngine 等) が HF 形式の id
-# ``Qwen/Qwen3-VL-8B-Thinking`` で問い合わせると 404 NotFoundError になる。
+# ``Qwen/Qwen3-VL-8B-Instruct`` で問い合わせると 404 NotFoundError になる。
 # served-model-name を明示してパス依存を切る。
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3-VL-8B-Thinking}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3-VL-8B-Instruct}"
+
+# Qwen3-VL-Thinking emits its chain-of-thought inside <think>...</think>.
+# Without --reasoning-parser the closing tag is forwarded as plain content,
+# so the API client receives the full English/Chinese reasoning instead of
+# the answer. Telling vLLM which parser to use moves the reasoning into a
+# separate `reasoning_content` field and lets `chat_template_kwargs.
+# enable_thinking=False` actually short-circuit the thinking phase.
+REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 
 if [[ -t 1 ]]; then
   # Interactive shell: keep legacy nohup behaviour for manual launches.
@@ -109,6 +117,7 @@ if [[ -t 1 ]]; then
     --additional-config="${ADDITIONAL_CONFIG}" \
     --limit-mm-per-prompt="${LIMIT_MM}" \
     --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --reasoning-parser="${REASONING_PARSER}" \
     --host=0.0.0.0 --port="${PORT}" \
     >>"${LOG}" 2>&1 &
   echo $! > "${PIDFILE}"
@@ -124,5 +133,6 @@ else
     --additional-config="${ADDITIONAL_CONFIG}" \
     --limit-mm-per-prompt="${LIMIT_MM}" \
     --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --reasoning-parser="${REASONING_PARSER}" \
     --host=0.0.0.0 --port="${PORT}"
 fi

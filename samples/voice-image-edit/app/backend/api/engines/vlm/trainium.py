@@ -11,7 +11,7 @@
 
 環境変数 (ハードコード禁止):
   - TRAINIUM_VLM_URL  (例: http://internal-...:8090/v1/chat/completions)
-  - TRAINIUM_VLM_MODEL_ID (default: Qwen/Qwen3-VL-8B-Thinking)
+  - TRAINIUM_VLM_MODEL_ID (default: Qwen/Qwen3-VL-8B-Instruct)
   - TRAINIUM_VLM_TIMEOUT_SECONDS (default: 300)
   - TRAINIUM_VLM_API_KEY (任意。Bearer ヘッダで送る)
   - TRAINIUM_VLM_STRIP_THINKING (default: "1"。"0" で無効化)
@@ -52,7 +52,7 @@ class TrainiumVlmEngine(VlmEngine):
     def __init__(self) -> None:
         self.endpoint = env_required("TRAINIUM_VLM_URL")
         self.model_id = os.environ.get(
-            "TRAINIUM_VLM_MODEL_ID", "Qwen/Qwen3-VL-8B-Thinking"
+            "TRAINIUM_VLM_MODEL_ID", "Qwen/Qwen3-VL-8B-Instruct"
         )
         self.timeout = env_float("TRAINIUM_VLM_TIMEOUT_SECONDS", 300.0)
         self.api_key = os.environ.get("TRAINIUM_VLM_API_KEY")
@@ -128,9 +128,32 @@ class TrainiumVlmEngine(VlmEngine):
                 provider_detail={"keys": list(payload.keys())},
             )
 
+        # ``language`` flows through into the language-aware filter inside
+        # strip_thinking. For review mode this strips out Qwen3 thinking
+        # written in English or Chinese without relying on <think> tags
+        # (the Neuron build of vLLM does not split reasoning_content even
+        # when --reasoning-parser qwen3 is set). Other modes pass language=None
+        # so the filter is a no-op and instruction / translate keep all text.
+        # If the caller (frontend) did not send a language we default to the
+        # product spec language (Japanese) for review so the filter still
+        # runs and reasoning never reaches the UI.
+        filter_lang = (req.language or "ja") if req.mode == "review" else None
         text, was_stripped = (
-            strip_thinking(raw_text) if self.strip_thinking else (raw_text, False)
+            strip_thinking(raw_text, language=filter_lang)
+            if self.strip_thinking
+            else (raw_text, False)
         )
+        if not text and self.strip_thinking:
+            # The thinking filter consumed everything, which means the
+            # model never produced an answer in the requested language
+            # (typical when the budget was eaten by reasoning). Surface
+            # a retryable error rather than returning the reasoning blob.
+            raise EngineError(
+                "provider_invalid_response",
+                "trainium vlm returned only reasoning content; no answer in requested language",
+                retryable=True,
+                provider_detail={"raw_excerpt": raw_text[:300], "language": filter_lang},
+            )
 
         usage = payload.get("usage") or {}
         extra = {
