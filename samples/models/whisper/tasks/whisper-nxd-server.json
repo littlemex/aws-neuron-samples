@@ -1,6 +1,6 @@
 {
   "name": "Whisper NxD Inference server (HTTP /transcribe) on EC2",
-  "description": "samples/models/whisper/whisper_server_nxd.py を systemd で常駐起動する。 whisper-nxd-precompile タスクで生成した {{MODEL_DIR}}/{encoder,decoder}/ を使う (compile はしない)。 port {{PORT}} で listen し、HTTP POST /transcribe (voice-image-edit ASR contract) を提供する。 server スクリプトは presigned URL で取得。 NEURON_RT_VISIBLE_CORES=48-55 (8 cores, TP=8 LNC=1)。 Qwen-Image-Edit (cores 0-31) と Qwen3-VL (cores 32-47) との衝突回避でこの window を確保。 注意: cores 48-55 は trn2.48xlarge (16 chips, 64 logical cores) 前提のレイアウト。 trn2.3xlarge / trn2.8xlarge では物理的に存在しないので NEURON_CORES を上書きすること。",
+  "description": "samples/models/whisper/whisper_server_nxd.py を systemd で常駐起動する。 whisper-nxd-precompile タスクで生成した {{MODEL_DIR}}/{encoder,decoder}/ を使う (compile はしない)。 port {{PORT}} で listen し、HTTP POST /transcribe (voice-image-edit ASR contract) を提供する。 server スクリプトは presigned URL で取得。 NEURON_RT_VISIBLE_CORES=8-15 (8 cores, TP=8 LNC=1)。 Qwen-Image-Edit (cores 32-63) と Qwen3-VL (cores 16-31) との衝突回避でこの window を確保。 注意: cores 8-15 は trn2.48xlarge (16 chips, 64 logical cores) 前提のレイアウト。 trn2.3xlarge / trn2.8xlarge では物理的に存在しないので NEURON_CORES を上書きすること。",
   "variables": {
     "SERVER_TARBALL_URL": "",
     "SERVE_DIR": "/opt/voice-image-edit/whisper-nxd-server",
@@ -10,7 +10,7 @@
     "MODEL_DIR": "/models/whisper-large-v3-neuron-nxd",
     "HF_HOME": "/models/hf-cache",
     "WHISPER_LANGUAGE": "ja",
-    "NEURON_CORES": "48-55",
+    "NEURON_CORES": "8-15",
     "NEURON_RT_NUM_CORES": "8",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference"
   },

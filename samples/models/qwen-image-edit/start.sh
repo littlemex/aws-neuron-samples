@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Qwen-Image-Edit 個別起動 (vLLM/Neuron diffusers).
 # Default core window = 0-31 on trn2.48xlarge (TP=16 + CFG-DP=2 -> world_size=32, LNC=2).
-# voice-image-edit 3-model layout: Qwen-Image-Edit=0-31, Qwen3-VL=32-47, Whisper=48-55.
+# voice-image-edit 3-model layout: Qwen-Image-Edit=32-63, Qwen3-VL=16-31, Whisper=8-15, xttsv2=0-3.
 # trn2.3xlarge / trn2.8xlarge では --cores と --world-size を上書きすること。
 # 既に同ポートで起動中の場合はスキップ。
 set -euo pipefail
@@ -12,7 +12,7 @@ COMPILED_DIR="${COMPILED_DIR:-/opt/dlami/nvme/compiled_models_tp16}"
 HEIGHT="${HEIGHT:-1024}"
 WIDTH="${WIDTH:-1024}"
 PATCH_MULT="${PATCH_MULT:-3}"
-NEURON_CORES="${NEURON_CORES:-0-31}"
+NEURON_CORES="${NEURON_CORES:-32-63}"
 WORLD_SIZE="${WORLD_SIZE:-32}"
 SERVE_PY="${SERVE_PY:-${PWD}/serve.py}"
 

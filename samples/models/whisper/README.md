@@ -8,7 +8,7 @@ Whisper-large-v3 (Neuron torch_neuronx 事前コンパイル版) を trn2.48xlar
 | 項目 | 値 |
 |---|---|
 | TP | 1 |
-| NeuronCore | 48 |
+| NeuronCore | 8 |
 | Port | 8765 |
 | Endpoint | HTTP `POST /transcribe`、 WebSocket `ws://...:8765/whisper-neuron/ws`、 `GET /health` (= `GET /whisper-neuron/health`) |
 | Venv | `/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference` |
@@ -49,7 +49,7 @@ Silero VAD で speech 区間だけを transcribe して JSON で返す。 voice-
 # venv に必要パッケージを入れて、 一度だけコンパイル
 source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
 pip install 'datasets<3' librosa soundfile
-NEURON_RT_VISIBLE_CORES=48 NEURON_RT_NUM_CORES=1 \
+NEURON_RT_VISIBLE_CORES=8 NEURON_RT_NUM_CORES=1 \
   python compile_whisper.py \
     --model-id openai/whisper-large-v3 \
     --output-dir /models/whisper-large-v3-neuron \

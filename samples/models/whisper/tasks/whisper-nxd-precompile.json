@@ -1,6 +1,6 @@
 {
   "name": "Whisper-large-v3 NxD Inference precompile (encoder + decoder)",
-  "description": "trn2.48xlarge 上で compile_whisper_nxd.py を 1 回だけ走らせ、NxD Inference 形式の {{MODEL_DIR}}/{encoder,decoder}/ Neuron 成果物を作る。冪等: compile_metadata.json + encoder/ + decoder/ が揃っていれば SKIP。 NEURON_RT_VISIBLE_CORES でコア固定 (default 0-7、tp_degree=8)。 compile_whisper_nxd.py 本体は presigned URL で S3 から取得する。",
+  "description": "trn2.48xlarge 上で compile_whisper_nxd.py を 1 回だけ走らせ、NxD Inference 形式の {{MODEL_DIR}}/{encoder,decoder}/ Neuron 成果物を作る。冪等: compile_metadata.json + encoder/ + decoder/ が揃っていれば SKIP。 NEURON_RT_VISIBLE_CORES でコア固定 (default 8-15、tp_degree=8)。 compile_whisper_nxd.py 本体は presigned URL で S3 から取得する。",
   "variables": {
     "MODEL_ID": "openai/whisper-large-v3",
     "MODEL_DIR": "/models/whisper-large-v3-neuron-nxd",
@@ -8,7 +8,7 @@
     "TP_DEGREE": "8",
     "BATCH_SIZE": "1",
     "DTYPE": "fp16",
-    "NEURON_CORES": "0-7",
+    "NEURON_CORES": "8-15",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference",
     "COMPILE_SCRIPT_URL": "",
     "WORK_DIR": "/opt/voice-image-edit/whisper-nxd-compile",

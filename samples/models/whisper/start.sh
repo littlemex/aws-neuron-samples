@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Whisper-large-v3 個別起動 (Neuron, NeuronCore 48 単独)
+# Whisper-large-v3 個別起動 (Neuron, NeuronCore 8 単独)
 # WHISPER_LANGUAGE=ja|en|auto で認識言語を切替。
 # 既に同ポートで起動中の場合はスキップ。
 set -euo pipefail
@@ -8,7 +8,7 @@ PORT="${PORT:-8765}"
 PATH_PREFIX="${PATH_PREFIX:-/whisper-neuron}"
 MODEL_DIR="${MODEL_DIR:-/models/whisper-large-v3-neuron}"
 MODEL_ID="${MODEL_ID:-openai/whisper-large-v3}"
-NEURON_CORE="${NEURON_CORE:-48}"
+NEURON_CORE="${NEURON_CORE:-8}"
 LANGUAGE="${WHISPER_LANGUAGE:-ja}"
 VENV="${VENV:-/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference}"
 SERVER_PY="${SERVER_PY:-${PWD}/whisper_server.py}"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Qwen3-VL-8B-Thinking 個別起動 (vLLM + Neuron)。
 # Default core window = 32-47 on trn2.48xlarge (TP=16 LNC=2). voice-image-edit
-# 3-model layout: Qwen-Image-Edit=0-31, Qwen3-VL=32-47, Whisper=48-55.
+# 3-model layout: Qwen-Image-Edit=32-63, Qwen3-VL=16-31, Whisper=8-15, xttsv2=0-3.
 # trn2.3xlarge / trn2.8xlarge では --cores で上書きすること。
 # 既に同ポートで起動中の場合はスキップ。
 set -euo pipefail
@@ -9,7 +9,7 @@ set -euo pipefail
 PORT="${PORT:-8090}"
 MODEL_DIR="${MODEL_DIR:-/models/Qwen3-VL-8B-Thinking}"
 VENV="${VENV:-/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16}"
-NEURON_CORES="${NEURON_CORES:-32-47}"
+NEURON_CORES="${NEURON_CORES:-16-31}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -212,22 +212,20 @@ step_precheck() {
 
 # --- helper: pick xttsv2 profile per host (TP, NeuronCores, compile path) ---
 # trn2.3xlarge has a single chip (cores 0-3). trn2.48xlarge has 16 chips (0-63);
-# whisper occupies 48-55, qwen3-vl 32-47, qwen-image-edit 0-31, leaving 56-63
+# whisper occupies 8-15, qwen3-vl 16-31, qwen-image-edit 32-63
 # (= 2 chips, 8 cores) free for xttsv2 — TP=8 is the largest power-of-two that
 # fits and roughly halves prefill latency over TP=4. The compile artefact path
 # is suffixed with the TP degree because the NEFFs are not interchangeable
 # across degrees and /models is shared via EFS.
 xttsv2_profile_for_instance() {
   local itype="$1"
-  case "$itype" in
-    trn2.48xlarge)
-      echo "8 56-63 /models/xttsv2-neuron-nxd-tp8"
-      ;;
-    *)
-      # trn2.3xlarge / unknown — assume the single-chip path.
-      echo "4 0-3 /models/xttsv2-neuron-nxd-tp4"
-      ;;
-  esac
+  # Always TP=4 / cores 0-3 / NeuronDevice 0. The container's bundled
+  # neuron-rt 2.30 crashes (tdrv bdf-workaround assertion) when given any
+  # high-index NeuronDevice on trn2.48xlarge, so xttsv2 sticks to the same
+  # NeuronDevice 0 as on trn2.3xlarge. The other model servers were shifted
+  # to 8-15 (Whisper) / 16-31 (Qwen3-VL) / 32-63 (Qwen-Image-Edit) to keep
+  # the layout fully non-overlapping on trn2.48xlarge.
+  echo "4 0-3 /models/xttsv2-neuron-nxd-tp4"
 }
 
 # --- helper: run a task JSON via run-tasks.sh ---
@@ -300,9 +298,9 @@ step_qie_prepare() {
 }
 
 # --- step: whisper-server ---
-# Uses the NxD server (TP=8). Pinned to NeuronCores 48-55 by
-# whisper-nxd-server.json; non-overlapping with Qwen-Image-Edit (0-31)
-# and Qwen3-VL (32-47). cores 48-55 require trn2.48xlarge (LNC=2 -> 64
+# Uses the NxD server (TP=8). Pinned to NeuronCores 8-15 by
+# whisper-nxd-server.json; non-overlapping with xttsv2 (0-3), Qwen-Image-Edit (32-63)
+# and Qwen3-VL (16-31). cores 8-15 require trn2.48xlarge (LNC=2 -> 64
 # logical cores); on trn2.3xlarge / trn2.8xlarge override NEURON_CORES.
 # The first health check on a freshly compiled model can take several
 # minutes, so the upstream task allows up to 1800s.

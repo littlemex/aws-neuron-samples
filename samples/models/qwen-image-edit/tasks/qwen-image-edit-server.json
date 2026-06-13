@@ -1,6 +1,6 @@
 {
   "name": "Qwen-Image-Edit-2511 serve.py (FastAPI multipart /infer) on EC2",
-  "description": "samples/models/qwen-image-edit/start.sh + serve.py を systemd で常駐起動する。事前に qwen-image-edit-prepare.json で /mnt/local/compiled_models_tp16/ に V3 TP16 artifacts が揃っている必要がある。 NeuronCore 0-31 (TP=16 DP=2 world_size=32) を専有し、 port {{PORT}} で FastAPI (POST /infer multipart, GET /health, POST /vton/infer alias) を提供。 source は presigned URL 経由で配布。",
+  "description": "samples/models/qwen-image-edit/start.sh + serve.py を systemd で常駐起動する。事前に qwen-image-edit-prepare.json で /mnt/local/compiled_models_tp16/ に V3 TP16 artifacts が揃っている必要がある。 NeuronCore 32-63 (TP=16 DP=2 world_size=32) を専有し、 port {{PORT}} で FastAPI (POST /infer multipart, GET /health, POST /vton/infer alias) を提供。 source は presigned URL 経由で配布。",
   "variables": {
     "SOURCE_TARBALL_URL": "",
     "SERVE_DIR": "/opt/voice-image-edit/qwen-image-edit-server",
@@ -11,7 +11,7 @@
     "HEIGHT": "1024",
     "WIDTH": "1024",
     "PATCH_MULTIPLIER": "3",
-    "NEURON_CORES": "0-31",
+    "NEURON_CORES": "32-63",
     "WORLD_SIZE": "32",
     "PATH_PREFIX": "/qwen-image-edit",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference",

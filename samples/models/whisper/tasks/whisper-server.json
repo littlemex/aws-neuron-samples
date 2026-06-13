@@ -10,7 +10,7 @@
     "MODEL_ID": "openai/whisper-large-v3",
     "MODEL_DIR": "/models/whisper-large-v3-neuron",
     "WHISPER_LANGUAGE": "ja",
-    "NEURON_CORE": "48",
+    "NEURON_CORE": "8",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference"
   },
   "tasks": [
