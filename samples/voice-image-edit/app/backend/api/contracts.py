@@ -128,6 +128,13 @@ class VlmRequest:
                        used by the GENERATE slot to localise non-English input.
     For modes other than "translate" image_b64 is required; for "translate"
     it is ignored even if supplied.
+
+    ``language`` selects the response language for the review mode (other modes
+    have a fixed response language). Accepted values are short codes such as
+    "ja" / "en"; BCP-47 forms ("ja-JP") are collapsed to the base subtag by
+    downstream consumers. Engines (bedrock / trainium) read this field via
+    ``req.language`` so callers do not need to pass anything for the default
+    Japanese review.
     """
 
     prompt: str
@@ -135,6 +142,7 @@ class VlmRequest:
     mode: str = "instruction"
     engine: Optional[str] = None
     request_id: Optional[str] = None
+    language: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "VlmRequest":
@@ -156,6 +164,7 @@ class VlmRequest:
             mode=mode,
             engine=d.get("engine"),
             request_id=d.get("request_id"),
+            language=d.get("language"),
         )
 
 
