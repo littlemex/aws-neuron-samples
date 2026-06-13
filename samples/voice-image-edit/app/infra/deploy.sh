@@ -31,6 +31,9 @@
 # 任意 (基盤接続):
 #   -r, --region REGION                基盤 stack のリージョン (default: AWS_REGION / AWS_DEFAULT_REGION)
 #   --bedrock-region REGION            Bedrock / Transcribe を呼ぶリージョン (default: us-east-1)
+#   --generate-bedrock-region REGION   Stability text-to-image を呼ぶリージョン (default: us-west-2)
+#   --edit-bedrock-region REGION       Stability image-to-image を呼ぶリージョン (default: us-west-2)
+#   --polly-region REGION              Amazon Polly TTS を呼ぶリージョン (default: us-east-1)
 #   --path-pattern PATTERN             ALB rule path (default: /api/edit/*)
 #   --rule-priority N                  ALB rule priority (default: 100)
 #   --api-port PORT                    API backend listen port (default: 8801)
@@ -50,7 +53,8 @@
 #   --bedrock-claude-sonnet-model ID   default: anthropic.claude-3-5-sonnet-20241022-v2:0
 #   --bedrock-nova-pro-model ID        default: amazon.nova-pro-v1:0
 #   --bedrock-nova-lite-model ID       default: amazon.nova-lite-v1:0
-#   --bedrock-edit-model ID            default: amazon.nova-canvas-v1:0
+#   --bedrock-nova-canvas-model ID     default: amazon.nova-canvas-v1:0
+#   --trainium-edit-model-id ID        Trainium 自前 EDIT サーバが返す model id (default: Qwen/Qwen-Image-Edit-2511)
 #
 # 任意 (Trainium 自前サービング URL — 空なら trainium engine は config_missing):
 #   --trainium-asr-url URL             例: http://internal-...:8000/transcribe
@@ -92,32 +96,51 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# single source of truth: deploy-defaults.env を必ず source する。
+# ここで `DEFAULT_*` 変数が export され、以下の `${X:-${DEFAULT_X}}` で受ける。
+DEFAULTS_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy-defaults.env"
+if [[ ! -f "$DEFAULTS_FILE" ]]; then
+    echo -e "\033[0;31m[NG] $DEFAULTS_FILE が見つかりません。voice-image-edit deploy の既定値はすべて同ファイルに集約されています。\033[0m" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "$DEFAULTS_FILE"
+
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 BASE_STACK_NAME="neuron-code-server"
-BEDROCK_REGION="us-east-1"
-# Stability AI の text-to-image foundation models (`stability.stable-image-*`)
-# は us-west-2 のみで提供されているため、generate スロットだけ別リージョンを
-# 使う。IAM resource ARN と systemd Environment の両方に流す。
-GENERATE_BEDROCK_REGION="us-west-2"
-PATH_PATTERN="/api/edit/*"
-RULE_PRIORITY="100"
-API_PORT="8801"
-ORIGIN_VERIFY_HEADER="X-Origin-Verify"
+BEDROCK_REGION="${BEDROCK_REGION:-${DEFAULT_BEDROCK_REGION}}"
+# Stability AI の text-to-image (Generate) と image-to-image (Edit) はいずれも
+# us-west-2 のみで提供されているため、それぞれ独立した変数で持つ (リージョン
+# 移行時に generate と edit を別々に動かせるようにするため)。
+GENERATE_BEDROCK_REGION="${GENERATE_BEDROCK_REGION:-${DEFAULT_GENERATE_BEDROCK_REGION}}"
+EDIT_BEDROCK_REGION="${EDIT_BEDROCK_REGION:-${DEFAULT_EDIT_BEDROCK_REGION}}"
+# Polly Neural は sa-east-1 ではまだ GA していないため、Bedrock とは別経路で
+# リージョンを指定可能にする。
+POLLY_REGION="${POLLY_REGION:-${DEFAULT_POLLY_REGION}}"
+PATH_PATTERN="${PATH_PATTERN:-${DEFAULT_API_PATH_PATTERN}}"
+RULE_PRIORITY="${RULE_PRIORITY:-${DEFAULT_API_RULE_PRIORITY}}"
+API_PORT="${API_PORT:-${DEFAULT_API_PORT}}"
+ORIGIN_VERIFY_HEADER="${ORIGIN_VERIFY_HEADER:-${DEFAULT_ORIGIN_VERIFY_HEADER}}"
 
-ASR_ENGINE_DEFAULT="bedrock_transcribe"
-VLM_ENGINE_DEFAULT="bedrock_nova_lite"
-EDIT_ENGINE_DEFAULT="bedrock_nova_canvas"
+ASR_ENGINE_DEFAULT="${ASR_ENGINE_DEFAULT:-${DEFAULT_ASR_ENGINE}}"
+VLM_ENGINE_DEFAULT="${VLM_ENGINE_DEFAULT:-${DEFAULT_VLM_ENGINE}}"
+EDIT_ENGINE_DEFAULT="${EDIT_ENGINE_DEFAULT:-${DEFAULT_EDIT_ENGINE}}"
 
-BEDROCK_ASR_BACKEND="transcribe"
-BEDROCK_CLAUDE_SONNET_MODEL_ID="anthropic.claude-3-5-sonnet-20241022-v2:0"
-BEDROCK_NOVA_PRO_MODEL_ID="amazon.nova-pro-v1:0"
-BEDROCK_NOVA_LITE_MODEL_ID="amazon.nova-lite-v1:0"
-BEDROCK_EDIT_MODEL_ID="amazon.nova-canvas-v1:0"
+BEDROCK_ASR_BACKEND="${BEDROCK_ASR_BACKEND:-${DEFAULT_BEDROCK_ASR_BACKEND}}"
+BEDROCK_CLAUDE_SONNET_MODEL_ID="${BEDROCK_CLAUDE_SONNET_MODEL_ID:-${DEFAULT_BEDROCK_CLAUDE_SONNET_MODEL_ID}}"
+BEDROCK_NOVA_PRO_MODEL_ID="${BEDROCK_NOVA_PRO_MODEL_ID:-${DEFAULT_BEDROCK_NOVA_PRO_MODEL_ID}}"
+BEDROCK_NOVA_LITE_MODEL_ID="${BEDROCK_NOVA_LITE_MODEL_ID:-${DEFAULT_BEDROCK_NOVA_LITE_MODEL_ID}}"
+# 旧 BEDROCK_EDIT_MODEL_ID は撤廃。Nova Canvas を指す唯一の env は
+# BEDROCK_NOVA_CANVAS_MODEL_ID に統一 (engines/edit/__init__.py がこれだけを読む)。
+BEDROCK_NOVA_CANVAS_MODEL_ID="${BEDROCK_NOVA_CANVAS_MODEL_ID:-${DEFAULT_BEDROCK_NOVA_CANVAS_MODEL_ID}}"
 
 TRAINIUM_ASR_URL=""
 TRAINIUM_VLM_URL=""
 TRAINIUM_EDIT_URL=""
 TRAINIUM_TTS_URL=""
+# Trainium 自前 EDIT サーバが返す model id (engines/edit/trainium.py のレスポンス
+# metadata に乗る)。URL を渡すときと一緒に上書きする想定。
+TRAINIUM_EDIT_MODEL_ID="${TRAINIUM_EDIT_MODEL_ID:-${DEFAULT_TRAINIUM_EDIT_MODEL_ID}}"
 
 ALB_ARN_OVERRIDE=""
 LISTENER_ARN_OVERRIDE=""
@@ -130,14 +153,14 @@ SKIP_API_DEPLOY=false
 SKIP_FRONTEND=false
 SKIP_FRONTEND_DEPLOY=false
 FRONTEND_NO_BUILD=false
-FRONTEND_PORT="3000"
-FRONTEND_RULE_PRIORITY="200"
+FRONTEND_PORT="${FRONTEND_PORT:-${DEFAULT_FRONTEND_PORT}}"
+FRONTEND_RULE_PRIORITY="${FRONTEND_RULE_PRIORITY:-${DEFAULT_FRONTEND_RULE_PRIORITY}}"
 
 SKIP_STREAM=false
 SKIP_STREAM_DEPLOY=false
-STREAM_PORT="8800"
-STREAM_RULE_PRIORITY="150"
-STREAM_PATH_PATTERN="/stream/*"
+STREAM_PORT="${STREAM_PORT:-${DEFAULT_STREAM_PORT}}"
+STREAM_RULE_PRIORITY="${STREAM_RULE_PRIORITY:-${DEFAULT_STREAM_RULE_PRIORITY}}"
+STREAM_PATH_PATTERN="${STREAM_PATH_PATTERN:-${DEFAULT_STREAM_PATH_PATTERN}}"
 
 RESET_APP_STACKS=false
 DESTROY=false
@@ -152,6 +175,8 @@ while [[ $# -gt 0 ]]; do
         -r|--region)                    REGION="$2"; shift 2 ;;
         --bedrock-region)               BEDROCK_REGION="$2"; shift 2 ;;
         --generate-bedrock-region)      GENERATE_BEDROCK_REGION="$2"; shift 2 ;;
+        --edit-bedrock-region)          EDIT_BEDROCK_REGION="$2"; shift 2 ;;
+        --polly-region)                 POLLY_REGION="$2"; shift 2 ;;
         --path-pattern)                 PATH_PATTERN="$2"; shift 2 ;;
         --rule-priority)                RULE_PRIORITY="$2"; shift 2 ;;
         --api-port)                     API_PORT="$2"; shift 2 ;;
@@ -163,7 +188,11 @@ while [[ $# -gt 0 ]]; do
         --bedrock-claude-sonnet-model)  BEDROCK_CLAUDE_SONNET_MODEL_ID="$2"; shift 2 ;;
         --bedrock-nova-pro-model)       BEDROCK_NOVA_PRO_MODEL_ID="$2"; shift 2 ;;
         --bedrock-nova-lite-model)      BEDROCK_NOVA_LITE_MODEL_ID="$2"; shift 2 ;;
-        --bedrock-edit-model)           BEDROCK_EDIT_MODEL_ID="$2"; shift 2 ;;
+        --bedrock-nova-canvas-model)    BEDROCK_NOVA_CANVAS_MODEL_ID="$2"; shift 2 ;;
+        --bedrock-edit-model)
+            # 後方互換: 旧フラグ名。BEDROCK_NOVA_CANVAS_MODEL_ID と同じ意味で受ける。
+            BEDROCK_NOVA_CANVAS_MODEL_ID="$2"; shift 2 ;;
+        --trainium-edit-model-id)       TRAINIUM_EDIT_MODEL_ID="$2"; shift 2 ;;
         --trainium-asr-url)             TRAINIUM_ASR_URL="$2"; shift 2 ;;
         --trainium-vlm-url)             TRAINIUM_VLM_URL="$2"; shift 2 ;;
         --trainium-edit-url)            TRAINIUM_EDIT_URL="$2"; shift 2 ;;
@@ -513,6 +542,8 @@ echo "  OriginVerifySecretArn      : $ORIGIN_VERIFY_SECRET_ARN"
 echo "  OriginVerifyHeader         : $ORIGIN_VERIFY_HEADER"
 echo "  BedrockRegion              : $BEDROCK_REGION"
 echo "  GenerateBedrockRegion      : $GENERATE_BEDROCK_REGION"
+echo "  EditBedrockRegion          : $EDIT_BEDROCK_REGION"
+echo "  PollyRegion                : $POLLY_REGION"
 echo
 if [[ "$NEEDS_EC2" == "true" ]]; then
     echo "  Ec2 InstanceId             : $EC2_INSTANCE_ID"
@@ -530,7 +561,8 @@ echo "  EDIT default               : $EDIT_ENGINE_DEFAULT"
 echo "  Bedrock Claude Sonnet      : $BEDROCK_CLAUDE_SONNET_MODEL_ID"
 echo "  Bedrock Nova Pro           : $BEDROCK_NOVA_PRO_MODEL_ID"
 echo "  Bedrock Nova Lite          : $BEDROCK_NOVA_LITE_MODEL_ID"
-echo "  Bedrock EDIT model         : $BEDROCK_EDIT_MODEL_ID"
+echo "  Bedrock Nova Canvas (EDIT) : $BEDROCK_NOVA_CANVAS_MODEL_ID"
+echo "  Trainium EDIT model id     : $TRAINIUM_EDIT_MODEL_ID"
 echo "  Trainium ASR URL           : ${TRAINIUM_ASR_URL:-(none)}"
 echo "  Trainium VLM URL           : ${TRAINIUM_VLM_URL:-(none)}"
 echo "  Trainium EDIT URL          : ${TRAINIUM_EDIT_URL:-(none)}"
@@ -586,6 +618,7 @@ CDK_CTX=(
     "-c" "originVerifySecretArn=$ORIGIN_VERIFY_SECRET_ARN"
     "-c" "bedrockRegion=$BEDROCK_REGION"
     "-c" "generateBedrockRegion=$GENERATE_BEDROCK_REGION"
+    "-c" "editBedrockRegion=$EDIT_BEDROCK_REGION"
 )
 
 STACKS_TO_DEPLOY=()
@@ -810,8 +843,11 @@ deploy_api_service() {
     vars_json=$(jq -n \
         --arg api_tarball "$presigned" \
         --arg api_port "$API_PORT" \
+        --arg aws_region "$REGION" \
         --arg bedrock_region "$BEDROCK_REGION" \
         --arg generate_bedrock_region "$GENERATE_BEDROCK_REGION" \
+        --arg edit_bedrock_region "$EDIT_BEDROCK_REGION" \
+        --arg polly_region "$POLLY_REGION" \
         --arg edit_bucket "$API_RESULT_BUCKET" \
         --arg edit_region "$REGION" \
         --arg asr "$ASR_ENGINE_DEFAULT" \
@@ -821,16 +857,20 @@ deploy_api_service() {
         --arg claude "$BEDROCK_CLAUDE_SONNET_MODEL_ID" \
         --arg nova_pro "$BEDROCK_NOVA_PRO_MODEL_ID" \
         --arg nova_lite "$BEDROCK_NOVA_LITE_MODEL_ID" \
-        --arg edit_model "$BEDROCK_EDIT_MODEL_ID" \
+        --arg nova_canvas "$BEDROCK_NOVA_CANVAS_MODEL_ID" \
         --arg trainium_asr "$TRAINIUM_ASR_URL" \
         --arg trainium_vlm "$TRAINIUM_VLM_URL" \
         --arg trainium_edit "$TRAINIUM_EDIT_URL" \
         --arg trainium_tts "$TRAINIUM_TTS_URL" \
+        --arg trainium_edit_model "$TRAINIUM_EDIT_MODEL_ID" \
         '{
           API_TARBALL_URL: $api_tarball,
           API_PORT: $api_port,
+          AWS_REGION: $aws_region,
           BEDROCK_REGION: $bedrock_region,
           GENERATE_BEDROCK_REGION: $generate_bedrock_region,
+          EDIT_BEDROCK_REGION: $edit_bedrock_region,
+          POLLY_REGION: $polly_region,
           EDIT_RESULT_BUCKET: $edit_bucket,
           EDIT_RESULT_REGION: $edit_region,
           ASR_ENGINE_DEFAULT: $asr,
@@ -840,13 +880,13 @@ deploy_api_service() {
           BEDROCK_CLAUDE_SONNET_MODEL_ID: $claude,
           BEDROCK_NOVA_PRO_MODEL_ID: $nova_pro,
           BEDROCK_NOVA_LITE_MODEL_ID: $nova_lite,
-          BEDROCK_NOVA_CANVAS_MODEL_ID: $edit_model,
-          BEDROCK_EDIT_MODEL_ID: $edit_model,
+          BEDROCK_NOVA_CANVAS_MODEL_ID: $nova_canvas,
           BEDROCK_VLM_MODEL_ID: $nova_lite,
           TRAINIUM_ASR_URL: $trainium_asr,
           TRAINIUM_VLM_URL: $trainium_vlm,
           TRAINIUM_EDIT_URL: $trainium_edit,
-          TRAINIUM_TTS_URL: $trainium_tts
+          TRAINIUM_TTS_URL: $trainium_tts,
+          TRAINIUM_EDIT_MODEL_ID: $trainium_edit_model
         }')
 
     run_task "$EC2_INSTANCE_ID" "$INFRA_DIR/tasks/voice-image-edit-api.json" "$vars_json" "voice-image-edit-api"

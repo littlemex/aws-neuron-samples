@@ -53,6 +53,15 @@ _parser.add_argument("--compiled_models_dir", type=str,
 _parser.add_argument("--s3_models_uri", type=str,
                      default=os.environ.get("VTON_S3_MODELS_URI", ""),
                      help="S3 URI for compiled VTON models. Required unless --compiled_models_dir already populated.")
+_parser.add_argument("--s3_models_region", type=str,
+                     default=os.environ.get(
+                         "VTON_S3_MODELS_REGION",
+                         os.environ.get("AWS_DEFAULT_REGION",
+                                        os.environ.get("AWS_REGION", ""))
+                     ),
+                     help="AWS region for the s3 sync of --s3_models_uri. "
+                          "Falls back to AWS_DEFAULT_REGION / AWS_REGION; "
+                          "leave empty to let the AWS CLI resolve it itself.")
 _parser.add_argument("--height", type=int, default=int(os.environ.get("HEIGHT", "1024")))
 _parser.add_argument("--width", type=int, default=int(os.environ.get("WIDTH", "1024")))
 _parser.add_argument("--patch_multiplier", type=int, default=int(os.environ.get("PATCH_MULT", "3")))
@@ -138,10 +147,12 @@ def load_pipeline():
         print(f"Downloading from {s3_uri} ...")
         os.makedirs(models_dir, exist_ok=True)
         import subprocess
-        result = subprocess.run(
-            ["aws", "s3", "sync", s3_uri, models_dir, "--region", "us-east-2"],
-            capture_output=True, text=True
-        )
+        # --s3_models_region が空なら CLI 側に解決を委ねる (AWS_DEFAULT_REGION /
+        # ~/.aws/config にあれば動く)。明示指定があれば --region を付ける。
+        cmd = ["aws", "s3", "sync", s3_uri, models_dir]
+        if SERVER_ARGS.s3_models_region:
+            cmd += ["--region", SERVER_ARGS.s3_models_region]
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"S3 download failed: {result.stderr}")
         print(f"Download complete: {models_dir}")

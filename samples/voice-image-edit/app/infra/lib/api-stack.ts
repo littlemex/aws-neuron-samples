@@ -41,7 +41,8 @@ import { Construct } from 'constructs';
  *   - apiPort                      : default = 8801
  *   - apiPathPattern               : default = /api/edit/*
  *   - apiRulePriority              : default = 100
- *   - generateBedrockRegion        : default = us-west-2 (Stability AI モデルの home region)
+ *   - generateBedrockRegion        : default = us-west-2 (Stability text-to-image)
+ *   - editBedrockRegion            : default = us-west-2 (Stability image-to-image)
  */
 export interface ApiStackProps extends cdk.StackProps {}
 
@@ -75,14 +76,16 @@ export class ApiStack extends cdk.Stack {
     const apiPathPattern = ctx('apiPathPattern') ?? '/api/edit/*';
     const apiRulePriority = Number(ctx('apiRulePriority') ?? '100');
 
-    // Stability AI image-generation models (`stability.stable-image-*`) only
-    // live in us-west-2. The default `bedrockRegion` (e.g. us-east-1) does
-    // not host them, so the GENERATE slot needs a separate region in both
-    // the IAM resource ARN and the runtime env. Configurable but defaults to
-    // us-west-2 so the demo works out of the box.
+    // Stability AI 系モデル (`stability.stable-image-*` / `stability.sd3-5-*`)
+    // は us-west-2 のみで提供されているため、Generate (text-to-image) と Edit
+    // (image-to-image) のどちらも `bedrockRegion` (Nova / Claude 用、通常は
+    // us-east-1) では呼び出せない。IAM resource ARN と runtime env の両方に
+    // 流すため、Generate と Edit を独立した ctx で持つ (将来 Edit を別モデル
+    // で別リージョンに動かせるようにする)。両方未指定なら us-west-2 で動く。
     const generateBedrockRegion = ctx('generateBedrockRegion') ?? 'us-west-2';
+    const editBedrockRegion = ctx('editBedrockRegion') ?? 'us-west-2';
     const bedrockResourceRegions = Array.from(
-      new Set([bedrockRegion, generateBedrockRegion]),
+      new Set([bedrockRegion, generateBedrockRegion, editBedrockRegion]),
     );
 
     const vpc = ec2.Vpc.fromLookup(this, 'BaseVpc', { vpcId: apiVpcId });
@@ -127,8 +130,9 @@ export class ApiStack extends cdk.Stack {
           'bedrock:ConverseStream',
           'bedrock:InvokeModelWithResponseStream',
         ],
-        // Allow every region the API needs: bedrockRegion (Claude / Nova) +
-        // generateBedrockRegion (Stability image generation in us-west-2).
+        // Allow every region the API needs: bedrockRegion (Claude / Nova),
+        // generateBedrockRegion (Stability text-to-image),
+        // editBedrockRegion (Stability image-to-image).
         resources: bedrockResourceRegions.map(
           (r) => `arn:aws:bedrock:${r}::foundation-model/*`,
         ),

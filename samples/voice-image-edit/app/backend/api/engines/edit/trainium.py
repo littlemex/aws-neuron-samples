@@ -6,8 +6,10 @@ base64 image を multipart に詰め替えて送り、PNG bytes を base64 に�
 EditResponse に乗せる。contracts.py を変えずに新サーバに向け替えられる。
 
 接続先は環境変数で受け取る。ハードコード禁止。
-- TRAINIUM_EDIT_URL    (例: http://internal-...:8081/infer)
-- TRAINIUM_EDIT_MODEL_ID (default: Qwen/Qwen-Image-Edit-2511)
+- TRAINIUM_EDIT_URL    (必須、例: http://internal-...:8081/infer)
+- TRAINIUM_EDIT_MODEL_ID (必須。deploy.sh / deploy-defaults.env が注入。
+                           値は EditResponse.metadata.model_id にだけ流れる
+                           表示用の文字列。Trainium サーバ側のモデルとは独立)
 - TRAINIUM_EDIT_TIMEOUT_SECONDS (default: 300)  Diffusion は重いので長め
 - TRAINIUM_EDIT_NEGATIVE_PROMPT_DEFAULT (default: "blurry, low quality, deformed, distorted")
 - TRAINIUM_EDIT_NUM_INFERENCE_STEPS (default: 50)
@@ -44,10 +46,11 @@ class TrainiumEditEngine(ImageEditEngine):
 
     def __init__(self) -> None:
         self.endpoint = env_required("TRAINIUM_EDIT_URL", "TRAINIUM_BACKEND_URL")
-        self.model_id = os.environ.get(
-            "TRAINIUM_EDIT_MODEL_ID",
-            os.environ.get("TRAINIUM_MODEL_ID", "Qwen/Qwen-Image-Edit-2511"),
-        )
+        # TRAINIUM_EDIT_MODEL_ID は deploy.sh が deploy-defaults.env から
+        # 注入する必須 env。旧 fallback (TRAINIUM_MODEL_ID + Python literal)
+        # は撤廃した。値は表示用の metadata.model_id に流れるだけで、Trainium
+        # サーバ側のモデルとは独立。
+        self.model_id = env_required("TRAINIUM_EDIT_MODEL_ID")
         self.timeout = env_float(
             "TRAINIUM_EDIT_TIMEOUT_SECONDS",
             300.0,

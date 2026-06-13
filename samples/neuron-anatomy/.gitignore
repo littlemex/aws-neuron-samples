@@ -1,5 +1,9 @@
 node_modules/
 cdk.out/
+# cdk.context.json は VPC lookup の結果を環境固有 ID (account / vpc / subnet)
+# で焼き込むため VCS 管理外。ルート .gitignore に既に入っているが、サブ
+# プロジェクトの .gitignore でも明示して取りこぼしを防ぐ。
+infra/cdk.context.json
 .venv/
 *.egg-info/
 __pycache__/

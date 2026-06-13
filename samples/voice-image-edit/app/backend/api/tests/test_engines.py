@@ -131,7 +131,9 @@ class TestDummyEngine:
 
 class TestRegistry:
     def test_list_slots(self):
-        assert registry.list_slots() == ["asr", "vlm", "edit"]
+        # registry には asr/vlm/edit に加えて generate (P11) と tts (P12) が
+        # 順次追加された。順序は登録順なので新規追加時は末尾につくこと。
+        assert registry.list_slots() == ["asr", "vlm", "edit", "generate", "tts"]
 
     def test_edit_engines_include_dummy_and_bedrock_and_trainium(self):
         names = registry.list_engines("edit")
@@ -162,10 +164,18 @@ class TestRegistry:
             registry.get_engine("edit", "does-not-exist")
         assert exc.value.code == "unknown_engine"
 
-    def test_default_edit_falls_back_to_dummy(self, monkeypatch):
+    def test_default_edit_resolves_to_stability_sd35(self, monkeypatch):
+        # EDIT_ENGINE_DEFAULT が未設定なら DEFAULT_FALLBACK
+        # = "bedrock_stability_sd35" が返る (engines/edit/__init__.py)。
+        # 旧実装は "dummy" を返していたが、Stability SD3.5 が唯一の
+        # ACTIVE な image-to-image SKU なのでそちらに揃えた。
+        # ここでは「resolve 後の名前が bedrock_stability_sd35 になる」
+        # ことだけ確認する。実体化は EDIT_BEDROCK_REGION が要るので
+        # monkeypatch で注入する。
         monkeypatch.delenv("EDIT_ENGINE_DEFAULT", raising=False)
+        monkeypatch.setenv("EDIT_BEDROCK_REGION", "us-west-2")
         engine = registry.get_engine("edit", None)
-        assert engine.name == "dummy"
+        assert engine.name == "bedrock_stability_sd35"
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +186,7 @@ class TestRegistry:
 class TestEnvGuards:
     def test_bedrock_edit_requires_env(self, monkeypatch):
         monkeypatch.delenv("BEDROCK_REGION", raising=False)
-        monkeypatch.delenv("BEDROCK_EDIT_MODEL_ID", raising=False)
-        monkeypatch.delenv("NOVA_CANVAS_MODEL_ID", raising=False)
+        monkeypatch.delenv("BEDROCK_NOVA_CANVAS_MODEL_ID", raising=False)
         from engines.edit.bedrock import BedrockEditEngine
 
         with pytest.raises(EngineError) as exc:
@@ -187,6 +196,7 @@ class TestEnvGuards:
     def test_trainium_edit_requires_env(self, monkeypatch):
         monkeypatch.delenv("TRAINIUM_EDIT_URL", raising=False)
         monkeypatch.delenv("TRAINIUM_BACKEND_URL", raising=False)
+        monkeypatch.delenv("TRAINIUM_EDIT_MODEL_ID", raising=False)
         from engines.edit.trainium import TrainiumEditEngine
 
         with pytest.raises(EngineError) as exc:
