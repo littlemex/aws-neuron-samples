@@ -99,6 +99,14 @@ echo "[qwen3] launching vLLM on :${PORT} (TP=${TP}, cores=${NEURON_CORES}) (log 
 # served-model-name を明示してパス依存を切る。
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3-VL-8B-Thinking}"
 
+# Qwen3-VL-Thinking emits its chain-of-thought inside <think>...</think>.
+# Without --reasoning-parser the closing tag is forwarded as plain content,
+# so the API client receives the full English/Chinese reasoning instead of
+# the answer. Telling vLLM which parser to use moves the reasoning into a
+# separate `reasoning_content` field and lets `chat_template_kwargs.
+# enable_thinking=False` actually short-circuit the thinking phase.
+REASONING_PARSER="${REASONING_PARSER:-qwen3}"
+
 if [[ -t 1 ]]; then
   # Interactive shell: keep legacy nohup behaviour for manual launches.
   nohup vllm serve \
@@ -109,6 +117,7 @@ if [[ -t 1 ]]; then
     --additional-config="${ADDITIONAL_CONFIG}" \
     --limit-mm-per-prompt="${LIMIT_MM}" \
     --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --reasoning-parser="${REASONING_PARSER}" \
     --host=0.0.0.0 --port="${PORT}" \
     >>"${LOG}" 2>&1 &
   echo $! > "${PIDFILE}"
@@ -124,5 +133,6 @@ else
     --additional-config="${ADDITIONAL_CONFIG}" \
     --limit-mm-per-prompt="${LIMIT_MM}" \
     --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --reasoning-parser="${REASONING_PARSER}" \
     --host=0.0.0.0 --port="${PORT}"
 fi
