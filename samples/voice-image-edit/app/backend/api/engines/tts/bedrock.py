@@ -7,7 +7,7 @@ contract so the operator picks "bedrock_polly_*" the same way they'd pick
 any other engine in the slot.
 
 Configuration:
-  POLLY_REGION             default us-east-1
+  POLLY_REGION             必須 (deploy-defaults.env に集約)
   POLLY_OUTPUT_FORMAT      default "mp3"
   POLLY_SAMPLE_RATE        default "24000" (24kHz neural is the recommended pair)
 
@@ -27,11 +27,10 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from contracts import EngineError, TtsRequest, TtsResponse
-from engines._common import build_metadata
+from engines._common import build_metadata, env_required
 from engines.tts.base import TtsEngine
 
 
-_DEFAULT_REGION = "us-east-1"
 _DEFAULT_OUTPUT_FORMAT = "mp3"
 _DEFAULT_SAMPLE_RATE = "24000"
 
@@ -57,11 +56,10 @@ class PollyTtsEngine(TtsEngine):
         # "Bedrock-team cloud TTS" because it lives in the same account /
         # ecosystem and uses the same IAM role wiring as the rest of the
         # Bedrock engines in this project.
-        self.region = (
-            region
-            or os.environ.get("POLLY_REGION")
-            or _DEFAULT_REGION
-        )
+        # POLLY_REGION は deploy.sh / deploy-defaults.env が必ず注入する
+        # 必須 env (旧 us-east-1 default は撤廃)。Polly Neural の GA 状況は
+        # リージョンによって違うため、デプロイ先と分離して持てる。
+        self.region = region or env_required("POLLY_REGION")
         self.voice = voice
         self.polly_engine = polly_engine  # "neural" | "standard" | "long-form"
         self.language_code = language_code

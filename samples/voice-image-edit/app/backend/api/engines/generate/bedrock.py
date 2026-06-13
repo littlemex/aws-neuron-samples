@@ -12,9 +12,9 @@ Prompt localisation is handled UPSTREAM by the VLM slot in mode="translate"
 NOT translate or rewrite prompts itself — that lets the operator pick which
 VLM (Bedrock Claude / Trainium Qwen3-VL) does the rewrite.
 
-Region / model id are overridable via env:
-  - GENERATE_BEDROCK_REGION   (default us-west-2)
-  - GENERATE_BEDROCK_MODEL_ID (default stability.stable-image-ultra-v1:1)
+Region / model id:
+  - GENERATE_BEDROCK_REGION   必須 (deploy-defaults.env に集約)
+  - GENERATE_BEDROCK_MODEL_ID 任意 (default stability.stable-image-ultra-v1:1)
 """
 from __future__ import annotations
 
@@ -27,11 +27,10 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from contracts import EngineError, GenerateRequest, GenerateResponse
-from engines._common import build_metadata
+from engines._common import build_metadata, env_required
 from engines.generate.base import ImageGenerateEngine
 
 
-_DEFAULT_REGION = "us-west-2"
 _DEFAULT_MODEL_ID = "stability.stable-image-ultra-v1:1"
 
 
@@ -46,15 +45,11 @@ class StabilityBedrockGenerateEngine(ImageGenerateEngine):
         region: str | None = None,
         engine_name: str | None = None,
     ) -> None:
-        # Stability text-to-image SKUs are only ACTIVE in us-west-2 today,
-        # so we MUST NOT fall back to BEDROCK_REGION (which the rest of the
-        # service points at us-east-1 for Nova / Claude). Honour an explicit
-        # GENERATE_BEDROCK_REGION override; otherwise default to us-west-2.
-        self.region = (
-            region
-            or os.environ.get("GENERATE_BEDROCK_REGION")
-            or _DEFAULT_REGION
-        )
+        # Stability text-to-image は us-west-2 でしか動かないが、Bedrock の
+        # 提供リージョンは将来増える可能性があるため GENERATE_BEDROCK_REGION
+        # を必須にする (BEDROCK_REGION = us-east-1 を継承させない)。値は
+        # deploy.sh / deploy-defaults.env が注入する。
+        self.region = region or env_required("GENERATE_BEDROCK_REGION")
         self.model_id = (
             model_id
             or os.environ.get("GENERATE_BEDROCK_MODEL_ID")

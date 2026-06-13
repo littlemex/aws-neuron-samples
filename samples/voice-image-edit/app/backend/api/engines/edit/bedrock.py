@@ -157,7 +157,10 @@ class NovaCanvasEditEngine(BedrockEditEngineBase):
         return env_required("BEDROCK_REGION")
 
     def _resolve_model_id(self) -> str:
-        return env_required("BEDROCK_EDIT_MODEL_ID", "NOVA_CANVAS_MODEL_ID")
+        # 旧 BEDROCK_EDIT_MODEL_ID / NOVA_CANVAS_MODEL_ID は撤廃。
+        # 単一の真実の源 = BEDROCK_NOVA_CANVAS_MODEL_ID (deploy-defaults.env と
+        # voice-image-edit-api.json variables の両方で同名で扱う)。
+        return env_required("BEDROCK_NOVA_CANVAS_MODEL_ID")
 
     def _build_body(self, req: EditRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -186,10 +189,10 @@ class NovaCanvasEditEngine(BedrockEditEngineBase):
 
 
 # ---------------------------------------------------------------------------
-# Stability SD 3.5 Large image-to-image. ACTIVE on us-west-2.
+# Stability SD 3.5 Large image-to-image. Bedrock 上で ACTIVE なのは us-west-2 のみ。
+# 注入経路は deploy.sh → voice-image-edit-api.json → systemd Environment。
 # ---------------------------------------------------------------------------
 
-_DEFAULT_SD35_REGION = "us-west-2"
 _DEFAULT_SD35_MODEL_ID = "stability.sd3-5-large-v1:0"
 
 
@@ -201,20 +204,23 @@ class StabilitySd35EditEngine(BedrockEditEngineBase):
     instruction prompts through the VLM slot first; that step already
     yields English. The ``EditRequest.prompt`` we receive here is treated
     as English. ``options.strength`` is forwarded as Stability's
-    ``strength`` (0.0–1.0; higher = follow prompt more, change image more).
+    ``strength`` (0.0-1.0; higher = follow prompt more, change image more).
     """
 
     name = "bedrock_stability_sd35"
 
     def _resolve_region(self) -> str:
-        # Stability lives in us-west-2; do NOT inherit BEDROCK_REGION
-        # (which the Nova/Claude path points at us-east-1).
-        return os.environ.get("EDIT_BEDROCK_REGION") or _DEFAULT_SD35_REGION
+        # Stability の image-to-image は us-west-2 でしか動かないが、Bedrock の
+        # 提供リージョンは将来増える可能性があるため EDIT_BEDROCK_REGION を必須
+        # にする (BEDROCK_REGION = us-east-1 を継承させない)。値は
+        # deploy.sh / deploy-defaults.env が注入する。
+        return env_required("EDIT_BEDROCK_REGION")
 
     def _resolve_model_id(self) -> str:
+        # モデル ID はリージョンと違って簡単には変わらないので Python 側 default
+        # を残すが、単一の真実の源は env (BEDROCK_STABILITY_SD35_MODEL_ID)。
         return (
-            os.environ.get("EDIT_BEDROCK_MODEL_ID")
-            or os.environ.get("BEDROCK_STABILITY_SD35_MODEL_ID")
+            os.environ.get("BEDROCK_STABILITY_SD35_MODEL_ID")
             or _DEFAULT_SD35_MODEL_ID
         )
 

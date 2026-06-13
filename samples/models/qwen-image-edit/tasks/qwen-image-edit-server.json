@@ -16,7 +16,9 @@
     "PATH_PREFIX": "/qwen-image-edit",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference",
     "HF_HOME_DIR": "/models/hf-cache",
-    "HF_CACHE_DIR": "/models/hf-cache/hub"
+    "HF_CACHE_DIR": "/models/hf-cache/hub",
+    "VTON_S3_MODELS_REGION": "",
+    "VTON_S3_MODELS_URI": ""
   },
   "tasks": [
     {
@@ -107,6 +109,8 @@
         "Environment=HUGGINGFACE_CACHE_DIR={{HF_CACHE_DIR}}",
         "Environment=HF_HOME={{HF_HOME_DIR}}",
         "Environment=TRANSFORMERS_CACHE={{HF_CACHE_DIR}}",
+        "Environment=VTON_S3_MODELS_URI={{VTON_S3_MODELS_URI}}",
+        "Environment=VTON_S3_MODELS_REGION={{VTON_S3_MODELS_REGION}}",
         "Environment=LOG_DIR={{SERVE_DIR}}/logs",
         "ExecStart=/bin/bash {{SERVE_DIR}}/start.sh --port {{PORT}} --host {{HOST}} --compiled-dir {{COMPILED_MODELS_DIR}} --height {{HEIGHT}} --width {{WIDTH}} --cores {{NEURON_CORES}} --world-size {{WORLD_SIZE}} --serve-py {{SERVE_DIR}}/serve.py",
         "Restart=always",

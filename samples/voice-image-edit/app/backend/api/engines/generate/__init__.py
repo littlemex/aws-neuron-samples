@@ -2,6 +2,10 @@
 
 Add a new engine by appending one factory line to ``ENGINES``. Factories
 take zero arguments and return an ``ImageGenerateEngine`` instance.
+
+Stability の Bedrock モデル ID は Stability 側の SKU と 1:1 に紐づいた
+半固定値なので Python 側に default を残す。値を絞ったり差し替えたい場合は
+BEDROCK_STABILITY_*_MODEL_ID env を deploy.sh で指定する。
 """
 from __future__ import annotations
 

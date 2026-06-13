@@ -20,12 +20,11 @@ from engines.edit.trainium import TrainiumEditEngine
 
 
 def _bedrock_nova_canvas() -> ImageEditEngine:
-    return NovaCanvasEditEngine(
-        model_id=os.environ.get(
-            "BEDROCK_NOVA_CANVAS_MODEL_ID", "amazon.nova-canvas-v1:0"
-        ),
-        engine_name="bedrock_nova_canvas",
-    )
+    # model_id / region resolution はクラス側 (NovaCanvasEditEngine._resolve_*)
+    # に集約。ここで Python literal を持つと「task JSON に入っていない値が
+    # サイレントで動く」二重管理になるので、registry は engine_name だけ渡す
+    # 薄い factory に保つ。
+    return NovaCanvasEditEngine(engine_name="bedrock_nova_canvas")
 
 
 def _bedrock_stability_sd35() -> ImageEditEngine:
