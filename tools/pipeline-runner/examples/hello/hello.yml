@@ -1,0 +1,22 @@
+name: hello-world
+description: Minimal example pipeline used to smoke-test the runner.
+
+vars:
+  GREETING: hello
+
+required_vars:
+  - TARGET_NAME
+
+defaults:
+  timeout: 30s
+  cloudwatch_logs: false   # examples don't need CW Logs to keep things tidy
+
+tasks:
+  - id: 10-greet
+    script: scripts/10-greet.sh
+    fingerprint_inputs:
+      - "{{TARGET_NAME}}"
+
+  - id: 20-farewell
+    needs: [10-greet]
+    script: scripts/20-farewell.sh

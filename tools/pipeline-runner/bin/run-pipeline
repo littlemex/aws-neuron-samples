@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""pipeline-runner v1 entry point.
+
+A thin SSM-driven runner for declarative deploy pipelines. See the README
+next to this file for the design rationale and the YAML schema.
+
+Implementation is split across the imported modules in ../lib so this file
+stays a small command-line shim.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# Make the sibling lib/ directory importable without installing as a package.
+_HERE = Path(__file__).resolve().parent
+_LIB = _HERE.parent / "lib"
+sys.path.insert(0, str(_LIB))
+
+from cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

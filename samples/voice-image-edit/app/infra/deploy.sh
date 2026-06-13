@@ -79,6 +79,8 @@
 #   --reset-app-stacks            base ALB と紐づかない既存 VoiceImageEdit*Stack を deploy 前に強制 destroy。
 #                                 base stack 再作成後の orphan stack を正規に作り直す唯一のパス。
 #   --destroy                     全 stack を destroy する
+#   --use-pipeline-runner         api backend deploy を新 pipeline-runner で実行 (default: 旧 run-tasks.sh)
+#                                 deploy 経路だけが切り替わるので、CDK や frontend/stream は影響なし
 #   -h, --help                    このヘルプ
 #
 # Examples:
@@ -164,6 +166,11 @@ STREAM_PATH_PATTERN="${STREAM_PATH_PATTERN:-${DEFAULT_STREAM_PATH_PATTERN}}"
 
 RESET_APP_STACKS=false
 DESTROY=false
+# When true, the API backend deploy step uses the new pipeline-runner
+# (tools/pipeline-runner/) instead of the legacy run-tasks.sh. The CDK and
+# frontend/stream paths are unchanged. Default off until the new runner has
+# enough mileage on this codebase.
+USE_PIPELINE_RUNNER=false
 
 usage() {
     sed -n '3,86p' "$0"
@@ -216,6 +223,7 @@ while [[ $# -gt 0 ]]; do
         --stream-path-pattern)          STREAM_PATH_PATTERN="$2"; shift 2 ;;
         --reset-app-stacks)             RESET_APP_STACKS=true; shift ;;
         --destroy)                      DESTROY=true; shift ;;
+        --use-pipeline-runner)          USE_PIPELINE_RUNNER=true; shift ;;
         -h|--help)                      usage; exit 0 ;;
         *)
             echo -e "${RED}Error: unknown option: $1${NC}"
@@ -889,8 +897,70 @@ deploy_api_service() {
           TRAINIUM_EDIT_MODEL_ID: $trainium_edit_model
         }')
 
-    run_task "$EC2_INSTANCE_ID" "$INFRA_DIR/tasks/voice-image-edit-api.json" "$vars_json" "voice-image-edit-api"
+    if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+        run_api_via_pipeline_runner "$vars_json"
+    else
+        run_task "$EC2_INSTANCE_ID" "$INFRA_DIR/tasks/voice-image-edit-api.json" "$vars_json" "voice-image-edit-api"
+    fi
     echo -e "${GREEN}[DONE] voice-image-edit-api.service is running on ${EC2_INSTANCE_ID}:${API_PORT}${NC}"
+}
+
+# -----------------------------------------------------------------------------
+# Drive the API deploy through the new tools/pipeline-runner.
+#
+# The legacy run_task path takes a JSON blob whose keys are the same task
+# variables we already build for the old runner. Here we pull those keys back
+# out (jq -r) and forward each one as a `-v K=V` flag to run-pipeline. This
+# keeps deploy.sh as the single source of truth for variable values - the
+# YAML pipeline lists them under `required_vars` and refuses to start if any
+# are missing, but it never carries default values itself.
+# -----------------------------------------------------------------------------
+run_api_via_pipeline_runner() {
+    local vars_json="$1"
+    local repo_root pipeline_yml runner_bin
+    repo_root="$(cd "$INFRA_DIR/../../../.." && pwd)"
+    runner_bin="$repo_root/tools/pipeline-runner/bin/run-pipeline"
+    pipeline_yml="$INFRA_DIR/pipelines/voice-image-edit-api.yml"
+
+    if [[ ! -x "$runner_bin" ]]; then
+        echo -e "${RED}[NG] pipeline runner not found at $runner_bin${NC}" >&2
+        exit 1
+    fi
+    if [[ ! -f "$pipeline_yml" ]]; then
+        echo -e "${RED}[NG] pipeline yml not found at $pipeline_yml${NC}" >&2
+        exit 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo -e "${RED}[NG] python3 is required for the pipeline runner${NC}" >&2
+        exit 1
+    fi
+
+    # `python3 -c 'import yaml'` rather than `pip install` ourselves, so we
+    # fail loud if PyYAML is missing instead of silently auto-installing.
+    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        echo -e "${RED}[NG] PyYAML missing. Install with: pip3 install --user pyyaml${NC}" >&2
+        exit 1
+    fi
+
+    # Build `-v K=V` args from the JSON blob. ``jq -r 'to_entries[] | "K=V"'``
+    # gives one line per pair; we read them with mapfile to keep quoting honest.
+    local var_args=()
+    local line
+    while IFS= read -r line; do
+        var_args+=("-v" "$line")
+    done < <(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<< "$vars_json")
+
+    echo -e "${BLUE}[INFO] running voice-image-edit-api.yml via pipeline-runner on ${EC2_INSTANCE_ID}${NC}"
+
+    # cd to the repo root so .runner-state/ lands at a predictable spot. The
+    # runner anchors all state file paths to the current working directory.
+    (
+        cd "$repo_root"
+        "$runner_bin" run "$pipeline_yml" \
+            --instance "$EC2_INSTANCE_ID" \
+            --region "$REGION" \
+            "${var_args[@]}"
+    )
 }
 
 # -----------------------------------------------------------------------------
