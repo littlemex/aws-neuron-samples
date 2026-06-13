@@ -1,0 +1,123 @@
+name: code-server-setup
+description: |
+  End-to-end installation and configuration of code-server, nginx, persistent
+  storage, and VS Code extensions on a Neuron DLAMI instance.
+
+vars:
+  USER: "coder"
+  HOME_DIR: "/work"
+  INTERNAL_PORT: "8080"
+  NGINX_PORT: "80"
+  EFS_SUBPATH: "/neuron-workspace"
+  INSTALL_CLAUDE_CODE: "no"
+
+required_vars:
+  - PASSWORD
+  - EFS_ID
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-setup-persistence
+    timeout: 10m
+    script: scripts/00-setup-persistence.sh
+
+  - id: 01-configure-needrestart
+    needs: [00-setup-persistence]
+    timeout: 30s
+    script: scripts/01-configure-needrestart.sh
+
+  - id: 02-cleanup-neuron-repo
+    needs: [01-configure-needrestart]
+    timeout: 30s
+    script: scripts/02-cleanup-neuron-repo.sh
+
+  - id: 03-wait-for-dpkg-lock
+    needs: [02-cleanup-neuron-repo]
+    timeout: 10m
+    script: scripts/03-wait-for-dpkg-lock.sh
+
+  - id: 04-install-base-packages
+    needs: [03-wait-for-dpkg-lock]
+    timeout: 30m
+    script: scripts/04-install-base-packages.sh
+
+  - id: 05-create-user
+    needs: [04-install-base-packages]
+    timeout: 1m
+    script: scripts/05-create-user.sh
+
+  - id: 06-configure-sudo
+    needs: [05-create-user]
+    timeout: 30s
+    script: scripts/06-configure-sudo.sh
+
+  - id: 07-create-home-dir
+    needs: [06-configure-sudo]
+    timeout: 30s
+    script: scripts/07-create-home-dir.sh
+
+  - id: 08-configure-profile
+    needs: [07-create-home-dir]
+    timeout: 1m
+    script: scripts/08-configure-profile.sh
+
+  - id: 09-install-code-server
+    needs: [08-configure-profile]
+    timeout: 10m
+    script: scripts/09-install-code-server.sh
+
+  - id: 10-configure-code-server
+    needs: [09-install-code-server]
+    timeout: 1m
+    script: scripts/10-configure-code-server.sh
+
+  - id: 11-configure-vscode-settings
+    needs: [10-configure-code-server]
+    timeout: 1m
+    script: scripts/11-configure-vscode-settings.sh
+
+  - id: 12-configure-nginx
+    needs: [11-configure-vscode-settings]
+    timeout: 5m
+    script: scripts/12-configure-nginx.sh
+
+  - id: 13-create-systemd-service
+    needs: [12-configure-nginx]
+    timeout: 1m
+    script: scripts/13-create-systemd-service.sh
+
+  - id: 14-enable-and-start-service
+    needs: [13-create-systemd-service]
+    timeout: 5m
+    script: scripts/14-enable-and-start-service.sh
+
+  - id: 15-install-vscode-extensions
+    needs: [14-enable-and-start-service]
+    timeout: 10m
+    script: scripts/15-install-vscode-extensions.sh
+
+  - id: 16-create-code-command
+    needs: [15-install-vscode-extensions]
+    timeout: 1m
+    script: scripts/16-create-code-command.sh
+
+  - id: 17-install-docker
+    needs: [16-create-code-command]
+    timeout: 10m
+    script: scripts/17-install-docker.sh
+
+  - id: 18-install-claude-code
+    needs: [17-install-docker]
+    timeout: 30m
+    script: scripts/18-install-claude-code.sh
+
+  - id: 19-verify-installation
+    needs: [18-install-claude-code]
+    timeout: 5m
+    script: scripts/19-verify-installation.sh

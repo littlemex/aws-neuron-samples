@@ -1,0 +1,78 @@
+name: xttsv2-precompile
+description: |
+  Compile XTTSv2 GPT (Prefill + Decode) inside an AWS Neuron Deep Learning Container.
+  SDK 2.28 is pinned due to a compiler bug in 2.30. Idempotent via .compile_metadata.json
+  presence check; FORCE_RECOMPILE=true overrides the cache.
+
+vars:
+  MODEL_ID: "tts_models/multilingual/multi-dataset/xtts_v2"
+  XTTS_MODEL_DIR: "/models/XTTS-v2"
+  COMPILED_MODEL_PATH: "/models/xttsv2-neuron-nxd"
+  TP_DEGREE: "4"
+  SEQ_LEN: "1081"
+  NEURON_CORES: "0-3"
+  DLC_IMAGE: "public.ecr.aws/neuron/pytorch-inference-neuronx:2.9.0-neuronx-py312-sdk2.28.0-ubuntu24.04"
+  WORK_DIR: "/opt/voice-image-edit/xttsv2-compile"
+  SWAP_FILE: "/swapfile-xttsv2"
+  SWAP_SIZE_GB: "16"
+  FORCE_RECOMPILE: "false"
+
+required_vars:
+  - SOURCE_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 05-ensure-swap
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/05-ensure-swap.sh
+
+  - id: 10-pull-image
+    needs: [05-ensure-swap]
+    timeout: 30m
+    script: scripts/10-pull-image.sh
+    fingerprint_inputs:
+      - "{{DLC_IMAGE}}"
+
+  - id: 20-skip-if-cached
+    needs: [10-pull-image]
+    timeout: 30s
+    script: scripts/20-skip-if-cached.sh
+
+  - id: 25-fetch-source
+    needs: [20-skip-if-cached]
+    timeout: 5m
+    script: scripts/25-fetch-source.sh
+    fingerprint_inputs:
+      - "{{SOURCE_TARBALL_URL}}"
+
+  - id: 30-fetch-checkpoint
+    needs: [25-fetch-source]
+    timeout: 30m
+    script: scripts/30-fetch-checkpoint.sh
+    fingerprint_inputs:
+      - "{{MODEL_ID}}"
+
+  - id: 40-compile
+    needs: [30-fetch-checkpoint]
+    timeout: 2h
+    script: scripts/40-compile.sh
+    fingerprint_inputs:
+      - "{{SOURCE_TARBALL_URL}}"
+      - "{{MODEL_ID}}"
+      - "{{DLC_IMAGE}}"
+
+  - id: 50-verify
+    needs: [40-compile]
+    timeout: 30s
+    script: scripts/50-verify.sh

@@ -1,0 +1,64 @@
+name: neuron-anatomy-server
+description: |
+  Deploys the neuron-anatomy backend (FastAPI/uvicorn) as a systemd unit on the
+  existing trn2 host. Listens on port 8810; exposes /health and /neuron/*
+  (topology, snapshot, SSE stream). Source tarball is fetched from a presigned
+  S3 URL. Idempotent.
+
+vars:
+  SERVE_DIR: /opt/neuron-anatomy
+  SERVE_USER: ubuntu
+  ANATOMY_PORT: "8810"
+  VENV: /opt/neuron-anatomy/venv
+  NEURON_MONITOR_BIN: /opt/aws/neuron/bin/neuron-monitor
+  NEURON_LS_BIN: /opt/aws/neuron/bin/neuron-ls
+  NEURON_MONITOR_PERIOD_S: "1"
+
+required_vars:
+  - SOURCE_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 5m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{SOURCE_TARBALL_URL}}"
+
+  - id: 30-create-venv
+    needs: [20-deploy-tarball]
+    timeout: 5m
+    script: scripts/30-create-venv.sh
+
+  - id: 40-install-systemd-unit
+    needs: [30-create-venv]
+    timeout: 1m
+    script: scripts/40-install-systemd-unit.sh
+
+  - id: 50-enable-start
+    needs: [40-install-systemd-unit]
+    timeout: 30s
+    script: scripts/50-enable-start.sh
+
+  - id: 60-health-check
+    needs: [50-enable-start]
+    timeout: 1m
+    retries: 30
+    retry_delay: 1s
+    script: scripts/60-health-check.sh

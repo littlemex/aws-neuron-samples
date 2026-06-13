@@ -1,0 +1,71 @@
+name: whisper-nxd-server
+description: |
+  Deploys whisper_server_nxd.py as a systemd service (whisper-server-nxd.service) on EC2.
+  Requires pre-compiled NxD artifacts from whisper-nxd-precompile. Serves HTTP POST
+  /transcribe on PORT using NEURON_RT_VISIBLE_CORES=NEURON_CORES (default 8-15, TP=8 LNC=1).
+
+vars:
+  SERVE_DIR: "/opt/voice-image-edit/whisper-nxd-server"
+  SERVE_USER: "ubuntu"
+  PORT: "8765"
+  PATH_PREFIX: "/whisper-neuron"
+  MODEL_DIR: "/models/whisper-large-v3-neuron-nxd"
+  HF_HOME: "/models/hf-cache"
+  WHISPER_LANGUAGE: "ja"
+  NEURON_CORES: "8-15"
+  NEURON_RT_NUM_CORES: "8"
+  VENV: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference"
+
+required_vars:
+  - SERVER_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 5m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{SERVER_TARBALL_URL}}"
+
+  - id: 30-install-deps
+    needs: [20-deploy-tarball]
+    timeout: 30m
+    script: scripts/30-install-deps.sh
+
+  - id: 40-install-systemd-unit
+    needs: [30-install-deps]
+    timeout: 1m
+    script: scripts/40-install-systemd-unit.sh
+
+  - id: 45-disable-legacy-unit
+    needs: [40-install-systemd-unit]
+    timeout: 30s
+    script: scripts/45-disable-legacy-unit.sh
+
+  - id: 50-enable-start
+    needs: [45-disable-legacy-unit]
+    timeout: 30s
+    script: scripts/50-enable-start.sh
+
+  - id: 60-health-check
+    needs: [50-enable-start]
+    timeout: 15m
+    retries: 2
+    retry_delay: 30s
+    script: scripts/60-health-check.sh

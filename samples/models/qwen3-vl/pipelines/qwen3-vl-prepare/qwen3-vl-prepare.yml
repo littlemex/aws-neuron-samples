@@ -1,0 +1,53 @@
+name: qwen3-vl-prepare
+description: |
+  Downloads Qwen/Qwen3-VL-8B-Instruct from Hugging Face to MODEL_DIR on a
+  trn2.48xlarge, then performs a one-shot vLLM warm-up (NeuronCore 16-31,
+  TP=16) to populate the Neuron compile cache. Idempotent via a marker file.
+
+vars:
+  MODEL_ID: "Qwen/Qwen3-VL-8B-Instruct"
+  MODEL_DIR: "/models/Qwen3-VL-8B-Instruct"
+  VENV: "/opt/aws_neuronx_venv_pytorch_inference_vllm_0_16"
+  NEURON_CORES: "16-31"
+  PORT: "8090"
+  WARMUP_MARKER: "/models/Qwen3-VL-8B-Instruct/.neuron_warmup_done"
+  FORCE_REWARMUP: "false"
+
+required_vars: []
+
+defaults:
+  timeout: 30s
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-download-model
+    needs: [00-precheck]
+    timeout: 30m
+    script: scripts/10-download-model.sh
+    fingerprint_inputs:
+      - "{{MODEL_ID}}"
+      - "{{MODEL_DIR}}"
+
+  - id: 20-skip-if-warmed
+    needs: [10-download-model]
+    timeout: 30s
+    script: scripts/20-skip-if-warmed.sh
+    fingerprint_inputs:
+      - "{{WARMUP_MARKER}}"
+      - "{{FORCE_REWARMUP}}"
+
+  - id: 30-warmup
+    needs: [20-skip-if-warmed]
+    timeout: 2h
+    script: scripts/30-warmup.sh
+    fingerprint_inputs:
+      - "{{MODEL_DIR}}"
+      - "{{NEURON_CORES}}"
+      - "{{PORT}}"

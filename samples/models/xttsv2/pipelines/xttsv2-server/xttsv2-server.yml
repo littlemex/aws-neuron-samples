@@ -1,0 +1,96 @@
+name: xttsv2-server
+description: |
+  Deploys xttsv2_server.py inside an AWS Neuron DLC managed by a systemd unit.
+  Builds a runtime Docker image on top of the public Neuron DLC (SDK 2.28 pinned),
+  installs a systemd unit that runs `docker run --device /dev/neuron0`, and verifies
+  the /health endpoint. Requires compiled artefacts from xttsv2-precompile.
+
+vars:
+  SERVE_DIR: /opt/voice-image-edit/xttsv2-server
+  SERVE_USER: ubuntu
+  PORT: "8770"
+  COMPILED_MODEL_PATH: /models/xttsv2-neuron-nxd
+  XTTS_MODEL_DIR: /models/XTTS-v2
+  XTTSV2_VOICES_DIR: /models/xttsv2-voices
+  XTTSV2_DEFAULT_VOICE: default
+  XTTSV2_LANGUAGE: ja
+  TP_DEGREE: "4"
+  NEURON_CORES: "0-3"
+  DLC_IMAGE: "public.ecr.aws/neuron/pytorch-inference-neuronx:2.9.0-neuronx-py312-sdk2.28.0-ubuntu24.04"
+  RUNTIME_IMAGE: "xttsv2-server:sdk2.28.0-ja"
+  XTTSV2_REFERENCE_VOICE_ID: Tomoko
+  XTTSV2_REFERENCE_VOICE_REGION: us-east-1
+  XTTSV2_REFERENCE_VOICE_TEXT: "これはトレーニウム上で動く XTTSv2 のサンプルボイスです。声色は Amazon Polly の日本語音声をクローン元として複製しています。"
+
+required_vars:
+  - SOURCE_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 5m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{SOURCE_TARBALL_URL}}"
+
+  - id: 25-ensure-voices-dir
+    needs: [20-deploy-tarball]
+    timeout: 30s
+    script: scripts/25-ensure-voices-dir.sh
+
+  - id: 27-fetch-default-voice
+    needs: [25-ensure-voices-dir]
+    timeout: 5m
+    script: scripts/27-fetch-default-voice.sh
+    fingerprint_inputs:
+      - "{{XTTSV2_REFERENCE_VOICE_ID}}"
+      - "{{XTTSV2_REFERENCE_VOICE_REGION}}"
+      - "{{XTTSV2_REFERENCE_VOICE_TEXT}}"
+
+  - id: 30-pull-base-image
+    needs: [27-fetch-default-voice]
+    timeout: 30m
+    script: scripts/30-pull-base-image.sh
+    fingerprint_inputs:
+      - "{{DLC_IMAGE}}"
+
+  - id: 35-build-runtime-image
+    needs: [30-pull-base-image]
+    timeout: 30m
+    script: scripts/35-build-runtime-image.sh
+    fingerprint_inputs:
+      - "{{DLC_IMAGE}}"
+      - "{{RUNTIME_IMAGE}}"
+
+  - id: 40-install-systemd-unit
+    needs: [35-build-runtime-image]
+    timeout: 1m
+    script: scripts/40-install-systemd-unit.sh
+
+  - id: 50-enable-start
+    needs: [40-install-systemd-unit]
+    timeout: 30s
+    script: scripts/50-enable-start.sh
+
+  - id: 60-health-check
+    needs: [50-enable-start]
+    timeout: 10m
+    retries: 120
+    retry_delay: 5s
+    script: scripts/60-health-check.sh

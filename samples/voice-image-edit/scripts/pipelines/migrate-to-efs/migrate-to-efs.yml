@@ -1,0 +1,54 @@
+name: migrate-to-efs
+description: |
+  Migrates existing model artifacts from NVMe / root fs to EFS for the first
+  time on a live EC2 that has already run compile / HF downloads. Assumes EFS
+  is already mounted at /mnt/efs and each canonical path exists as a real
+  directory (not yet a symlink). After this pipeline completes, run
+  setup-efs-paths to flip symlinks.
+
+vars:
+  EFS_ROOT: /mnt/efs/neuron-workspace
+  MODELS_DIR_NAME: models
+  VIE_DIR_NAME: voice-image-edit
+
+defaults:
+  timeout: 30m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-mkdir-efs
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-mkdir-efs.sh
+
+  - id: 20-rsync-models
+    needs: [10-mkdir-efs]
+    timeout: 30m
+    script: scripts/20-rsync-models.sh
+
+  - id: 30-rsync-compiled-models
+    needs: [20-rsync-models]
+    timeout: 30m
+    script: scripts/30-rsync-compiled-models.sh
+
+  - id: 40-rsync-hf-cache
+    needs: [30-rsync-compiled-models]
+    timeout: 30m
+    script: scripts/40-rsync-hf-cache.sh
+
+  - id: 50-rsync-voice-image-edit
+    needs: [40-rsync-hf-cache]
+    timeout: 30m
+    script: scripts/50-rsync-voice-image-edit.sh
+
+  - id: 60-summary
+    needs: [50-rsync-voice-image-edit]
+    timeout: 30s
+    script: scripts/60-summary.sh

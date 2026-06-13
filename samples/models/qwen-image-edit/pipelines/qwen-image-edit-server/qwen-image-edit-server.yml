@@ -1,0 +1,73 @@
+name: qwen-image-edit-server
+description: |
+  Deploys Qwen-Image-Edit-2511 serve.py (FastAPI multipart /infer) as a
+  systemd service on EC2. Requires compiled V3 TP16 artifacts under
+  COMPILED_MODELS_DIR (produced by qwen-image-edit-prepare pipeline).
+  NeuronCore 32-63 (TP=16 DP=2 world_size=32), port PORT.
+
+vars:
+  SERVE_DIR: /opt/voice-image-edit/qwen-image-edit-server
+  SERVE_USER: ubuntu
+  PORT: "8081"
+  HOST: 0.0.0.0
+  COMPILED_MODELS_DIR: /mnt/local/compiled_models_tp16
+  HEIGHT: "1024"
+  WIDTH: "1024"
+  PATCH_MULTIPLIER: "3"
+  NEURON_CORES: 32-63
+  WORLD_SIZE: "32"
+  PATH_PREFIX: /qwen-image-edit
+  VENV: /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference
+  HF_HOME_DIR: /models/hf-cache
+  HF_CACHE_DIR: /models/hf-cache/hub
+  VTON_S3_MODELS_REGION: ""
+  VTON_S3_MODELS_URI: ""
+
+required_vars:
+  - SOURCE_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 5m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{SOURCE_TARBALL_URL}}"
+
+  - id: 30-install-deps
+    needs: [20-deploy-tarball]
+    timeout: 5m
+    script: scripts/30-install-deps.sh
+
+  - id: 40-install-systemd-unit
+    needs: [30-install-deps]
+    timeout: 30s
+    script: scripts/40-install-systemd-unit.sh
+
+  - id: 50-enable-start
+    needs: [40-install-systemd-unit]
+    timeout: 30s
+    script: scripts/50-enable-start.sh
+
+  - id: 60-health-check
+    needs: [50-enable-start]
+    timeout: 30m
+    retries: 150
+    retry_delay: 10s
+    script: scripts/60-health-check.sh

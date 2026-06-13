@@ -920,7 +920,7 @@ run_api_via_pipeline_runner() {
     local repo_root pipeline_yml runner_bin
     repo_root="$(cd "$INFRA_DIR/../../../.." && pwd)"
     runner_bin="$repo_root/tools/pipeline-runner/bin/run-pipeline"
-    pipeline_yml="$INFRA_DIR/pipelines/voice-image-edit-api.yml"
+    pipeline_yml="$INFRA_DIR/pipelines/voice-image-edit-api/voice-image-edit-api.yml"
 
     if [[ ! -x "$runner_bin" ]]; then
         echo -e "${RED}[NG] pipeline runner not found at $runner_bin${NC}" >&2
