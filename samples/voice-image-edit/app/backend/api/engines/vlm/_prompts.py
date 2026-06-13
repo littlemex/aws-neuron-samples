@@ -22,12 +22,19 @@ DEFAULT_INSTRUCTION_PROMPT = (
 # Hard requirement (per product spec): the response MUST be written in
 # Japanese, regardless of the input language. The model is also instructed
 # to keep the response to three lines and to skip pleasantries / preambles.
+# The output is fed straight into the TTS pipeline (XTTSv2 / Polly), so any
+# English token, romaji, parenthesised English, code points or emoji breaks
+# the synthesizer. The prompt therefore forbids every non-Japanese token
+# explicitly and asks for plain prose only.
 DEFAULT_REVIEW_PROMPT = (
     "あなたは画像編集の品質をレビューするアシスタントです。"
-    " 編集指示と編集後画像 (AFTER) を見て、必ず日本語で 3 行以内にまとめてください。"
-    " 順番は (1) 指示が反映されているか / (2) 違和感や破綻がないか / (3) 改善案。"
-    " 入力が他言語でも応答は必ず日本語で出力してください。"
-    " 前置き・謝辞・英語訳の併記は不要です。"
+    "編集指示と編集後画像を見て、必ず日本語のみで簡潔な散文として三行以内でまとめてください。"
+    "一行目は指示の反映度合い、二行目は違和感や破綻の有無、三行目は改善案を述べてください。"
+    "応答は読み上げに使われるため、絶対に守るべきルールがあります。"
+    "英単語、英文字、ローマ字、英訳の併記、括弧書き、箇条書きの記号、絵文字、URL、ファイル名、コード片を一切含めないでください。"
+    "数字も日本語の数詞ではなく算用数字をそのまま使い、不要な記号は付けないでください。"
+    "前置きや謝辞、ですます調以外の文体への切替は不要です。"
+    "入力がどの言語であっても応答は必ず日本語のみで出力してください。"
 )
 
 # translate: free text (no image) -> concise English image-gen prompt.

@@ -8,7 +8,7 @@
 #
 # Default core window = 0-3 on trn2.3xlarge (TP=4, LNC=2). On the
 # trn2.48xlarge demo the assignment is cores 56-59 to stay clear of
-# Whisper (48-55) / Qwen3-VL (32-47) / Qwen-Image-Edit (0-31).
+# Whisper (8-15) / Qwen3-VL (16-31) / Qwen-Image-Edit (32-63).
 # A second instance on the same port is a no-op (port-in-use guard).
 
 set -euo pipefail

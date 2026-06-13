@@ -1,6 +1,6 @@
 {
   "name": "XTTSv2 NxD Inference server (DLC, HTTP /synthesize)",
-  "description": "Run xttsv2_server.py inside an AWS Neuron DLC managed by a systemd unit. The unit invokes `docker run --rm --device /dev/neuron0 ...` against an image built locally on top of public.ecr.aws/neuron/pytorch-inference-neuronx:2.9.0-neuronx-py312-sdk2.28.0-ubuntu24.04 (Dockerfile.server). SDK 2.28 is pinned because newer SDKs hit NCC_IXRO002 on this model. Listens on port {{PORT}} with the TrainiumTtsEngine wire contract (POST /synthesize) plus GET /health. NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} (default 0-3 on trn2.3xlarge; on trn2.48xlarge override to 56-59 to stay clear of Whisper at 48-55 / Qwen3-VL at 32-47 / Qwen-Image-Edit at 0-31).",
+  "description": "Run xttsv2_server.py inside an AWS Neuron DLC managed by a systemd unit. The unit invokes `docker run --rm --device /dev/neuron0 ...` against an image built locally on top of public.ecr.aws/neuron/pytorch-inference-neuronx:2.9.0-neuronx-py312-sdk2.28.0-ubuntu24.04 (Dockerfile.server). SDK 2.28 is pinned because newer SDKs hit NCC_IXRO002 on this model. Listens on port {{PORT}} with the TrainiumTtsEngine wire contract (POST /synthesize) plus GET /health. NEURON_RT_VISIBLE_CORES={{NEURON_CORES}} (default 0-3 on both trn2.3xlarge and trn2.48xlarge (uses NeuronDevice 0). The other model servers are placed at 8-15 (Whisper), 16-31 (Qwen3-VL), 32-63 (Qwen-Image-Edit) so the layout is fully non-overlapping).",
   "variables": {
     "SOURCE_TARBALL_URL": "",
     "SERVE_DIR": "/opt/voice-image-edit/xttsv2-server",
@@ -89,13 +89,13 @@
         "REF_DIR={{XTTSV2_VOICES_DIR}}/{{XTTSV2_DEFAULT_VOICE}}",
         "REF_WAV=$REF_DIR/reference.wav",
         "if [ -f \"$REF_WAV\" ]; then echo '[OK] reference.wav already exists, skip'; exit 0; fi",
-        "command -v ffmpeg >/dev/null || { echo '[INFO] installing ffmpeg'; DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -y -qq ffmpeg; }",
+        "if ! command -v ffmpeg >/dev/null; then echo '[INFO] installing ffmpeg'; DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg >/dev/null 2>&1 || { echo '[WARN] ffmpeg install failed; skipping default voice seed (server falls back to built-in speaker)'; exit 0; }; fi",
         "TMP_MP3=$(mktemp /tmp/xttsv2-ref.XXXXXX.mp3)",
         "trap 'rm -f $TMP_MP3' EXIT",
-        "aws polly synthesize-speech --region {{XTTSV2_REFERENCE_VOICE_REGION}} --engine neural --voice-id {{XTTSV2_REFERENCE_VOICE_ID}} --language-code ja-JP --output-format mp3 --text '{{XTTSV2_REFERENCE_VOICE_TEXT}}' \"$TMP_MP3\" >/dev/null",
-        "test -s \"$TMP_MP3\" || { echo '[NG] Polly produced empty mp3'; exit 1; }",
+        "if ! aws polly synthesize-speech --region {{XTTSV2_REFERENCE_VOICE_REGION}} --engine neural --voice-id {{XTTSV2_REFERENCE_VOICE_ID}} --language-code ja-JP --output-format mp3 --text '{{XTTSV2_REFERENCE_VOICE_TEXT}}' \"$TMP_MP3\" >/dev/null 2>&1; then echo '[WARN] Polly synthesize-speech failed (likely missing polly:SynthesizeSpeech on the instance role); skipping default voice seed (server falls back to built-in speaker)'; exit 0; fi",
+        "test -s \"$TMP_MP3\" || { echo '[WARN] Polly produced empty mp3; skipping'; exit 0; }",
         "ffmpeg -y -hide_banner -loglevel error -i \"$TMP_MP3\" -ar 24000 -ac 1 -c:a pcm_s16le \"$REF_WAV\"",
-        "test -s \"$REF_WAV\" || { echo '[NG] ffmpeg produced empty wav'; exit 1; }",
+        "test -s \"$REF_WAV\" || { echo '[WARN] ffmpeg produced empty wav; skipping'; exit 0; }",
         "chown -R {{SERVE_USER}}:{{SERVE_USER}} \"$REF_DIR\"",
         "echo \"[OK] reference.wav written: $(stat -c %s \"$REF_WAV\") bytes\""
       ]
@@ -178,13 +178,17 @@
     },
     {
       "id": "50-enable-start",
-      "name": "daemon-reload + enable + start xttsv2-server",
-      "description": "Reload systemd and bring the service up.",
+      "name": "daemon-reload + enable + start xttsv2-server (stop then start, not restart)",
+      "description": "Reload systemd and bring the service up. restart は unit file を変更した直後に古い unit で再起動するケースがあり、それで 60-health-check が timeout する事故が再現した。必ず stop してから start する。最後に is-active で状態確認。",
       "commands": [
         "set -e",
         "systemctl daemon-reload",
         "systemctl enable xttsv2-server.service",
-        "systemctl restart xttsv2-server.service",
+        "systemctl stop xttsv2-server.service 2>/dev/null || true",
+        "systemctl reset-failed xttsv2-server.service 2>/dev/null || true",
+        "systemctl start xttsv2-server.service",
+        "for i in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active xttsv2-server.service >/dev/null 2>&1 && break; sleep 1; done",
+        "systemctl is-active xttsv2-server.service >/dev/null 2>&1 || { echo '[NG] service did not become active'; systemctl status xttsv2-server.service --no-pager | head -20; journalctl -u xttsv2-server.service -n 30 --no-pager; exit 1; }",
         "echo '[OK] service started'"
       ]
     },
