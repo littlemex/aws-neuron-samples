@@ -64,6 +64,10 @@ SKIP_STEPS=""
 ONLY_STEPS=""
 INTEGRATE_VIE=false
 DRY_RUN=false
+# When true, the backend systemd deploy is dispatched through
+# tools/pipeline-runner instead of the legacy run-tasks.sh. The CDK
+# steps are unaffected. Same flag name as deploy-all.sh / app/infra/deploy.sh.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
 
 ALL_STEPS=(precheck backend infra integrate)
 
@@ -76,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --only)            ONLY_STEPS="$2"; shift 2 ;;
         --integrate-voice-image-edit) INTEGRATE_VIE=true; shift ;;
         --dry-run)         DRY_RUN=true; shift ;;
+        --use-pipeline-runner) USE_PIPELINE_RUNNER=true; shift ;;
         -h|--help)
             sed -n '1,30p' "$0"
             exit 0
@@ -256,14 +261,37 @@ stage_dir_to_s3() {
 }
 
 run_task_json() {
+    # Dispatch through the new pipeline-runner when USE_PIPELINE_RUNNER=true;
+    # otherwise keep using the legacy run-tasks.sh by sourcing the same
+    # helper deploy-all.sh uses.
     local task_file="$1" vars_json="${2:-{\}}" state_label="${3:-$(basename "$task_file" .json)}"
     local state_file="/tmp/task-state-${EC2_INSTANCE_ID}-${state_label}.json"
+
+    if ! declare -F pipeline_dispatch >/dev/null; then
+        local helper="$REPO_ROOT/tools/pipeline-runner/lib-sh/dispatch.sh"
+        if [[ ! -f "$helper" ]]; then
+            err "dispatch helper missing at $helper"
+            return 1
+        fi
+        export REPO_ROOT
+        # shellcheck disable=SC1090
+        source "$helper"
+    fi
+
+    local pipeline_name yml_path
+    pipeline_name="$(basename "$task_file" .json)"
+    yml_path="$(dirname "$(dirname "$task_file")")/pipelines/${pipeline_name}/${pipeline_name}.yml"
+
     if [[ "$DRY_RUN" == true ]]; then
-        log "[dry] $RUNNER -i $EC2_INSTANCE_ID -r $REGION -f $task_file -v '$vars_json' --state-file $state_file"
+        if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+            log "[dry] pipeline-runner: $yml_path on $EC2_INSTANCE_ID"
+        else
+            log "[dry] $RUNNER -i $EC2_INSTANCE_ID -r $REGION -f $task_file -v '$vars_json' --state-file $state_file"
+        fi
         return 0
     fi
-    log "running: $task_file (state=$state_file)"
-    "$RUNNER" -i "$EC2_INSTANCE_ID" -r "$REGION" -f "$task_file" -v "$vars_json" --state-file "$state_file"
+    log "running: $task_file (USE_PIPELINE_RUNNER=$USE_PIPELINE_RUNNER, state=$state_file)"
+    pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "$task_file" "$yml_path" "$vars_json" "$state_label"
 }
 
 # ---------------------------------------------------------------------------

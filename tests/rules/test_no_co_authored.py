@@ -51,9 +51,12 @@ def test_no_co_authored_by_in_branch_commits():
             continue
         sha = lines[0]
         body = "\n".join(lines[1:])
-        # Match case-insensitively; the policy applies regardless of case.
+        # A real Git trailer starts the line with `Co-authored-by:`. Only
+        # those count as policy violations; the substring may appear in
+        # body prose (test descriptions, README excerpts) without harm.
         for raw in body.splitlines():
-            if "co-authored-by:" in raw.strip().lower():
+            stripped = raw.lstrip()
+            if stripped.lower().startswith("co-authored-by:"):
                 bad.append(f"{sha[:12]}: {raw.strip()}")
 
     assert not bad, (

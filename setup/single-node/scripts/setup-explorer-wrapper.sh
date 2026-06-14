@@ -45,6 +45,8 @@ Options:
         --start-from TASK_ID            Resume from the specified task ID
         --clean-state                   Clear state file and run from start
         --dry-run                       Print plan only, do not execute
+        --use-pipeline-runner           Dispatch through tools/pipeline-runner
+                                        instead of the legacy run-tasks.sh.
     -h, --help                          Show this help
 
 Examples:
@@ -64,6 +66,7 @@ NGINX_LOCATION="/explorer"
 START_FROM=""
 CLEAN_STATE=false
 DRY_RUN=false
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -78,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --start-from) START_FROM="$2"; shift 2 ;;
         --clean-state) CLEAN_STATE=true; shift ;;
         --dry-run) DRY_RUN=true; shift ;;
+        --use-pipeline-runner) USE_PIPELINE_RUNNER=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
     esac
@@ -174,14 +178,32 @@ print(json.dumps({
 }))
 ")
 
-RUN_TASKS_ARGS=(
-    -i "$INSTANCE_ID"
-    -r "$REGION"
-    -f "$TASK_FILE"
-    -v "$VARIABLES_JSON"
-)
-[[ -n "$START_FROM" ]] && RUN_TASKS_ARGS+=(--start-from "$START_FROM")
-[[ "$CLEAN_STATE" == true ]] && RUN_TASKS_ARGS+=(--clean-state)
-[[ "$DRY_RUN" == true ]]    && RUN_TASKS_ARGS+=(--dry-run)
+REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+DISPATCH_HELPER="$REPO_ROOT/tools/pipeline-runner/lib-sh/dispatch.sh"
+if [[ ! -f "$DISPATCH_HELPER" ]]; then
+    echo "Error: dispatch helper missing at $DISPATCH_HELPER"
+    exit 1
+fi
+export REPO_ROOT
+# shellcheck disable=SC1090
+source "$DISPATCH_HELPER"
 
-bash "$SCRIPT_DIR/run-tasks.sh" "${RUN_TASKS_ARGS[@]}"
+PIPELINE_NAME="$(basename "$TASK_FILE" .json)"
+NEW_YML="$PROJECT_DIR/pipelines/${PIPELINE_NAME}/${PIPELINE_NAME}.yml"
+
+if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+    if [[ -n "$START_FROM" || "$CLEAN_STATE" == "true" || "$DRY_RUN" == "true" ]]; then
+        echo "[INFO] --start-from / --clean-state / --dry-run on the new runner: invoke run-pipeline directly with rerun --from / --force-all / --dry-run against $NEW_YML for fine control."
+    fi
+fi
+
+if [[ "$DRY_RUN" == "true" && "$USE_PIPELINE_RUNNER" != "true" ]]; then
+    bash "$SCRIPT_DIR/run-tasks.sh" -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON" --dry-run
+elif [[ "$USE_PIPELINE_RUNNER" != "true" && (-n "$START_FROM" || "$CLEAN_STATE" == "true") ]]; then
+    RUN_TASKS_ARGS=( -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON" )
+    [[ -n "$START_FROM" ]] && RUN_TASKS_ARGS+=(--start-from "$START_FROM")
+    [[ "$CLEAN_STATE" == "true" ]] && RUN_TASKS_ARGS+=(--clean-state)
+    bash "$SCRIPT_DIR/run-tasks.sh" "${RUN_TASKS_ARGS[@]}"
+else
+    pipeline_dispatch "$INSTANCE_ID" "$REGION" "$TASK_FILE" "$NEW_YML" "$VARIABLES_JSON" "$PIPELINE_NAME"
+fi
