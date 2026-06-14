@@ -35,12 +35,12 @@ tasks:
 
   - id: 30-rsync-compiled-models
     needs: [20-rsync-models]
-    timeout: 30m
+    timeout: 1h
     script: scripts/30-rsync-compiled-models.sh
 
   - id: 40-rsync-hf-cache
     needs: [30-rsync-compiled-models]
-    timeout: 30m
+    timeout: 90m
     script: scripts/40-rsync-hf-cache.sh
 
   - id: 50-rsync-voice-image-edit

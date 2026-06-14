@@ -40,9 +40,7 @@ class BedrockAsrEngine(AsrEngine):
         engine_name: str | None = None,
     ) -> None:
         self.region = env_required("BEDROCK_REGION", "AWS_REGION")
-        self.backend = backend or os.environ.get(
-            "BEDROCK_ASR_BACKEND", "transcribe"
-        )
+        self.backend = backend or os.environ.get("BEDROCK_ASR_BACKEND") or "transcribe"
         if self.backend not in {"transcribe", "nova_sonic"}:
             raise EngineError(
                 "config_missing",
@@ -56,9 +54,7 @@ class BedrockAsrEngine(AsrEngine):
         self.model_id = (
             "amazon.transcribe"
             if self.backend == "transcribe"
-            else os.environ.get(
-                "BEDROCK_NOVA_SONIC_MODEL_ID", "amazon.nova-sonic-v1:0"
-            )
+            else env_required("BEDROCK_NOVA_SONIC_MODEL_ID")
         )
 
     def invoke(self, req: AsrRequest) -> AsrResponse:

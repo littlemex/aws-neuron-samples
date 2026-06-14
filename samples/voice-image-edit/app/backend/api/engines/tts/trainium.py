@@ -39,7 +39,7 @@ class TrainiumTtsEngine(TtsEngine):
         # the operator can flip to it as soon as the server comes online,
         # without restarting the API.
         self.endpoint: Optional[str] = None
-        self.model_id = os.environ.get("TRAINIUM_TTS_MODEL_ID", "trainium-tts")
+        self.model_id = os.environ.get("TRAINIUM_TTS_MODEL_ID") or "trainium-tts"
         self.timeout = env_float("TRAINIUM_TTS_TIMEOUT_SECONDS", 60.0)
         self.api_key = os.environ.get("TRAINIUM_TTS_API_KEY")
         if engine_name:

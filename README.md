@@ -1,5 +1,32 @@
 # aws-neuron-samples
 
+## Running the test suite
+
+```
+make test            # all layers (unit + pipelines + rules), ~2 min
+make test-unit       # runner internals, ~12 s
+make test-pipelines  # YAML+bash static checks + dry-run, ~90 s
+make test-rules      # language / style / policy enforcement, < 1 s
+make test-fast       # everything except the per-pipeline dry-run
+```
+
+The repo policies that the tests enforce:
+
+- pipeline-runner sources are written in English (no CJK characters).
+- No emoji in committed sources; use `[OK]` / `[NG]` / `[WARN]` text tags.
+- No `Co-authored-by:` trailers on the working branch.
+- Engine code uses `env_required(...)` instead of `os.environ.get(K, default)`.
+- Every pipeline YAML's `required_vars` covers every `${VAR}` its scripts read.
+- `bash -n` on every committed pipeline script.
+- Server pipelines do not write to `/mnt/local/` (NVMe ephemeral).
+- Pipelines that write under `/models` or `/opt/voice-image-edit` guard the
+  symlink in their precheck task.
+
+See `tests/README.md` for the rationale behind each rule and how to add an
+exemption.
+
+---
+
 Reference infrastructure and tooling for building interactive development
 environments on [AWS Neuron](https://awsdocs-neuron.readthedocs-hosted.com/)
 accelerators (Trainium and Inferentia). The goal is to give researchers and

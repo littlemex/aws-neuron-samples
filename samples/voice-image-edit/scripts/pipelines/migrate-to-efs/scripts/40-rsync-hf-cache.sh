@@ -11,7 +11,7 @@ if [ -L "$SRC" ]; then echo '[OK] already symlinked'; exit 0; fi
 if [ -d "$SRC" ] && [ "$(ls -A "$SRC" 2>/dev/null)" ]; then
   mkdir -p "$TARGET"
   echo '[INFO] rsync (this can take ~15 min for ~110GB)'
-  rsync -a --info=stats2,progress2 "$SRC/" "$TARGET/"
+  rsync -a --partial --inplace --info=stats2,progress2 "$SRC/" "$TARGET/"
   echo '[OK] hf-cache rsync done'
 else
   echo '[INFO] hf-cache empty/missing, skip'

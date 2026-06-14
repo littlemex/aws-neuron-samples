@@ -66,6 +66,11 @@ server {
     location / {
         proxy_pass http://localhost:${INTERNAL_PORT}/;
     }
+
+    # Allow drop-in location blocks (e.g. explorer-location.conf) without
+    # touching this template.  Explorer and similar add-ons must write their
+    # nginx snippets to /etc/nginx/conf.d/ instead of patching this file.
+    include /etc/nginx/conf.d/*.conf;
 }
 EOF
 

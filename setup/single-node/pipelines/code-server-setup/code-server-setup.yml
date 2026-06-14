@@ -14,6 +14,10 @@ vars:
 required_vars:
   - PASSWORD
   - EFS_ID
+  # 00-setup-persistence reads AWS_REGION to compose the EFS DNS mount
+  # target. The script also has an IMDS fallback, but IMDSv2 is often
+  # blocked on bare-metal hosts so we make the value explicit here.
+  - AWS_REGION
 
 defaults:
   timeout: 5m

@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# NOTE: this script delegates to /tmp/setup-explorer.sh which is uploaded
+# by setup-explorer-wrapper.sh. The wrapper version of that script must
+# write its nginx include to /etc/nginx/conf.d/explorer-location.conf
+# rather than awk-patching /etc/nginx/sites-enabled/code-server in place.
+# Otherwise re-running code-server-setup overwrites the include silently.
+
 # Task: Install systemd unit, nginx fragment, and start the service
 # Description: Drops setup-explorer.sh on the instance and runs it.
 #   Re-runnable: the script is idempotent and patches

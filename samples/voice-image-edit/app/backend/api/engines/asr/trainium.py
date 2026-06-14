@@ -40,9 +40,7 @@ class TrainiumAsrEngine(AsrEngine):
         import os
 
         self.endpoint = env_required("TRAINIUM_ASR_URL")
-        self.model_id = os.environ.get(
-            "TRAINIUM_ASR_MODEL_ID", "openai/whisper-large-v3"
-        )
+        self.model_id = os.environ.get("TRAINIUM_ASR_MODEL_ID") or "openai/whisper-large-v3"
         self.timeout = env_float("TRAINIUM_ASR_TIMEOUT_SECONDS", 60.0)
         self._http = urllib3.PoolManager()
 

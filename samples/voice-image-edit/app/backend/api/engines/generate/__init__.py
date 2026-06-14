@@ -20,30 +20,21 @@ from engines.generate.dummy import DummyGenerateEngine
 
 def _bedrock_stability_ultra() -> ImageGenerateEngine:
     return StabilityBedrockGenerateEngine(
-        model_id=os.environ.get(
-            "BEDROCK_STABILITY_ULTRA_MODEL_ID",
-            "stability.stable-image-ultra-v1:1",
-        ),
+        model_id=os.environ.get("BEDROCK_STABILITY_ULTRA_MODEL_ID") or "stability.stable-image-ultra-v1:1",
         engine_name="bedrock_stability_ultra",
     )
 
 
 def _bedrock_stability_core() -> ImageGenerateEngine:
     return StabilityBedrockGenerateEngine(
-        model_id=os.environ.get(
-            "BEDROCK_STABILITY_CORE_MODEL_ID",
-            "stability.stable-image-core-v1:1",
-        ),
+        model_id=os.environ.get("BEDROCK_STABILITY_CORE_MODEL_ID") or "stability.stable-image-core-v1:1",
         engine_name="bedrock_stability_core",
     )
 
 
 def _bedrock_stability_sd35() -> ImageGenerateEngine:
     return StabilityBedrockGenerateEngine(
-        model_id=os.environ.get(
-            "BEDROCK_STABILITY_SD35_MODEL_ID",
-            "stability.sd3-5-large-v1:0",
-        ),
+        model_id=os.environ.get("BEDROCK_STABILITY_SD35_MODEL_ID") or "stability.sd3-5-large-v1:0",
         engine_name="bedrock_stability_sd35",
     )
 

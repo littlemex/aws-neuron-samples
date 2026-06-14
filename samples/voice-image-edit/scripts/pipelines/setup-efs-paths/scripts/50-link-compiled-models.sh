@@ -19,5 +19,27 @@ elif [ -d /mnt/local/compiled_models ]; then
   rmdir /mnt/local/compiled_models 2>/dev/null || rm -rf /mnt/local/compiled_models
 fi
 ln -sfn "${TARGET}" /mnt/local/compiled_models
+
+# /mnt/local lives on NVMe ephemeral storage and is wiped on every restart.
+# Install a oneshot systemd unit that replays the same ln -sfn at boot so the
+# symlink does not silently vanish across stop+start.
+cat > /etc/systemd/system/restore-nvme-symlinks.service <<EOF
+[Unit]
+Description=Recreate NVMe symlinks under /mnt/local after every boot
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'mkdir -p /mnt/local && ln -sfn ${TARGET} /mnt/local/compiled_models'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now restore-nvme-symlinks.service
+
 ls -ld /mnt/local/compiled_models
 echo '[OK] /mnt/local/compiled_models -> EFS'

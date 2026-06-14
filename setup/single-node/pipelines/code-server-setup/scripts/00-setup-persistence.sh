@@ -21,11 +21,11 @@ export EFS_ID EFS_SUBPATH CODE_USER HOME_DIR NEFF_RESTORE_FROM_EFS AWS_REGION
 bash /tmp/setup-persistence-full.sh
 PERSIST_SCRIPT_EOF
 
-# The full script body is transferred to the instance by setup-code-server.sh
-# (the preamble in setup-code-server.sh uploads /tmp/setup-persistence-full.sh)
 if [ ! -f /tmp/setup-persistence-full.sh ]; then
-  echo 'ERROR: /tmp/setup-persistence-full.sh not found on instance'
-  echo 'setup-code-server.sh must upload it before this task runs'
+  echo '[NG] /tmp/setup-persistence-full.sh not found.'
+  echo '     This pipeline currently relies on the legacy setup-code-server.sh wrapper'
+  echo '     to upload that file via SSM. Until the upload step is moved into the'
+  echo '     pipeline itself, code-server-setup must be invoked through the wrapper.'
   exit 1
 fi
 bash /tmp/setup-persistence.sh

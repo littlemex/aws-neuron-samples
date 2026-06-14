@@ -9,8 +9,8 @@ timeout=300
 elapsed=0
 while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
   if [ $elapsed -ge $timeout ]; then
-    echo 'Timeout waiting for dpkg lock'
-    break
+    echo '[NG] dpkg-lock did not release in time'
+    exit 1
   fi
   echo "Waiting for dpkg lock... ($elapsed seconds)"
   sleep 5

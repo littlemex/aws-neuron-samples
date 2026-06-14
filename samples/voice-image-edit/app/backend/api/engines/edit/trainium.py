@@ -57,8 +57,8 @@ class TrainiumEditEngine(ImageEditEngine):
             fallback=("TRAINIUM_TIMEOUT_SECONDS",),
         )
         self.default_negative_prompt = os.environ.get(
-            "TRAINIUM_EDIT_NEGATIVE_PROMPT_DEFAULT", _DEFAULT_NEGATIVE_PROMPT
-        )
+            "TRAINIUM_EDIT_NEGATIVE_PROMPT_DEFAULT"
+        ) or _DEFAULT_NEGATIVE_PROMPT
         self.num_inference_steps = env_int("TRAINIUM_EDIT_NUM_INFERENCE_STEPS", 50)
         self.true_cfg_scale = env_float("TRAINIUM_EDIT_TRUE_CFG_SCALE", 3.0)
         self._http = urllib3.PoolManager(
