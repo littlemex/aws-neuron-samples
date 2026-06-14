@@ -51,14 +51,10 @@ class TrainiumVlmEngine(VlmEngine):
 
     def __init__(self) -> None:
         self.endpoint = env_required("TRAINIUM_VLM_URL")
-        self.model_id = os.environ.get(
-            "TRAINIUM_VLM_MODEL_ID", "Qwen/Qwen3-VL-8B-Instruct"
-        )
+        self.model_id = os.environ.get("TRAINIUM_VLM_MODEL_ID") or "Qwen/Qwen3-VL-8B-Instruct"
         self.timeout = env_float("TRAINIUM_VLM_TIMEOUT_SECONDS", 300.0)
         self.api_key = os.environ.get("TRAINIUM_VLM_API_KEY")
-        self.strip_thinking = os.environ.get(
-            "TRAINIUM_VLM_STRIP_THINKING", "1"
-        ).strip() not in {"0", "false", "False", ""}
+        self.strip_thinking = (os.environ.get("TRAINIUM_VLM_STRIP_THINKING") or "true").strip() not in {"0", "false", "False", ""}
         self._http = urllib3.PoolManager()
 
     def invoke(self, req: VlmRequest) -> VlmResponse:

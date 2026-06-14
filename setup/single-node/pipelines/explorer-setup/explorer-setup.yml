@@ -1,0 +1,37 @@
+name: explorer-setup
+description: |
+  Install and configure neuron-explorer as a long-running systemd service
+  fronted by an nginx /explorer/ location block. Idempotent. Designed to be
+  invoked after setup-code-server has produced /etc/nginx/sites-enabled/code-server.
+
+vars:
+  EXPLORER_USER: "coder"
+  EXPLORER_PORT: "8181"
+  EXPLORER_API_PORT: "3002"
+  EXPLORER_DATA_DIR: "/var/lib/neuron-explorer"
+  EXPLORER_DISPLAY_NAME: "workshop"
+  NGINX_LOCATION: "/explorer"
+
+defaults:
+  timeout: 30s
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-prerequisites
+    timeout: 30s
+    script: scripts/00-prerequisites.sh
+
+  - id: 01-install-explorer
+    needs: [00-prerequisites]
+    timeout: 5m
+    script: scripts/01-install-explorer.sh
+
+  - id: 02-smoke-check
+    needs: [01-install-explorer]
+    timeout: 30s
+    retries: 15
+    retry_delay: 2s
+    script: scripts/02-smoke-check.sh

@@ -79,6 +79,8 @@
 #   --reset-app-stacks            base ALB と紐づかない既存 VoiceImageEdit*Stack を deploy 前に強制 destroy。
 #                                 base stack 再作成後の orphan stack を正規に作り直す唯一のパス。
 #   --destroy                     全 stack を destroy する
+#   --use-pipeline-runner         api / frontend / stream の deploy を新 pipeline-runner で実行
+#                                 (default: 旧 run-tasks.sh)。CDK 部分は影響なし。
 #   -h, --help                    このヘルプ
 #
 # Examples:
@@ -164,6 +166,11 @@ STREAM_PATH_PATTERN="${STREAM_PATH_PATTERN:-${DEFAULT_STREAM_PATH_PATTERN}}"
 
 RESET_APP_STACKS=false
 DESTROY=false
+# When true, all three application deploys (api / frontend / stream) flow
+# through tools/pipeline-runner instead of the legacy run-tasks.sh. The
+# CDK steps are unaffected. Defaults off so existing operators keep their
+# muscle memory until the legacy runner is retired.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
 
 usage() {
     sed -n '3,86p' "$0"
@@ -216,6 +223,7 @@ while [[ $# -gt 0 ]]; do
         --stream-path-pattern)          STREAM_PATH_PATTERN="$2"; shift 2 ;;
         --reset-app-stacks)             RESET_APP_STACKS=true; shift ;;
         --destroy)                      DESTROY=true; shift ;;
+        --use-pipeline-runner)          USE_PIPELINE_RUNNER=true; shift ;;
         -h|--help)                      usage; exit 0 ;;
         *)
             echo -e "${RED}Error: unknown option: $1${NC}"
@@ -784,18 +792,39 @@ stage_tarball() {
 }
 
 run_task() {
-    local instance_id="$1" task_file="$2" vars_json="$3" service="$4"
-    # サービスごとに state file を分離する。run-tasks.sh の default は
-    # /tmp/task-state-<instance>.json なので、API/Frontend/Stream で task-id が衝突して
-    # 全部 "Already completed" になる事故を防ぐ。
-    local state_file="/tmp/task-state-${instance_id}-${service}.json"
-    echo -e "${BLUE}[INFO] running $(basename "$task_file") on ${instance_id} (state=${state_file})${NC}"
-    "$RUNNER_PATH" \
-        -i "$instance_id" \
-        -r "$REGION" \
-        -f "$task_file" \
-        -v "$vars_json" \
-        --state-file "$state_file"
+    # Thin shim that delegates to tools/pipeline-runner/lib-sh/dispatch.sh,
+    # which picks the new pipeline-runner or the legacy run-tasks.sh based
+    # on USE_PIPELINE_RUNNER. Callers pass BOTH the legacy JSON path and
+    # the new YAML path so the switch is a single env var away.
+    local instance_id="$1" legacy_json="$2" vars_json="$3" service="$4"
+
+    # Resolve the matching new-runner YAML by convention:
+    #   tasks/voice-image-edit-api.json  ->  pipelines/voice-image-edit-api/voice-image-edit-api.yml
+    local pipeline_name new_yml
+    pipeline_name="$(basename "$legacy_json" .json)"
+    new_yml="$INFRA_DIR/pipelines/${pipeline_name}/${pipeline_name}.yml"
+
+    # Source the dispatch helper lazily so the original run_task callers
+    # do not have to know about the helper's path.
+    if ! declare -F pipeline_dispatch >/dev/null; then
+        local helper="$INFRA_DIR/../../../../tools/pipeline-runner/lib-sh/dispatch.sh"
+        if [[ ! -f "$helper" ]]; then
+            echo -e "${RED}[NG] dispatch helper missing at $helper${NC}" >&2
+            exit 1
+        fi
+        # REPO_ROOT is needed by the helper so the new runner anchors
+        # .runner-state/ at the repo root, not at the deploy.sh cwd.
+        export REPO_ROOT="$(cd "$INFRA_DIR/../../../.." && pwd)"
+        # shellcheck disable=SC1090
+        source "$helper"
+    fi
+
+    if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+        echo -e "${BLUE}[INFO] running ${pipeline_name}.yml via pipeline-runner on ${instance_id}${NC}"
+    else
+        echo -e "${BLUE}[INFO] running $(basename "$legacy_json") on ${instance_id} (legacy run-tasks.sh)${NC}"
+    fi
+    pipeline_dispatch "$instance_id" "$REGION" "$legacy_json" "$new_yml" "$vars_json" "$service"
 }
 
 # -----------------------------------------------------------------------------

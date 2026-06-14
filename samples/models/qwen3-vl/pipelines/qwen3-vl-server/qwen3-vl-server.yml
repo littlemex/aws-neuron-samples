@@ -1,0 +1,58 @@
+name: qwen3-vl-server
+description: |
+  Deploys Qwen3-VL-8B-Instruct as an OpenAI-compatible vLLM Neuron server on EC2.
+  Requires qwen3-vl-prepare to have completed warm-up first.
+  Installs and starts a systemd unit occupying NeuronCores 16-31 (TP=16) on port 8090.
+
+vars:
+  SERVE_DIR: /opt/voice-image-edit/qwen3-vl-server
+  SERVE_USER: ubuntu
+  PORT: "8090"
+  MODEL_ID: Qwen/Qwen3-VL-8B-Instruct
+  MODEL_DIR: /models/Qwen3-VL-8B-Instruct
+  NEURON_CORES: 16-31
+  VENV: /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16
+
+required_vars:
+  - SERVER_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 5m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{SERVER_TARBALL_URL}}"
+
+  - id: 30-install-systemd-unit
+    needs: [20-deploy-tarball]
+    timeout: 1m
+    script: scripts/30-install-systemd-unit.sh
+
+  - id: 40-enable-start
+    needs: [30-install-systemd-unit]
+    timeout: 30s
+    script: scripts/40-enable-start.sh
+
+  - id: 50-health-check
+    needs: [40-enable-start]
+    timeout: 30m
+    retries: 150
+    retry_delay: 10s
+    script: scripts/50-health-check.sh

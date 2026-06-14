@@ -30,6 +30,7 @@
 #   --migrate           初回 EFS 移行で migrate-to-efs を setup-efs-paths の前に挟む
 #   --recover           CB / Spot terminate 後の recovery mode (= --skip migrate-to-efs と同義、 default)
 #   --dry-run           各 step の表示のみ。 SSM 送信は走らない
+#   --use-pipeline-runner  全 step を tools/pipeline-runner 経由で実行 (default: 旧 run-tasks.sh)
 #
 # 必須環境変数:
 #   AWS_PROFILE=claude-code  (他 profile 禁止: 2026-04-20 厳命)
@@ -71,6 +72,12 @@ SKIP_STEPS=""
 ONLY_STEPS=""
 MIGRATE=false
 DRY_RUN=false
+# When true, every step is dispatched through tools/pipeline-runner
+# (YAML+bash pipelines under <consumer>/pipelines/<name>/). Otherwise
+# the legacy run-tasks.sh JSON path is used. Same flag name as the
+# voice-image-edit/app/infra/deploy.sh switch so operators can pass the
+# same value top-down.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
 
 # Step granularity: --skip prepare で 3 prepare 全部 skip / --skip setup-efs-paths で 1 step skip
 #
@@ -105,6 +112,7 @@ while [[ $# -gt 0 ]]; do
     --migrate)         MIGRATE=true; shift ;;
     --recover)         MIGRATE=false; shift ;;
     --dry-run)         DRY_RUN=true; shift ;;
+    --use-pipeline-runner) USE_PIPELINE_RUNNER=true; shift ;;
     -h|--help)
       sed -n '1,40p' "$0"
       exit 0
@@ -237,23 +245,55 @@ xttsv2_profile_for_instance() {
   echo "4 0-3 /models/xttsv2-neuron-nxd-tp4"
 }
 
-# --- helper: run a task JSON via run-tasks.sh ---
+# --- helper: run a task JSON via run-tasks.sh, OR the matching YAML pipeline ---
+#
+# Mapping convention used by every consumer in this repo:
+#   <dir>/tasks/<name>.json   <->   <dir>/pipelines/<name>/<name>.yml
+#
+# Callers still hand us the legacy JSON path (since deploy-all.sh predates
+# the new runner); we derive the YAML path by string substitution. If the
+# YAML is missing when --use-pipeline-runner is requested, fall back to the
+# legacy path with a loud warning so a half-migrated tree still deploys.
 run_task_json() {
   local task_file="$1"
   local vars_json="${2:-{\}}"
   local state_label="${3:-$(basename "$task_file" .json)}"
   local state_file="/tmp/task-state-${EC2_INSTANCE_ID}-${state_label}.json"
+
+  # Source the dispatch helper lazily; we cd to REPO_ROOT before invoking
+  # so the runner anchors .runner-state/ at a predictable spot.
+  if ! declare -F pipeline_dispatch >/dev/null; then
+    local helper="$REPO_ROOT/tools/pipeline-runner/lib-sh/dispatch.sh"
+    if [[ ! -f "$helper" ]]; then
+      err "dispatch helper missing at $helper"
+      return 1
+    fi
+    export REPO_ROOT
+    # shellcheck disable=SC1090
+    source "$helper"
+  fi
+
+  local pipeline_name yml_path
+  pipeline_name="$(basename "$task_file" .json)"
+  yml_path="$(dirname "$(dirname "$task_file")")/pipelines/${pipeline_name}/${pipeline_name}.yml"
+
   if [[ "$DRY_RUN" == true ]]; then
-    log "[dry] $RUNNER -i $EC2_INSTANCE_ID -r $REGION -f $task_file -v '$vars_json' --state-file $state_file"
+    if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+      log "[dry] pipeline-runner: $yml_path on $EC2_INSTANCE_ID"
+    else
+      log "[dry] $RUNNER -i $EC2_INSTANCE_ID -r $REGION -f $task_file -v '$vars_json' --state-file $state_file"
+    fi
     return 0
   fi
-  log "running: $task_file (state=$state_file)"
-  "$RUNNER" \
-    -i "$EC2_INSTANCE_ID" \
-    -r "$REGION" \
-    -f "$task_file" \
-    -v "$vars_json" \
-    --state-file "$state_file"
+
+  if [[ "$USE_PIPELINE_RUNNER" == "true" && ! -f "$yml_path" ]]; then
+    warn "USE_PIPELINE_RUNNER=true but $yml_path missing; falling back to legacy $task_file"
+    USE_PIPELINE_RUNNER=false pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "$task_file" "$yml_path" "$vars_json" "$state_label"
+    return $?
+  fi
+
+  log "running: $task_file (USE_PIPELINE_RUNNER=$USE_PIPELINE_RUNNER, state=$state_file)"
+  pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "$task_file" "$yml_path" "$vars_json" "$state_label"
 }
 
 # --- step: setup-efs-paths ---
@@ -409,13 +449,18 @@ step_voice_image_edit_app() {
     log "[dry] cd $APP_INFRA_DIR && bash deploy.sh --base-stack-name $BASE_STACK_NAME --region $REGION --trainium-asr-url $asr_url --trainium-vlm-url $vlm_url --trainium-edit-url $edit_url --trainium-tts-url $tts_url"
     return 0
   fi
+  local extra_args=()
+  if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+    extra_args+=(--use-pipeline-runner)
+  fi
   ( cd "$APP_INFRA_DIR" && bash deploy.sh \
     --base-stack-name "$BASE_STACK_NAME" \
     --region "$REGION" \
     --trainium-asr-url "$asr_url" \
     --trainium-vlm-url "$vlm_url" \
     --trainium-edit-url "$edit_url" \
-    --trainium-tts-url "$tts_url" )
+    --trainium-tts-url "$tts_url" \
+    "${extra_args[@]}" )
 }
 
 # --- step: neuron-anatomy (sibling stack, must follow EC2 recover) ---
@@ -436,10 +481,15 @@ step_neuron_anatomy() {
     log "[dry] $anatomy_deploy --base-stack-name $BASE_STACK_NAME --region $REGION --only backend,infra"
     return 0
   fi
+  local anatomy_extra_args=()
+  if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+    anatomy_extra_args+=(--use-pipeline-runner)
+  fi
   bash "$anatomy_deploy" \
     --base-stack-name "$BASE_STACK_NAME" \
     --region "$REGION" \
-    --only backend,infra
+    --only backend,infra \
+    "${anatomy_extra_args[@]}"
 }
 
 # --- helper: stage a single file or directory tar to the stage S3 bucket ---

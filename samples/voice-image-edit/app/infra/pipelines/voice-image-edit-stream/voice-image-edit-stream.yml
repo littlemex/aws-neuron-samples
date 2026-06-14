@@ -1,0 +1,63 @@
+name: voice-image-edit-stream
+description: |
+  Deploys the voice-image-edit SSE backend (FastAPI/uvicorn, port 8800) on an
+  existing EC2 instance as a systemd service. Tarball is fetched via presigned
+  S3 URL; venv lives at /opt/voice-image-edit/stream/venv. Idempotent: safe to
+  re-run for updates.
+
+vars:
+  STREAM_DIR: /opt/voice-image-edit/stream
+  STREAM_USER: ubuntu
+  STREAM_PORT: "8800"
+  ORIGIN_VERIFY_HEADER_NAME: X-Origin-Verify
+
+required_vars:
+  - STREAM_TARBALL_URL
+  - EDIT_API_BASE_URL
+  - ORIGIN_VERIFY_HEADER_VALUE
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 5m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{STREAM_TARBALL_URL}}"
+
+  - id: 30-create-venv
+    needs: [20-deploy-tarball]
+    timeout: 5m
+    script: scripts/30-create-venv.sh
+
+  - id: 40-install-systemd-unit
+    needs: [30-create-venv]
+    timeout: 1m
+    script: scripts/40-install-systemd-unit.sh
+
+  - id: 50-enable-start
+    needs: [40-install-systemd-unit]
+    timeout: 90s
+    script: scripts/50-enable-start.sh
+
+  - id: 60-health-check
+    needs: [50-enable-start]
+    timeout: 90s
+    retries: 5
+    retry_delay: 5s
+    script: scripts/60-health-check.sh

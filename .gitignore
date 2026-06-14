@@ -33,6 +33,8 @@ venv/
 # Local state produced by scripts
 /tmp/task-state-*.json
 state.json
+# pipeline-runner stores fingerprint cache + run logs here.
+.runner-state/
 
 # Environment files with image URIs, credentials, or local overrides.
 # These must never be committed; the repo ships only

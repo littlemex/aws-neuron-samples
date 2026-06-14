@@ -91,7 +91,7 @@ class PollyTtsEngine(TtsEngine):
             or os.environ.get("POLLY_OUTPUT_FORMAT")
             or _DEFAULT_OUTPUT_FORMAT
         )
-        sample_rate = os.environ.get("POLLY_SAMPLE_RATE", _DEFAULT_SAMPLE_RATE)
+        sample_rate = os.environ.get("POLLY_SAMPLE_RATE") or _DEFAULT_SAMPLE_RATE
         language_code = opts.language or self.language_code
 
         try:

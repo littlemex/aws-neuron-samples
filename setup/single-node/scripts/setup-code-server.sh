@@ -30,6 +30,8 @@ Options:
     --install-claude-code           Opt-in: install Anthropic Claude Code CLI and
                                     neuron-agentic-development agents/skills into
                                     ~/.claude for the code-server user.
+    --use-pipeline-runner           Dispatch through tools/pipeline-runner instead of
+                                    the legacy run-tasks.sh.
     -h, --help                      Show this help message
 
 Examples:
@@ -71,6 +73,10 @@ CLEAN_STATE=false
 DRY_RUN=false
 REBOOT=false
 INSTALL_CLAUDE_CODE=false
+# When true, dispatch through tools/pipeline-runner; when false, the
+# historical run-tasks.sh path is used. Same flag name as the other
+# callers so operators can pass the same value top-down.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -133,6 +139,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --install-claude-code)
             INSTALL_CLAUDE_CODE=true
+            shift
+            ;;
+        --use-pipeline-runner)
+            USE_PIPELINE_RUNNER=true
             shift
             ;;
         -h|--help)
@@ -248,28 +258,48 @@ if [[ -f "$PERSIST_SH" ]]; then
     fi
 fi
 
-# Run the task runner
-RUN_TASKS_ARGS=(
-    -i "$INSTANCE_ID"
-    -r "$REGION"
-    -f "$TASK_FILE"
-    -v "$VARIABLES_JSON"
-)
+# Dispatch through the new pipeline-runner when --use-pipeline-runner is
+# set; otherwise fall back to the legacy run-tasks.sh. The dispatch helper
+# encapsulates the choice so this wrapper does not need two code paths.
+REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+DISPATCH_HELPER="$REPO_ROOT/tools/pipeline-runner/lib-sh/dispatch.sh"
+if [[ ! -f "$DISPATCH_HELPER" ]]; then
+    echo "Error: dispatch helper missing at $DISPATCH_HELPER"
+    exit 1
+fi
+export REPO_ROOT
+# shellcheck disable=SC1090
+source "$DISPATCH_HELPER"
 
-if [[ -n "$START_FROM" ]]; then
-    RUN_TASKS_ARGS+=(--start-from "$START_FROM")
+# Map tasks/code-server-setup.json -> pipelines/code-server-setup/code-server-setup.yml.
+PIPELINE_NAME="$(basename "$TASK_FILE" .json)"
+NEW_YML="$PROJECT_DIR/pipelines/${PIPELINE_NAME}/${PIPELINE_NAME}.yml"
+
+# The legacy runner accepted --start-from and --clean-state for resume
+# semantics; the new runner offers `rerun --from <task-id>` and
+# `--force-all`. We keep the wrapper minimal and only respect
+# --start-from when on the legacy path; on the new path we inform the
+# operator and proceed without it (this is documented in the README).
+if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
+    if [[ -n "$START_FROM" || "$CLEAN_STATE" == "true" || "$DRY_RUN" == "true" ]]; then
+        echo "[INFO] --start-from / --clean-state / --dry-run on the new runner: use 'rerun --from <id>' / '--force-all' / '--dry-run' against $NEW_YML directly for fine control."
+    fi
 fi
 
-if [[ "$CLEAN_STATE" == true ]]; then
-    RUN_TASKS_ARGS+=(--clean-state)
+if [[ "$DRY_RUN" == "true" && "$USE_PIPELINE_RUNNER" != "true" ]]; then
+    # Preserve the legacy --dry-run behaviour when going through the old runner.
+    bash "$SCRIPT_DIR/run-tasks.sh" -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON" --dry-run
+elif [[ "$USE_PIPELINE_RUNNER" != "true" && (-n "$START_FROM" || "$CLEAN_STATE" == "true") ]]; then
+    # Legacy resume / clean-state forms: keep using run-tasks.sh directly.
+    RUN_TASKS_ARGS=(
+        -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON"
+    )
+    [[ -n "$START_FROM" ]] && RUN_TASKS_ARGS+=(--start-from "$START_FROM")
+    [[ "$CLEAN_STATE" == "true" ]] && RUN_TASKS_ARGS+=(--clean-state)
+    bash "$SCRIPT_DIR/run-tasks.sh" "${RUN_TASKS_ARGS[@]}"
+else
+    pipeline_dispatch "$INSTANCE_ID" "$REGION" "$TASK_FILE" "$NEW_YML" "$VARIABLES_JSON" "$PIPELINE_NAME"
 fi
-
-if [[ "$DRY_RUN" == true ]]; then
-    RUN_TASKS_ARGS+=(--dry-run)
-fi
-
-echo ""
-bash "$SCRIPT_DIR/run-tasks.sh" "${RUN_TASKS_ARGS[@]}"
 
 # Execution result
 if [[ $? -eq 0 ]]; then

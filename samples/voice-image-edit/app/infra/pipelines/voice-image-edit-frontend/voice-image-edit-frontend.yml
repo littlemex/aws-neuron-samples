@@ -1,0 +1,56 @@
+name: voice-image-edit-frontend
+description: |
+  Deploys the voice-image-edit Next.js standalone server (port 3000) on an
+  existing EC2 instance via systemd. The frontend tarball is fetched from a
+  presigned S3 URL (no EC2 IAM S3 permission needed). Idempotent and safe to
+  re-run for updates.
+
+vars:
+  FRONTEND_DIR: /opt/voice-image-edit/frontend
+  FRONTEND_USER: ubuntu
+  FRONTEND_PORT: "3000"
+  EDIT_API_PATH: /api/edit
+
+required_vars:
+  - FRONTEND_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 5m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{FRONTEND_TARBALL_URL}}"
+
+  - id: 30-install-systemd-unit
+    needs: [20-deploy-tarball]
+    timeout: 1m
+    script: scripts/30-install-systemd-unit.sh
+
+  - id: 40-enable-start
+    needs: [30-install-systemd-unit]
+    timeout: 90s
+    script: scripts/40-enable-start.sh
+
+  - id: 50-health-check
+    needs: [40-enable-start]
+    timeout: 90s
+    retries: 5
+    retry_delay: 5s
+    script: scripts/50-health-check.sh

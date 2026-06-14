@@ -1,0 +1,66 @@
+name: qwen-image-edit-prepare
+description: |
+  Downloads the Qwen-Image-Edit-2511 HF model snapshot and compiles it with compile.sh v3_tp16
+  on trn2.48xlarge (NeuronCore 32-63, world_size=32, TP=16, DP=2). Idempotent: skips compile
+  if all V3 CFG artifact directories are already populated under COMPILED_MODELS_DIR.
+
+vars:
+  MODEL_ID: "Qwen/Qwen-Image-Edit-2511"
+  HF_CACHE_DIR: "/models/hf-cache"
+  COMPILED_MODELS_DIR: "/mnt/local/compiled_models_tp16"
+  COMPILER_WORKDIR: "/mnt/local/compiler_workdir"
+  VENV: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference"
+  NEURON_CORES: "32-63"
+  WORLD_SIZE: "32"
+  SERVE_USER: "ubuntu"
+  WORK_DIR: "/opt/voice-image-edit/qwen-image-edit-compile"
+  HEIGHT: "1024"
+  WIDTH: "1024"
+  IMAGE_SIZE: "448"
+  PATCH_MULTIPLIER: "3"
+  MAX_SEQ_LEN: "1024"
+  FORCE_RECOMPILE: "false"
+
+required_vars:
+  - SOURCE_TARBALL_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-skip-if-cached
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-skip-if-cached.sh
+
+  - id: 20-fetch-source
+    needs: [10-skip-if-cached]
+    timeout: 5m
+    script: scripts/20-fetch-source.sh
+    fingerprint_inputs:
+      - "{{SOURCE_TARBALL_URL}}"
+
+  - id: 30-install-deps
+    needs: [20-fetch-source]
+    timeout: 30m
+    script: scripts/30-install-deps.sh
+
+  - id: 40-compile
+    needs: [30-install-deps]
+    timeout: 2h
+    script: scripts/40-compile.sh
+    fingerprint_inputs:
+      - "{{SOURCE_TARBALL_URL}}"
+
+  - id: 50-verify
+    needs: [40-compile]
+    timeout: 30s
+    script: scripts/50-verify.sh

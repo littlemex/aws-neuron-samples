@@ -1,0 +1,65 @@
+name: whisper-nxd-precompile
+description: |
+  Runs compile_whisper_nxd.py once on a trn2.48xlarge to produce NxD Inference
+  encoder/ and decoder/ Neuron artifacts under MODEL_DIR. Idempotent: skips if
+  compile_metadata.json + encoder/ + decoder/ are already present and FORCE_RECOMPILE=false.
+
+vars:
+  MODEL_ID: "openai/whisper-large-v3"
+  MODEL_DIR: "/models/whisper-large-v3-neuron-nxd"
+  HF_HOME: "/models/hf-cache"
+  TP_DEGREE: "8"
+  BATCH_SIZE: "1"
+  DTYPE: "fp16"
+  NEURON_CORES: "8-15"
+  VENV: "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference"
+  WORK_DIR: "/opt/voice-image-edit/whisper-nxd-compile"
+  FORCE_RECOMPILE: "false"
+
+required_vars:
+  - COMPILE_SCRIPT_URL
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-skip-if-cached
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-skip-if-cached.sh
+
+  - id: 15-install-deps
+    needs: [10-skip-if-cached]
+    timeout: 5m
+    script: scripts/15-install-deps.sh
+
+  - id: 20-fetch-script
+    needs: [15-install-deps]
+    timeout: 5m
+    script: scripts/20-fetch-script.sh
+    fingerprint_inputs:
+      - "{{COMPILE_SCRIPT_URL}}"
+
+  - id: 30-compile
+    needs: [20-fetch-script]
+    timeout: 1h
+    script: scripts/30-compile.sh
+    fingerprint_inputs:
+      - "{{MODEL_ID}}"
+      - "{{MODEL_DIR}}"
+      - "{{TP_DEGREE}}"
+      - "{{BATCH_SIZE}}"
+      - "{{DTYPE}}"
+
+  - id: 40-verify
+    needs: [30-compile]
+    timeout: 30s
+    script: scripts/40-verify.sh

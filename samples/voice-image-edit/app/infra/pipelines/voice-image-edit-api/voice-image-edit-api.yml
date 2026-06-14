@@ -1,0 +1,95 @@
+name: voice-image-edit-api
+description: |
+  Deploys the FastAPI/uvicorn API backend that serves /api/edit/* on the
+  shared EC2 host. Idempotent - safe to re-run; cached tasks short-circuit
+  unless their script body, environment, or the API_TARBALL_URL ETag has
+  changed.
+
+vars:
+  # Defaults that rarely move per environment. Anything operational
+  # (regions, model ids, tarball URL) lives in required_vars below.
+  API_DIR: /opt/voice-image-edit/api
+  API_USER: ubuntu
+  EDIT_RESULT_TTL_SECONDS: "900"
+  EDIT_RESULT_PREFIX: "edit-results/"
+
+required_vars:
+  # Tarball + listen port
+  - API_TARBALL_URL
+  - API_PORT
+  # Region wiring (Bedrock + Polly + Stability all live in different regions)
+  - AWS_REGION
+  - BEDROCK_REGION
+  - GENERATE_BEDROCK_REGION
+  - EDIT_BEDROCK_REGION
+  - POLLY_REGION
+  # Edit-result S3 bucket (created by ApiStack)
+  - EDIT_RESULT_BUCKET
+  - EDIT_RESULT_REGION
+  # Engine defaults
+  - ASR_ENGINE_DEFAULT
+  - VLM_ENGINE_DEFAULT
+  - EDIT_ENGINE_DEFAULT
+  - BEDROCK_ASR_BACKEND
+  # Bedrock model ids
+  - BEDROCK_CLAUDE_SONNET_MODEL_ID
+  - BEDROCK_NOVA_PRO_MODEL_ID
+  - BEDROCK_NOVA_LITE_MODEL_ID
+  - BEDROCK_NOVA_CANVAS_MODEL_ID
+  - BEDROCK_VLM_MODEL_ID
+  # Trainium endpoints (empty string is fine, but the variable must be set)
+  - TRAINIUM_ASR_URL
+  - TRAINIUM_VLM_URL
+  - TRAINIUM_EDIT_URL
+  - TRAINIUM_TTS_URL
+  - TRAINIUM_EDIT_MODEL_ID
+
+defaults:
+  timeout: 5m
+  retries: 0
+  cloudwatch_logs: true
+
+# These six tasks were independent in concept but the old runner forced them
+# to run in series. Here they are still chained because the unit needs to be
+# reinstalled before it can be started; declaring `needs:` keeps the order
+# explicit and makes the DAG visible to the runner.
+max_concurrency: 1
+
+tasks:
+  - id: 00-precheck
+    timeout: 30s
+    script: scripts/00-precheck.sh
+
+  - id: 10-stop-service
+    needs: [00-precheck]
+    timeout: 30s
+    script: scripts/10-stop-service.sh
+
+  - id: 20-deploy-tarball
+    needs: [10-stop-service]
+    timeout: 3m
+    script: scripts/20-deploy-tarball.sh
+    fingerprint_inputs:
+      - "{{API_TARBALL_URL}}"
+
+  - id: 30-create-venv
+    needs: [20-deploy-tarball]
+    timeout: 5m
+    script: scripts/30-create-venv.sh
+
+  - id: 40-install-systemd-unit
+    needs: [30-create-venv]
+    timeout: 30s
+    script: scripts/40-install-systemd-unit.sh
+
+  - id: 50-enable-start
+    needs: [40-install-systemd-unit]
+    timeout: 1m
+    script: scripts/50-enable-start.sh
+
+  - id: 60-health-check
+    needs: [50-enable-start]
+    timeout: 90s
+    retries: 5
+    retry_delay: 5s
+    script: scripts/60-health-check.sh
