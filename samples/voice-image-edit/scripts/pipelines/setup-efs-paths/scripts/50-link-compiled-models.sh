@@ -9,20 +9,29 @@ set -euo pipefail
 TARGET="${EFS_ROOT}/${MODELS_DIR_NAME}/qwen-image-edit-compiled"
 if [ -L /mnt/local/compiled_models ]; then
   current=$(readlink -f /mnt/local/compiled_models)
-  if [ "$current" = "$TARGET" ]; then echo '[OK] compiled_models already symlinked'; exit 0; fi
-  rm /mnt/local/compiled_models
+  if [ "$current" = "$TARGET" ]; then
+    echo '[OK] compiled_models already symlinked'
+  else
+    rm /mnt/local/compiled_models
+    ln -sfn "${TARGET}" /mnt/local/compiled_models
+  fi
 elif [ -d /mnt/local/compiled_models ] && [ "$(ls -A /mnt/local/compiled_models 2>/dev/null)" ]; then
   echo '[INFO] migrating compiled_models to EFS (this may take ~10 min for ~80GB)'
   rsync -a --info=progress2 /mnt/local/compiled_models/ "${TARGET}/"
   rm -rf /mnt/local/compiled_models
-elif [ -d /mnt/local/compiled_models ]; then
-  rmdir /mnt/local/compiled_models 2>/dev/null || rm -rf /mnt/local/compiled_models
+  ln -sfn "${TARGET}" /mnt/local/compiled_models
+else
+  if [ -d /mnt/local/compiled_models ]; then
+    rmdir /mnt/local/compiled_models 2>/dev/null || rm -rf /mnt/local/compiled_models
+  fi
+  ln -sfn "${TARGET}" /mnt/local/compiled_models
 fi
-ln -sfn "${TARGET}" /mnt/local/compiled_models
 
 # /mnt/local lives on NVMe ephemeral storage and is wiped on every restart.
 # Install a oneshot systemd unit that replays the same ln -sfn at boot so the
 # symlink does not silently vanish across stop+start.
+# This block runs on every invocation (idempotent): the unit body is
+# rewritten with the current TARGET so re-runs cannot drift.
 cat > /etc/systemd/system/restore-nvme-symlinks.service <<EOF
 [Unit]
 Description=Recreate NVMe symlinks under /mnt/local after every boot
