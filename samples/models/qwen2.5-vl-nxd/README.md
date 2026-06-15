@@ -46,44 +46,182 @@ transformers >= 4.51                   # tested with 4.57.6
 `vLLM` itself is not required. Use the `*_nxd_inference` venv, not the
 `*_vllm_*` one.
 
-## Running on trn2.3xlarge with Qwen2.5-VL-7B-Instruct
+## End-to-end run on trn2.3xlarge with Qwen2.5-VL-7B-Instruct
+
+The script writes everything (HF ckpt, NEFFs, compile cache, NxDI compiler
+workdir, sanity results) under a single `WORK_DIR`. EFS is preferred so
+the artefacts survive instance termination and are easy to share across
+machines, but a plain local directory works as well.
+
+### 0. Pick a `WORK_DIR`
+
+```bash
+export WORK_DIR=/mnt/efs/qwen25vl-nxd     # or $HOME/qwen25vl-nxd if you have no EFS
+mkdir -p $WORK_DIR
+df -h $WORK_DIR                            # ensure ~40 GB free (HF ckpt 16 GB + safetensors 16 GB + NEFF + cache)
+```
+
+`WORK_DIR` will hold these subdirectories after a successful run:
+
+```
+$WORK_DIR/
+├── hf-ckpt-28l/        # HF checkpoint (16 GB)
+├── traces/vl-28l/      # 3 NEFFs (vision + text CTE + text TKG)
+├── nxd-workdir/        # NxDI compiler workdir (relocated from /tmp/nxd_model)
+├── .compile-cache/     # neuronx-cc cache
+└── results/            # metrics-vl.json (verdict + generated text)
+```
+
+### 1. Activate the NxDI venv
+
+The DLAMI ships several venvs; use the `_nxd_inference` one (NOT the
+`_vllm_*` one). Their torch versions are incompatible.
+
+```bash
+ls /opt/aws_neuronx_venv_*nxd_inference*/bin/activate
+source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+```
+
+### 2. Download the HF checkpoint into `WORK_DIR`
+
+```bash
+export HF_TOKEN=${HF_TOKEN:-}      # public model — leave empty for 7B Instruct
+export HF_HUB_DISABLE_XET=1        # some regions have a slow xet backend
+
+mkdir -p $WORK_DIR/hf-ckpt-28l
+python - <<PYEOF
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='Qwen/Qwen2.5-VL-7B-Instruct',
+    local_dir=os.environ['WORK_DIR'] + '/hf-ckpt-28l',
+    ignore_patterns=['*.gguf','*.ggml','*.bin'],
+    max_workers=8,
+)
+PYEOF
+```
+
+### 3. Set Neuron env vars (LNC=2 must be applied to BOTH runtime and compiler)
+
+```bash
+mkdir -p $WORK_DIR/.compile-cache
+export NEURON_COMPILE_CACHE_URL=$WORK_DIR/.compile-cache
+
+# Runtime
+export NEURON_LOGICAL_NC_CONFIG=2
+export NEURON_RT_VISIBLE_CORES=0-1
+export NEURON_RT_NUM_CORES=2
+
+# Compiler
+export NEURON_CC_FLAGS="--target=trn2 --auto-cast=none --lnc=2"
+```
+
+`compile_qwen25vl.py` automatically points NxDI's `BASE_COMPILE_WORK_DIR`
+at `$WORK_DIR/nxd-workdir/`, so it never touches `/tmp/nxd_model/` and
+sidesteps the most common cross-user `PermissionError` on shared
+instances. Override with `BASE_COMPILE_WORK_DIR=...` if you need a
+different path.
+
+### 4. Compile + dummy gray smoke generate
 
 ```bash
 cd samples/models/qwen2.5-vl-nxd
 
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
-
-# LNC=2 (must be set for both runtime and compiler)
-export NEURON_LOGICAL_NC_CONFIG=2
-export NEURON_RT_VISIBLE_CORES=0-1
-export NEURON_RT_NUM_CORES=2
-export NEURON_CC_FLAGS="--target=trn2 --auto-cast=none --lnc=2"
-
-# Compile + dummy gray smoke generate
-HF_TOKEN=<your_hf_token> \
-MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct \
+NEURON_COMPILE_CACHE_URL=$WORK_DIR/.compile-cache \
+WORK_DIR=$WORK_DIR \
+HF_CKPT_DIR=$WORK_DIR/hf-ckpt-28l \
 TP_DEGREE=2 NUM_LAYERS=28 \
 MAX_CONTEXT_LEN=1024 MAX_NEW_TOKENS=64 \
-python compile_qwen25vl.py
-# -> NEFFs land under traces/vl-28l/
-# -> verdict + generated text in results/metrics-vl.json
+MODEL_ID=Qwen/Qwen2.5-VL-7B-Instruct \
+python compile_qwen25vl.py 2>&1 | tee $WORK_DIR/compile.log
 ```
 
-## Running on trn2.3xlarge with Stockmark-DocReasoner-Qwen2.5-VL-32B
+### 5. Inspect the result
 
 ```bash
-source /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference/bin/activate
+cat $WORK_DIR/results/metrics-vl.json | python -m json.tool | head -20
+# expected: "verdict": "A: VLM generates coherent text for dummy image"
+#           "degenerate": false
+#           gen_tail_text describing a uniform gray image
+```
+
+Reference timeline on trn2.3xlarge: compile ~245 s, load ~20 s, generate
+~1 s, end-to-end about 5 minutes from a cold start (after the HF
+download).
+
+## Variant: Stockmark-DocReasoner-Qwen2.5-VL-32B (LNC=1, TP=8)
+
+Same code path, different shape and HW budget. The 32B HF checkpoint is
+~60 GB on disk and `from_pretrained` allocates the bf16 model in CPU RAM
+once, so make sure the box has ~64 GB free RAM and ~80 GB free disk
+under `$WORK_DIR` before you start.
+
+```bash
+export WORK_DIR=/mnt/efs/qwen25vl-nxd-32b
+mkdir -p $WORK_DIR/hf-ckpt-64l
+
+# Download (gated repo, HF_TOKEN required)
+export HF_TOKEN=<your_hf_token>
+python - <<PYEOF
+import os
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id='stockmark/Stockmark-DocReasoner-Qwen2.5-VL-32B',
+    local_dir=os.environ['WORK_DIR'] + '/hf-ckpt-64l',
+    ignore_patterns=['*.gguf','*.ggml','*.bin'],
+    max_workers=8,
+)
+PYEOF
+
+mkdir -p $WORK_DIR/.compile-cache
+export NEURON_COMPILE_CACHE_URL=$WORK_DIR/.compile-cache
 export NEURON_LOGICAL_NC_CONFIG=1
 export NEURON_RT_VISIBLE_CORES=0-7
 export NEURON_RT_NUM_CORES=8
 export NEURON_CC_FLAGS="--target=trn2 --auto-cast=none --lnc=1"
 
-HF_TOKEN=<your_hf_token> \
-MODEL_ID=stockmark/Stockmark-DocReasoner-Qwen2.5-VL-32B \
+cd samples/models/qwen2.5-vl-nxd
+WORK_DIR=$WORK_DIR \
+HF_CKPT_DIR=$WORK_DIR/hf-ckpt-64l \
 TP_DEGREE=8 NUM_LAYERS=64 \
 MAX_CONTEXT_LEN=512 MAX_NEW_TOKENS=64 \
-python compile_qwen25vl.py
+MODEL_ID=stockmark/Stockmark-DocReasoner-Qwen2.5-VL-32B \
+python compile_qwen25vl.py 2>&1 | tee $WORK_DIR/compile.log
 ```
+
+## Common errors
+
+### `PermissionError: 'compile_flags.MODULE_*.json'` at the start of compile
+
+```text
+File "/.../neuronx_distributed/trace/model_builder.py", line 545, in trace
+    shutil.rmtree(self.compiler_workdir)
+PermissionError: [Errno 13] Permission denied:
+'compile_flags.MODULE_*.json'
+```
+
+NxDI's compiler workdir defaults to `/tmp/nxd_model/` and rmtree's it on
+every `compile()`. If a previous run was made by a different OS user on
+the same instance, the directory is owned by them and rmtree fails.
+`compile_qwen25vl.py` already redirects the workdir to
+`$WORK_DIR/nxd-workdir/` to avoid this, but if you ran an older version
+or another sample, clean up:
+
+```bash
+sudo rm -rf /tmp/nxd_model
+# or, point the workdir somewhere you own
+export BASE_COMPILE_WORK_DIR=$WORK_DIR/nxd-workdir/
+```
+
+### `ValueError: Model Qwen2_5_VLForConditionalGeneration is not supported on Neuron for now`
+
+The vLLM Neuron plugin v0.16 doesn't ship `qwen2_5_vl`. Use this
+sample's `compile_qwen25vl.py` instead of `vllm serve`.
+
+### `python -c '...'` literal `$WORK_DIR` in error paths
+
+Single-quoted Python one-liners suppress shell expansion. Use the
+heredoc + `os.environ['WORK_DIR']` pattern shown in step 2 above.
 
 ## Design notes (the gotchas you hit if you skip them)
 
@@ -164,9 +302,8 @@ Important: this script does NOT reuse the NEFFs produced by
 `compile_qwen25vl.py` (which writes a VLM Application bundle to
 `traces/vl-{N}l/`, with `text_model` wrapped inside the VLM). It expects a
 **dedicated text-only NEFF** under `traces/text-{N}l/` (override with
-`NEFF_DIR=...`). The text-only compile step is not bundled in this
-sample; the EXP-1037 results referenced in the parent report were
-produced by a separate text-only compile pass.
+`NEFF_DIR=...`). A text-only compile script is not bundled with this
+sample; you need to produce that NEFF separately.
 
 If you only need to verify the VLM pipeline end-to-end, the
 `compile_qwen25vl.py` smoke generate (verdict A) is sufficient.
