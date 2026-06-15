@@ -36,11 +36,11 @@ Sister sample: `samples/models/qwen3-vl/` covers Qwen3-VL via vLLM Neuron.
 # DLAMI-bundled venv (use the NxDI one, not the vLLM one)
 /opt/aws_neuronx_venv_pytorch_2_9_nxd_inference
 
-# Key packages
-neuronx_distributed_inference >= 0.10
-torch == 2.9.x
-torchvision == 0.24.x
-transformers >= 4.51, < 4.53
+# Key packages (versions verified on the 2026-06 DLAMI)
+neuronx_distributed_inference >= 0.10  # tested with 0.10.17970
+torch == 2.9.x                         # tested with 2.9.1
+torchvision == 0.24.x                  # tested with 0.24.1
+transformers >= 4.51                   # tested with 4.57.6
 ```
 
 `vLLM` itself is not required. Use the `*_nxd_inference` venv, not the
@@ -155,12 +155,34 @@ fails. See `_truncate_layers()`.
 The runtime flag and the compiler flag are separate. Setting only one
 side causes a runtime/compile LNC mismatch at load time.
 
+## Sanity script (`sanity_qwen25vl.py`)
+
+`sanity_qwen25vl.py` reloads a **text-only** NEFF and runs 6 prompts
+(en/ja, 3 each) through both NxDI and the HF CPU reference.
+
+Important: this script does NOT reuse the NEFFs produced by
+`compile_qwen25vl.py` (which writes a VLM Application bundle to
+`traces/vl-{N}l/`, with `text_model` wrapped inside the VLM). It expects a
+**dedicated text-only NEFF** under `traces/text-{N}l/` (override with
+`NEFF_DIR=...`). The text-only compile step is not bundled in this
+sample; the EXP-1037 results referenced in the parent report were
+produced by a separate text-only compile pass.
+
+If you only need to verify the VLM pipeline end-to-end, the
+`compile_qwen25vl.py` smoke generate (verdict A) is sufficient.
+
 ## Misc
 
 - `num_kv_heads` is 4 (7B) or 8 (32B). Pick a TP that divides it
   evenly. `TP=8` on the 7B model triggers a `GQA → MHA` conversion
   inside NxDI, with measurable correctness drift; for the 7B variant
-  prefer TP=2 or TP=4.
+  prefer TP=2 or TP=4. NxDI may print
+  `TP degree (2) and KV heads (4) are not divisible.` even for TP=2
+  because its internal head-sharding heuristic is more conservative
+  than a simple modulo; verdict=A confirms correctness was preserved
+  in our run.
 - After `python compile_qwen25vl.py` you will find:
   - NEFFs under `traces/vl-{NUM_LAYERS}l/`
   - verdict, generated text and latency in `results/metrics-vl.json`
+  - on compile failure, the same JSON contains
+    `{"status": "compile_fail", "error": "..."}`

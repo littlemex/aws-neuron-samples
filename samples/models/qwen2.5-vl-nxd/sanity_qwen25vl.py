@@ -37,13 +37,22 @@ import modeling_qwen25vl_text as m_stock
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", 28))
 TP_DEGREE = int(os.environ.get("TP_DEGREE", 2))
 BATCH = 1
-# Must match the compile-time values used by compile_qwen25vl.py. Reusing
-# the NEFF means these cannot be changed without recompiling.
+# Must match the compile-time values of the text-only NEFF that
+# sanity_qwen25vl.py loads. The VLM NEFF produced by compile_qwen25vl.py
+# (traces/vl-{N}l/) is NOT directly compatible — its text_model is wrapped
+# inside the VLM application. Generate a dedicated text-only NEFF via a
+# separate compile pass before invoking this script. Defaults below match
+# the canonical short-prompt sanity used in EXP-1037.
 MAX_CONTEXT_LEN = int(os.environ.get("MAX_CONTEXT_LEN", 128))
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", 16))
 
 HF_CKPT = WORK_DIR / f"hf-ckpt-{NUM_LAYERS}l"
-NEFF_DIR = WORK_DIR / "traces" / f"nxd-{NUM_LAYERS}l"
+# Default: traces/text-{N}l (text-only NEFF). Override with NEFF_DIR=... if
+# you keep the NEFF elsewhere.
+NEFF_DIR = Path(
+    os.environ.get("NEFF_DIR")
+    or (WORK_DIR / "traces" / f"text-{NUM_LAYERS}l")
+)
 RESULTS = WORK_DIR / "results"
 RESULTS.mkdir(parents=True, exist_ok=True)
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
