@@ -70,6 +70,20 @@ RESULTS = WORK_DIR / "results"
 NEFF_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS.mkdir(parents=True, exist_ok=True)
 
+# NxDI's ImageToTextInferenceConfig builders default compiler_workdir to
+# /tmp/nxd_model/, and rmtree() it at the start of every trace(). On shared
+# instances (e.g., teammates running the sample under different OS users)
+# the previous run's /tmp/nxd_model is owned by another user, which makes
+# rmtree fail with PermissionError before compile even starts.
+#
+# NxDI honours the BASE_COMPILE_WORK_DIR env var to relocate this directory.
+# Point it at WORK_DIR/nxd-workdir so the artefacts are always owned by the
+# running user (and survive across runs in the same WORK_DIR). Override with
+# BASE_COMPILE_WORK_DIR=... if you need a different path.
+if "BASE_COMPILE_WORK_DIR" not in os.environ:
+    os.environ["BASE_COMPILE_WORK_DIR"] = str(WORK_DIR / "nxd-workdir") + os.sep
+Path(os.environ["BASE_COMPILE_WORK_DIR"]).mkdir(parents=True, exist_ok=True)
+
 print("=" * 60)
 print(f"Qwen2.5-VL: compile 3 NEFFs (vision encoder + text CTE + text TKG)")
 print(f"  MODEL_ID={MODEL_ID}  TP_DEGREE={TP_DEGREE}")
