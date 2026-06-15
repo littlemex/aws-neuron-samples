@@ -51,8 +51,8 @@ import modeling_qwen25vl as m_vl
 MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 BATCH = 1
-# Qwen2.5-VL-7B: num_kv_heads=4 で TP=8 だと 0.5/core で割り切れない。
-# TP=4 (LNC=1) または TP=2 (LNC=2) が安全。 TP=2 で 1 NeuronCore あたり ~9GB。
+# Qwen2.5-VL-7B has num_kv_heads=4, so TP=8 leaves 0.5 head/core (not divisible).
+# TP=4 (LNC=1) or TP=2 (LNC=2) are the safe choices. At TP=2 each NeuronCore gets ~9 GB.
 TP_DEGREE = int(os.environ.get("TP_DEGREE", 2))
 
 NUM_LAYERS = int(os.environ.get("NUM_LAYERS", 28))

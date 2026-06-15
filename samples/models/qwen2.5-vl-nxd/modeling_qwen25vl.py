@@ -130,13 +130,13 @@ class StockmarkVLInferenceConfig(Qwen2VLInferenceConfig):
         if "out_hidden_size" in vision_dict:
             vision_dict["hidden_size"] = vision_dict["out_hidden_size"]
 
-        # Qwen2.5-VL の HF config layout は 2 通り:
-        #   (a) Stockmark-DocReasoner-VL-32B: text_config 配下に text 設定がネスト
-        #   (b) Qwen2.5-VL-7B-Instruct (公式): text 設定は flat top-level に配置
-        # (b) パターン用に、 text_config が空なら top-level の text key を集約する。
+        # The Qwen2.5-VL HF config has two possible layouts:
+        #   (a) Stockmark-DocReasoner-VL-32B: text settings nested under text_config
+        #   (b) Qwen2.5-VL-7B-Instruct (official): text settings flat at the top level
+        # For pattern (b), if text_config is empty, gather text keys from the top level.
         text_dict = dict(cfg_dict.get("text_config", {}))
         if not text_dict:
-            # flat layout: top-level から text key を抽出
+            # flat layout: extract text keys from the top level
             _text_top_keys = (
                 "hidden_size", "num_hidden_layers", "num_attention_heads",
                 "num_key_value_heads", "head_dim", "intermediate_size",
@@ -151,9 +151,9 @@ class StockmarkVLInferenceConfig(Qwen2VLInferenceConfig):
         # HF PretrainedConfig defaults required by NxDI model_base
         text_dict.setdefault("output_attentions", False)
         text_dict.setdefault("output_hidden_states", False)
-        # Qwen2.5-VL の HF config は pad_token_id が None / 未設定。 NxDI の
-        # validate_config() が text_config.pad_token_id の存在を要求するため
-        # eos_token_id にフォールバックする (Qwen 系は EOS=pad)。
+        # The Qwen2.5-VL HF config leaves pad_token_id as None / unset, but NxDI's
+        # validate_config() requires text_config.pad_token_id to be present, so we
+        # fall back to eos_token_id (Qwen-family conventions treat EOS as PAD).
         if text_dict.get("pad_token_id") is None:
             text_dict["pad_token_id"] = (
                 cfg_dict.get("pad_token_id")

@@ -74,18 +74,19 @@ class NeuronStockmarkTextRotaryEmbedding(nn.Module):
     Takes position_ids of shape [3, batch, seq_len] (temporal/height/width).
     For text-only, all 3 axes contain identical 1-D positions.
 
-    HF Qwen2_5_VLRotaryEmbedding.forward (transformers v4.57.6, L513-L526) の
-    position_ids 規約:
-      - 入力は [3, B, S] (temporal/height/width の 3 軸)
-      - inv_freq_expanded: [3, B, dim/2, 1]  ← position_ids.shape[1] = B を参照
+    HF Qwen2_5_VLRotaryEmbedding.forward (transformers v4.57.6, L513-L526)
+    position_ids contract:
+      - input is [3, B, S] (temporal/height/width axes)
+      - inv_freq_expanded: [3, B, dim/2, 1]  (uses position_ids.shape[1] = B)
       - position_ids_expanded: [3, B, 1, S]
 
-    NxDI adapter (HuggingFaceGenerationAdapter) は 2D [B, S] を渡すため、
-    2D を受けた場合は 3 軸 replicate する。text-only では 3 軸同値で正しい。
+    The NxDI HuggingFaceGenerationAdapter passes 2D [B, S], so when we
+    receive a 2D tensor we replicate it across all 3 axes. For text-only
+    runs all 3 axes carry identical values, which matches HF.
 
-    NOTE: TKG (decode) 時に adapter から渡される position_ids の「値」が
-    HF と一致するかは NeuronStockmarkTextForCausalLM.prepare_inputs_for_generation
-    で rope_delta 補正を行うことで担保する。
+    NOTE: at TKG (decode) time the *values* of position_ids that the
+    adapter passes are aligned with HF via the rope_delta correction in
+    NeuronStockmarkTextForCausalLM.prepare_inputs_for_generation below.
     """
 
     def __init__(self, config: InferenceConfig, device=None):
@@ -374,60 +375,62 @@ class NeuronStockmarkTextForCausalLM(NeuronBaseForCausalLM):
       lm_head.weight                   -> lm_head.weight
       visual.*                         -> SKIPPED
 
-    TKG / M-RoPE 修正の概要
-    -----------------------
-    Qwen2.5-VL は M-RoPE (3-axis: temporal/height/width) を使用する。HF の
-    prepare_inputs_for_generation は次の処理を行う:
+    TKG / M-RoPE notes
+    ------------------
+    Qwen2.5-VL uses M-RoPE (3 axes: temporal/height/width). HF's
+    prepare_inputs_for_generation does roughly the following:
 
       prefill step (cache_position[0]==0):
-        get_rope_index() で [3,B,S] の position_ids を生成し rope_deltas を保存。
-        text-only の場合 rope_deltas=0 (各バッチ要素)。
+        get_rope_index() builds [3,B,S] position_ids and saves rope_deltas.
+        For text-only inputs rope_deltas is 0 for every batch element.
 
       decode step (cache_position[0]>0):
-        position_ids = cache_position[0] + rope_deltas  (値 = L + delta)
-        を 3 軸に replicate した [3,B,1] を生成。
-        text-only では delta=0 なので position_ids = [[[L]],[[L]],[[L]]]。
+        position_ids = cache_position[0] + rope_deltas  (i.e., L + delta)
+        replicated across all 3 axes -> [3,B,1].
+        For text-only delta=0, so position_ids = [[[L]],[[L]],[[L]]].
 
-    NxDI HuggingFaceGenerationAdapter は常に 2D [B,1] を返し rope_delta を
-    加算しない。text-only かつ rope_delta=0 の場合は adapter の値と HF の値が
-    一致するため、NeuronStockmarkTextRotaryEmbedding の 2D->3D expand で
-    数値的に等価になる。
+    NxDI's HuggingFaceGenerationAdapter always returns 2D [B,1] without
+    adding rope_delta. For text-only inputs this is fine because delta=0,
+    so the 2D->3D expand inside NeuronStockmarkTextRotaryEmbedding makes
+    the adapter values numerically identical to HF.
 
-    もし将来マルチモーダル入力 (画像/動画) を扱う場合、rope_deltas≠0 になり
-    adapter の 2D position_ids とHFの 3D position_ids が数値レベルでズレる。
-    その場合は下記 prepare_inputs_for_generation オーバーライドで補正する。
+    If you later add true multimodal inputs (images / video), rope_deltas
+    becomes non-zero and the adapter's 2D position_ids will drift from
+    HF's 3D values. In that case, enable the rope_delta correction in the
+    prepare_inputs_for_generation override below.
     """
 
     _model_cls = NeuronStockmarkTextModel
 
-    # rope_deltas キャッシュ (prefill 後に保存、decode step で参照)
-    # text-only では常に 0 のため現状は実効なし。マルチモーダル時に必要。
+    # Cached rope_deltas (saved after prefill, consumed at every decode step).
+    # Always zero for text-only inputs; this slot becomes meaningful when
+    # multimodal positional offsets are introduced.
     _rope_deltas: Optional[torch.Tensor] = None
 
     def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs):
-        """NxDI adapter の 2D position_ids に M-RoPE rope_delta を補正する。
+        """Apply M-RoPE rope_delta correction to the adapter's 2D position_ids.
 
-        NxDI HuggingFaceGenerationAdapter が返す model_inputs の position_ids は
-        2D [B,S]。これを NeuronStockmarkTextRotaryEmbedding が 3 軸 replicate
-        するため、text-only (rope_delta=0) では HF と等価。
+        The HuggingFaceGenerationAdapter returns a 2D [B,S] position_ids,
+        which NeuronStockmarkTextRotaryEmbedding broadcasts to 3 axes. For
+        text-only runs (rope_delta=0) this matches HF exactly.
 
-        診断: TKG step 0 不一致の場合は kv_cache_populated フラグと
-        position_ids の値をここでデバッグプリントして確認すること。
+        Debug tip: if TKG step 0 diverges, print kv_cache_populated and the
+        position_ids value here to compare against HF.
         """
-        # 親クラス (NeuronBaseForCausalLM) の標準処理に委譲
+        # Delegate to the base class (NeuronBaseForCausalLM) for the standard work.
         model_inputs = super().prepare_inputs_for_generation(
             input_ids, attention_mask=attention_mask, **kwargs
         )
 
-        # --- M-RoPE rope_delta 補正 (将来のマルチモーダル対応) ---
-        # text-only では rope_deltas=0 のため補正不要。
-        # 画像/動画入力時は以下のコメントを外して有効化する:
+        # --- M-RoPE rope_delta correction (placeholder for future multimodal) ---
+        # For text-only inputs rope_deltas is always 0, so no correction is needed.
+        # Uncomment the block below to enable it for image/video inputs:
         #
         # if self._rope_deltas is not None:
         #     pos = model_inputs.get("position_ids", None)
         #     if pos is not None and pos.dim() == 2:
-        #         # kv_cache_populated=True の decode step: pos=[B,1], 値=cache_pos
-        #         # HF の値: cache_pos + rope_delta
+        #         # kv_cache_populated=True decode step: pos=[B,1], value=cache_pos
+        #         # HF value: cache_pos + rope_delta
         #         delta = self._rope_deltas.to(pos.device)  # [B,1]
         #         model_inputs["position_ids"] = pos + delta
 
