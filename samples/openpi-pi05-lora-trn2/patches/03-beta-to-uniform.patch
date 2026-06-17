@@ -1,0 +1,13 @@
+diff --git a/src/openpi/models/pi0.py b/src/openpi/models/pi0.py
+index ae7c459..7e09ba5 100644
+--- a/src/openpi/models/pi0.py
++++ b/src/openpi/models/pi0.py
+@@ -194,7 +194,7 @@ class Pi0(_model.BaseModel):
+
+         batch_shape = actions.shape[:-2]
+         noise = jax.random.normal(noise_rng, actions.shape)
+-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
++        time = jax.random.uniform(time_rng, batch_shape, minval=0.001, maxval=0.999)  # PATCH_NEURON_BETA_TO_UNIFORM (rejection-sampling beta blows partition 5 with Threefry ops)
+         time_expanded = time[..., None, None]
+         x_t = time_expanded * noise + (1 - time_expanded) * actions
+         u_t = noise - actions
