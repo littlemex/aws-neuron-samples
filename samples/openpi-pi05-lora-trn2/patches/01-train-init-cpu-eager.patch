@@ -1,0 +1,24 @@
+diff --git a/scripts/train.py b/scripts/train.py
+index 5d28941..18df29f 100644
+--- a/scripts/train.py
++++ b/scripts/train.py
+@@ -123,12 +123,13 @@ def init_train_state(
+     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+     # Initialize the train state and mix in the partial params.
+-    train_state = jax.jit(
+-        init,
+-        donate_argnums=(1,),  # donate the partial params buffer.
+-        in_shardings=replicated_sharding,
+-        out_shardings=state_sharding,
+-    )(init_rng, partial_params)
++    # PATCH v2: run init on CPU (no jit) to avoid Neuron NCC_ETUP002 and 7.5 GB HLO constants.
++    # Then transfer the full TrainState to Neuron via jax.device_put.
++    cpu_dev = jax.devices("cpu")[0]
++    with jax.default_device(cpu_dev):
++        train_state = init(init_rng, partial_params)
++    # Move TrainState onto the target sharded layout for downstream train_step.
++    train_state = jax.device_put(train_state, state_sharding)
+
+     return train_state, state_sharding
+

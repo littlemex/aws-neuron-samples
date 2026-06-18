@@ -1,0 +1,26 @@
+diff --git a/src/openpi/models/gemma.py b/src/openpi/models/gemma.py
+index d1623d1..78e9ec6 100644
+--- a/src/openpi/models/gemma.py
++++ b/src/openpi/models/gemma.py
+@@ -365,7 +365,7 @@ class Module(nn.Module):
+         self.layers = nn.scan(
+             block_cls,
+             variable_axes={"params": 0},
+-            split_rngs={"params": True, "dropout": True},
++            split_rngs={"params": True, "dropout": False},
+             in_axes=(
+                 0,
+                 nn.broadcast,
+diff --git a/src/openpi/models/vit.py b/src/openpi/models/vit.py
+index b7901d0..439a745 100644
+--- a/src/openpi/models/vit.py
++++ b/src/openpi/models/vit.py
+@@ -202,7 +202,7 @@ class Encoder(nn.Module):
+         x, _ = nn.scan(
+             block,
+             variable_axes={"params": 0},
+-            split_rngs={"params": True, "dropout": True},
++            split_rngs={"params": True, "dropout": False},
+             in_axes=nn.broadcast,
+             length=self.num_layers,
+         )(
