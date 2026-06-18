@@ -92,14 +92,20 @@ Options:
                                          Common values: 3600 (1h, default), 28800 (8h),
                                          86400 (1d), 604800 (1w).
     --show-info                          Show connection info for an already-deployed stack
-    --recover                            Recover an existing stack in place without changing
-                                         instance type / purchase mode. Heals:
+    --recover                            One-shot heal of an existing stack. Reproduces the
+                                         last-deployed shape automatically (no need to re-type
+                                         -t / --use-* ): instance type and purchase mode are
+                                         read back from the live LaunchTemplate. Heals:
                                            - stopped instance      -> start (Spot retry)
                                            - SG replaced by AWS    -> re-attach the CDK SG
                                            - EIP missing           -> allocate / reuse
-                                           - terminated instance   -> bump LT to force replace
+                                           - terminated / vanished instance -> recreate via CDK
+                                           - expired Capacity Block -> auto-pick an active SSM
+                                             slot reservation matching the instance type
                                            - filesystem persistence -> rerun setup-persistence.sh
-                                         Combine with --reallocate-eip to roll the public IP.
+                                         Pass -t / --use-spot / --use-capacity-block only to
+                                         CHANGE the shape during recovery. Combine with
+                                         --reallocate-eip to roll the public IP.
     --reallocate-eip                     Release the existing EIP and allocate a new one
                                          (use with --recover).
     --auto-heal-stack                    During a normal deploy, automatically delete a stack
@@ -211,8 +217,22 @@ EOF
 # Defaults
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 INSTANCE_TYPE="trn2.3xlarge"
+# Track whether the operator explicitly chose a shape on the command
+# line. `--recover` on its own must reproduce whatever the stack was
+# last deployed with (read back from the live LaunchTemplate), NOT
+# silently fall back to these hard-coded defaults — otherwise a bare
+# `deploy.sh --recover` on a vanished trn2.48xlarge/capacity-block stack
+# would try to recreate it as trn2.3xlarge/on-demand. These flags let the
+# recover path tell "operator asked for X" apart from "default X".
+INSTANCE_TYPE_EXPLICIT=false
+PURCHASE_MODE_EXPLICIT=false
 USE_CAPACITY_BLOCK=false
 CAPACITY_RESERVATION_ID=""
+# Set to the operator-supplied --capacity-reservation-id (if any). When
+# non-empty, the recover-time CR auto-heal is disabled: an explicit CR is
+# treated as a deliberate pin the operator owns, not something to second-
+# guess.
+CB_EXPLICIT_RES_ID=""
 # Named Capacity Block slot inside SSM Parameter Store. "default" reads
 # the legacy /capacity-block/<region>/reservation-id key; any other
 # value reads /capacity-block/<region>/slots/<name>/.
@@ -273,34 +293,42 @@ while [[ $# -gt 0 ]]; do
             ;;
         -t|--instance-type)
             INSTANCE_TYPE="$2"
+            INSTANCE_TYPE_EXPLICIT=true
             shift 2
             ;;
         --use-capacity-block)
             USE_CAPACITY_BLOCK=true
+            PURCHASE_MODE_EXPLICIT=true
             shift
             ;;
         --capacity-reservation-id)
             CAPACITY_RESERVATION_ID="$2"
+            CB_EXPLICIT_RES_ID="$2"
             USE_CAPACITY_BLOCK=true
+            PURCHASE_MODE_EXPLICIT=true
             shift 2
             ;;
         --slot)
             CB_SLOT="$2"
             USE_CAPACITY_BLOCK=true
+            PURCHASE_MODE_EXPLICIT=true
             shift 2
             ;;
         --use-spot)
             USE_SPOT=true
+            PURCHASE_MODE_EXPLICIT=true
             shift
             ;;
         --spot-max-price)
             SPOT_MAX_PRICE="$2"
             USE_SPOT=true
+            PURCHASE_MODE_EXPLICIT=true
             shift 2
             ;;
         --spot-interruption-behavior)
             SPOT_INTERRUPTION_BEHAVIOR="$2"
             USE_SPOT=true
+            PURCHASE_MODE_EXPLICIT=true
             shift 2
             ;;
         --efs-id)
@@ -1044,6 +1072,88 @@ describe_existing_shape() {
 }
 
 # ----------------------------------------------------------------------
+# Helper: reconstruct the deploy shape (instance type + purchase mode)
+# from the live LaunchTemplate when `--recover` is run WITHOUT an explicit
+# -t / --use-* flag.
+#
+# Why this exists:
+#   The original recover path only force-recreated a vanished instance if
+#   the operator re-passed the full shape (`-t trn2.48xlarge
+#   --use-capacity-block --slot ...`). A bare `deploy.sh --recover` fell
+#   back to the script defaults (trn2.3xlarge / on-demand), so the only
+#   reason it ever worked was the operator typing the shape every time.
+#   The user's requirement is that `--recover` ALONE heals any state.
+#
+#   The CFN stack always owns a LaunchTemplate whose $Latest version
+#   records exactly how the EC2 was last launched, so we read it back and
+#   re-seed INSTANCE_TYPE / USE_CAPACITY_BLOCK / USE_SPOT from there. Only
+#   fields the operator did NOT set explicitly are overwritten, so an
+#   intentional shape change (e.g. 3x -> 48x) still wins.
+#
+# Sets (globals): INSTANCE_TYPE, USE_CAPACITY_BLOCK, USE_SPOT,
+#                 SPOT_INTERRUPTION_BEHAVIOR.
+# ----------------------------------------------------------------------
+recover_seed_shape_from_launch_template() {
+    local sn="$1" rg="$2"
+    local lt_id lt_json lt_type lt_market lt_spot_behavior
+
+    lt_id=$(aws cloudformation describe-stack-resources --stack-name "$sn" --region "$rg" \
+        --query 'StackResources[?ResourceType==`AWS::EC2::LaunchTemplate`].PhysicalResourceId | [0]' \
+        --output text 2>/dev/null)
+    if [[ -z "$lt_id" ]] || [[ "$lt_id" == "None" ]]; then
+        echo -e "${YELLOW}[RECOVER] No LaunchTemplate found on stack; keeping current shape${NC}"
+        return 0
+    fi
+
+    lt_json=$(aws ec2 describe-launch-template-versions --region "$rg" \
+        --launch-template-id "$lt_id" --versions '$Latest' \
+        --query 'LaunchTemplateVersions[0].LaunchTemplateData' --output json 2>/dev/null)
+    [[ -z "$lt_json" ]] && return 0
+
+    lt_type=$(echo "$lt_json" | jq -r '.InstanceType // empty' 2>/dev/null)
+    # MarketType is "spot" or "capacity-block"; absent for on-demand.
+    lt_market=$(echo "$lt_json" | jq -r '.InstanceMarketOptions.MarketType // empty' 2>/dev/null)
+    lt_spot_behavior=$(echo "$lt_json" | jq -r '.InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior // empty' 2>/dev/null)
+    # capacity-block surfaces as a CapacityReservationTarget rather than a
+    # MarketType on some template revisions; treat either signal as CB.
+    if [[ -z "$lt_market" ]]; then
+        local lt_cr
+        lt_cr=$(echo "$lt_json" | jq -r '.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId // empty' 2>/dev/null)
+        [[ -n "$lt_cr" ]] && lt_market="capacity-block"
+    fi
+
+    # Instance type: adopt the LT value unless the operator typed -t.
+    if [[ "$INSTANCE_TYPE_EXPLICIT" != true ]] && [[ -n "$lt_type" ]]; then
+        if [[ "$INSTANCE_TYPE" != "$lt_type" ]]; then
+            echo -e "${BLUE}[RECOVER] Adopting instance type from LaunchTemplate: ${lt_type} (was default ${INSTANCE_TYPE})${NC}"
+        fi
+        INSTANCE_TYPE="$lt_type"
+    fi
+
+    # Purchase mode: adopt the LT value unless the operator typed a
+    # --use-* flag. This is what lets a bare `--recover` rebuild a
+    # capacity-block / spot instance instead of an on-demand one.
+    if [[ "$PURCHASE_MODE_EXPLICIT" != true ]]; then
+        case "$lt_market" in
+            capacity-block)
+                USE_CAPACITY_BLOCK=true
+                USE_SPOT=false
+                echo -e "${BLUE}[RECOVER] Adopting purchase mode from LaunchTemplate: capacity-block${NC}"
+                ;;
+            spot)
+                USE_SPOT=true
+                USE_CAPACITY_BLOCK=false
+                [[ -n "$lt_spot_behavior" ]] && SPOT_INTERRUPTION_BEHAVIOR="$lt_spot_behavior"
+                echo -e "${BLUE}[RECOVER] Adopting purchase mode from LaunchTemplate: spot (${SPOT_INTERRUPTION_BEHAVIOR})${NC}"
+                ;;
+            *)
+                echo -e "${BLUE}[RECOVER] LaunchTemplate purchase mode: on-demand${NC}"
+                ;;
+        esac
+    fi
+}
+
+# ----------------------------------------------------------------------
 # Helper: resolve a usable EFS file system id, in priority order:
 #
 #   1. CLI flag --efs-id (passed in as $1)
@@ -1288,6 +1398,18 @@ if [[ "$RECOVER" == true ]]; then
             ;;
     esac
 
+    # Re-seed INSTANCE_TYPE / purchase mode from the live LaunchTemplate so
+    # a bare `--recover` (no -t / --use-* flags) reproduces the shape the
+    # stack was last deployed with, instead of the script defaults. Runs
+    # for every recoverable status (including before we know whether the
+    # instance still exists) because the LaunchTemplate survives even when
+    # the EC2 is gone. Operator-supplied flags still win (see the
+    # *_EXPLICIT guards inside).
+    if [[ "$STACK_STATUS" == CREATE_COMPLETE || "$STACK_STATUS" == UPDATE_COMPLETE \
+       || "$STACK_STATUS" == UPDATE_ROLLBACK_COMPLETE || "$STACK_STATUS" == IMPORT_COMPLETE ]]; then
+        recover_seed_shape_from_launch_template "$STACK_NAME" "$REGION"
+    fi
+
     if [[ "$STACK_STATUS" == CREATE_COMPLETE || "$STACK_STATUS" == UPDATE_COMPLETE \
        || "$STACK_STATUS" == UPDATE_ROLLBACK_COMPLETE || "$STACK_STATUS" == IMPORT_COMPLETE ]]; then
 
@@ -1316,10 +1438,22 @@ if [[ "$RECOVER" == true ]]; then
             echo -e "  EFS:          ${YELLOW}(none — persistence will be skipped)${NC}"
         fi
 
-        # Diagnose
+        # Diagnose.
+        #
+        # When the EC2 has been fully deregistered from EC2 (CFN still
+        # records the old InstanceId but `describe-instances` returns an
+        # empty Reservations array — e.g. after a Capacity Block expires
+        # and AWS reclaims the host), `.Reservations[0].Instances[0]`
+        # resolves to null. The previous `.SecurityGroups[].GroupId`
+        # iterated that null directly, so jq aborted with
+        # "Cannot iterate over null" and `set -e` killed the whole
+        # recovery BEFORE the terminated/unknown branch below could fall
+        # through to FORCE_RECREATE. Guard every dereference with `?` /
+        # `// []` so a vanished instance degrades to STATE="unknown"
+        # (handled below) instead of crashing the script.
         INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --output json 2>/dev/null)
-        STATE=$(echo "$INSTANCE_INFO" | jq -r '.Reservations[0].Instances[0].State.Name // "unknown"')
-        CURRENT_SGS=$(echo "$INSTANCE_INFO" | jq -r '.Reservations[0].Instances[0].SecurityGroups[].GroupId // empty' | sort | tr '\n' ' ')
+        STATE=$(echo "$INSTANCE_INFO" | jq -r '.Reservations[0].Instances[0].State.Name // "unknown"' 2>/dev/null || echo "unknown")
+        CURRENT_SGS=$(echo "$INSTANCE_INFO" | jq -r '(.Reservations[0].Instances[0].SecurityGroups // [])[].GroupId // empty' 2>/dev/null | sort | tr '\n' ' ')
 
         echo "  State:        ${STATE:-unknown}"
         echo "  Current SG:   ${CURRENT_SGS:-(none)}"
@@ -1723,6 +1857,81 @@ if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
             echo "  Found: $CAPACITY_RESERVATION_ID"
         else
             echo -e "${YELLOW}  [WARN] Not found in Parameter Store${NC}"
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Validate the resolved Capacity Reservation and auto-heal a stale one.
+    #
+    # The #1 reason `--recover` failed in practice: Capacity Blocks are
+    # time-boxed. The SSM key (especially the legacy flat
+    # /capacity-block/<region>/reservation-id) keeps pointing at a CR that
+    # has already ended, so `cdk deploy` fails deep in CFN with an opaque
+    # "reservation not found / not active" error. Here we proactively
+    # check the CR and, if it is missing/expired/not-active, scan all
+    # SSM-registered slots for an `active` reservation that matches the
+    # requested instance type and adopt it automatically. Only engages
+    # when the operator did NOT pin an explicit --capacity-reservation-id.
+    # ------------------------------------------------------------------
+    cr_is_active() {
+        local cr="$1"
+        [[ -z "$cr" || "$cr" == "None" ]] && return 1
+        local st
+        st=$(aws ec2 describe-capacity-reservations --region "$REGION" \
+            --capacity-reservation-ids "$cr" \
+            --query 'CapacityReservations[0].State' --output text 2>/dev/null)
+        [[ "$st" == "active" ]]
+    }
+
+    if [[ -z "$CB_EXPLICIT_RES_ID" ]]; then
+        if cr_is_active "$CAPACITY_RESERVATION_ID"; then
+            echo -e "${GREEN}  [OK] Capacity Reservation ${CAPACITY_RESERVATION_ID} is active${NC}"
+        else
+            echo -e "${YELLOW}  [HEAL] Capacity Reservation '${CAPACITY_RESERVATION_ID:-<none>}' is missing/expired/not-active${NC}"
+            echo -e "${BLUE}  [HEAL] Scanning SSM slots for an active ${INSTANCE_TYPE} reservation...${NC}"
+            BEST_SLOT="" ; BEST_CR="" ; BEST_SUBNET="" ; BEST_END=""
+            # Enumerate every slot reservation-id key under this region.
+            while read -r pname; do
+                [[ -z "$pname" ]] && continue
+                slot_cr=$(aws ssm get-parameter --name "$pname" --region "$REGION" \
+                    --query 'Parameter.Value' --output text 2>/dev/null)
+                [[ -z "$slot_cr" || "$slot_cr" == "None" ]] && continue
+                # Pull state + type + end date in one call. The `|| true`
+                # is load-bearing: a since-deleted CR makes `aws` emit
+                # nothing, so `read` hits EOF and returns non-zero — under
+                # `set -e` that would abort the entire recovery instead of
+                # just skipping this slot.
+                cstate="" ; ctype="" ; cend=""
+                read -r cstate ctype cend < <(aws ec2 describe-capacity-reservations --region "$REGION" \
+                    --capacity-reservation-ids "$slot_cr" \
+                    --query 'CapacityReservations[0].[State,InstanceType,EndDate]' --output text 2>/dev/null) || true
+                [[ "$cstate" != "active" ]] && continue
+                [[ "$ctype" != "$INSTANCE_TYPE" ]] && continue
+                # Prefer the reservation that ends latest (most runway).
+                if [[ -z "$BEST_END" || "$cend" > "$BEST_END" ]]; then
+                    BEST_END="$cend"
+                    BEST_CR="$slot_cr"
+                    BEST_SLOT=$(echo "$pname" | sed -E 's#.*/slots/([^/]+)/reservation-id#\1#')
+                fi
+            done < <(aws ssm get-parameters-by-path \
+                --path "/capacity-block/${REGION}/slots/" --recursive --region "$REGION" \
+                --query "Parameters[?ends_with(Name,'reservation-id')].Name" --output text 2>/dev/null | tr '\t' '\n')
+
+            if [[ -n "$BEST_CR" ]]; then
+                CAPACITY_RESERVATION_ID="$BEST_CR"
+                CB_SLOT="$BEST_SLOT"
+                # Re-resolve the subnet for the chosen slot so they stay paired.
+                SUBNET_ID=$(aws ssm get-parameter \
+                    --name "/capacity-block/${REGION}/slots/${BEST_SLOT}/subnet-id" \
+                    --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null)
+                [[ "$SUBNET_ID" == "None" ]] && SUBNET_ID=""
+                echo -e "${GREEN}  [HEAL] Adopted active reservation ${CAPACITY_RESERVATION_ID} (slot=${BEST_SLOT}, ends ${BEST_END})${NC}"
+            else
+                echo -e "${RED}  [NG] No active ${INSTANCE_TYPE} Capacity Reservation found in any SSM slot.${NC}"
+                echo -e "${YELLOW}       Register one with manage-capacity-block.sh save-params --slot <name>,${NC}"
+                echo -e "${YELLOW}       or pass --capacity-reservation-id explicitly. Aborting before cdk deploy.${NC}"
+                exit 1
+            fi
         fi
     fi
 
