@@ -6,6 +6,8 @@
     "HF_CACHE_DIR": "/models/hf-cache",
     "COMPILED_MODELS_DIR": "/mnt/local/compiled_models_tp16",
     "COMPILER_WORKDIR": "/mnt/local/compiler_workdir",
+    "EFS_ROOT": "/mnt/efs/neuron-workspace",
+    "MODELS_DIR_NAME": "models",
     "VENV": "/opt/aws_neuronx_venv_pytorch_2_9_nxd_inference",
     "NEURON_CORES": "32-63",
     "WORLD_SIZE": "32",
@@ -35,20 +37,25 @@
     },
     {
       "id": "10-skip-if-cached",
-      "name": "Skip if all V3 CFG artifacts already exist",
-      "description": "transformer_v3_cfg/ + vae_encoder/ + vae_decoder/ + language_model_v3/ + vision_encoder_v3/ が揃っていれば exit 0。",
+      "name": "Skip only if a COMPLETE and CONSISTENT artifact set exists",
+      "description": "単に 5 ディレクトリが存在するだけでは SKIP しない。 過去に「stale な NEFF (world_size=8) と再生成された config/weights (world_size=32) が混在 -> serve.py が 'Expected 8 ranks, Received 32' で crash-loop」する事故が起きた。 ここでは transformer_v3_cfg に compile_transformer_v3_cfg.py が最後に書く .compile_stamp が存在し、 かつ weight shard 数 == stamp.tp_degree であることを確認できたときだけ SKIP する。 他の 4 コンポーネントは存在チェックのみ。 1 つでも崩れていれば再 compile する。 .compile_stamp を書かない旧アーティファクトは「未完了」とみなし安全側に倒して再 compile する。",
       "commands": [
         "set -e",
         "if [ '{{FORCE_RECOMPILE}}' = 'true' ]; then echo '[INFO] FORCE_RECOMPILE=true, will recompile'; exit 0; fi",
+        "D={{COMPILED_MODELS_DIR}}",
+        "T=$D/transformer_v3_cfg",
         "missing=0",
         "for d in transformer_v3_cfg vae_encoder vae_decoder language_model_v3 vision_encoder_v3; do",
-        "  if [ ! -d {{COMPILED_MODELS_DIR}}/$d ] || [ -z \"$(ls -A {{COMPILED_MODELS_DIR}}/$d 2>/dev/null)\" ]; then",
-        "    echo \"[INFO] missing artifact dir: $d\"",
-        "    missing=1",
-        "  fi",
+        "  if [ ! -d \"$D/$d\" ] || [ -z \"$(ls -A \"$D/$d\" 2>/dev/null)\" ]; then echo \"[INFO] missing artifact dir: $d\"; missing=1; fi",
         "done",
-        "if [ $missing -eq 0 ]; then echo '[OK] all artifacts present, skip compile'; mkdir -p {{COMPILED_MODELS_DIR}} && touch {{COMPILED_MODELS_DIR}}/.precompile_skipped; exit 0; fi",
-        "echo '[INFO] some artifacts missing, will compile'"
+        "if [ $missing -ne 0 ]; then echo '[INFO] some artifacts missing, will compile'; exit 0; fi",
+        "if [ ! -f \"$T/.compile_stamp\" ]; then echo '[INFO] transformer_v3_cfg has no .compile_stamp (incomplete or pre-stamp build), will recompile'; exit 0; fi",
+        "tp=$({{VENV}}/bin/python -c \"import json;print(json.load(open('$T/.compile_stamp')).get('tp_degree',0))\" 2>/dev/null || echo 0)",
+        "shards=$(ls \"$T/weights\"/tp*_sharded_checkpoint.safetensors 2>/dev/null | wc -l)",
+        "if [ \"$tp\" -le 0 ] || [ \"$shards\" -ne \"$tp\" ]; then echo \"[INFO] shard count $shards != stamp tp_degree $tp, will recompile\"; exit 0; fi",
+        "echo \"[OK] complete + consistent artifact set (tp_degree=$tp, shards=$shards); skip compile\"",
+        "touch \"$D/.precompile_skipped\"",
+        "exit 0"
       ]
     },
     {
@@ -87,7 +94,8 @@
     {
       "id": "40-compile",
       "name": "Run compile.sh v3_tp16 (~90-120 min, NeuronCore {{NEURON_CORES}}, world_size=32)",
-      "description": "compile.sh v3_tp16 は VAE + Transformer (V3 TP16) + Language Model + Vision Encoder の 4 コンポーネントを順に compile する。 NeuronCore は 32-63 (32 cores, world_size=32, TP=16, DP=2)。 24 attention heads は 32 にパディングされ 16 rank に分割 (2 heads/rank、25% padding overhead)。 edit ステージのレイテンシ削減を最優先。",
+      "description": "compile.sh v3_tp16 は VAE + Transformer (V3 TP16) + Language Model + Vision Encoder の 4 コンポーネントを順に compile する。 NeuronCore は 32-63 (32 cores, world_size=32, TP=16, DP=2)。 24 attention heads は 32 にパディングされ 16 rank に分割 (2 heads/rank、25% padding overhead)。 edit ステージのレイテンシ削減を最優先。 always_run: コマンド文字列が不変でも run-tasks.sh の state cache でスキップさせない (アーティファクト削除後の再 compile が握り潰される事故を防ぐ)。 実際のスキップ判定は冒頭の .precompile_skipped ガードが担う。",
+      "always_run": true,
       "commands": [
         "set -e",
         "if [ -f {{COMPILED_MODELS_DIR}}/.precompile_skipped ] && [ '{{FORCE_RECOMPILE}}' != 'true' ]; then echo '[OK] skipped (cached)'; exit 0; fi",
@@ -105,13 +113,14 @@
         "echo '[INFO] starting compile.sh v3_tp16 (this populates Neuron compile cache, ~90-120 min)'",
         "bash compile.sh v3_tp16 {{HEIGHT}} {{WIDTH}} {{IMAGE_SIZE}} 8 {{MAX_SEQ_LEN}} {{PATCH_MULTIPLIER}} 1",
         "echo '[OK] compile.sh v3_tp16 finished'",
-        "id {{SERVE_USER}} >/dev/null 2>&1 && { chown -R {{SERVE_USER}}:{{SERVE_USER}} {{COMPILED_MODELS_DIR}} && chmod -R u+rwX,go+rX {{COMPILED_MODELS_DIR}}; } || echo '[WARN] {{SERVE_USER}} missing on this host; skipping chown (server will need manual ownership fix)'"
+        "test -f {{COMPILED_MODELS_DIR}}/transformer_v3_cfg/.compile_stamp || { echo '[NG] compile.sh exited 0 but no .compile_stamp was written -> incomplete compile, refusing to publish'; exit 1; }",
+        "if id {{SERVE_USER}} >/dev/null 2>&1; then chown -R {{SERVE_USER}}:{{SERVE_USER}} {{COMPILED_MODELS_DIR}} || { echo '[NG] chown to {{SERVE_USER}} failed for {{COMPILED_MODELS_DIR}} (EFS root-squash or wrong owner?). The ubuntu-run server would hit EACCES/FileNotFoundError on the weights, so abort here.'; exit 1; }; chmod -R u+rwX,go+rX {{COMPILED_MODELS_DIR}} || { echo '[NG] chmod failed for {{COMPILED_MODELS_DIR}}'; exit 1; }; echo '[OK] artifacts owned by {{SERVE_USER}}, world-readable'; else echo '[WARN] serve user {{SERVE_USER}} not present on this host; skipping chown'; fi"
       ]
     },
     {
       "id": "50-verify",
-      "name": "Verify all V3 CFG artifacts present",
-      "description": "transformer_v3_cfg/ + vae_encoder/ + vae_decoder/ + language_model_v3/ + vision_encoder_v3/ が空でないことを確認。",
+      "name": "Verify artifacts present AND transformer layout is self-consistent",
+      "description": "5 コンポーネントが空でないことに加え、 transformer_v3_cfg を verify_artifacts.py の整合性ゲートに通す (.compile_stamp の world_size/tp_degree が config.json と一致し、 weight shard 数 == tp_degree)。 これは serve.py 起動時と同一の不変条件であり、 不整合なセットを publish 段階で確実に止める。 (nxd_model.pt の rank は CPU では読めないため stamp が真実の源。 nxd_model.pt と weights の mtime 比較はしない — compiler は graph を weights より先に書くので正常時も graph が古く、 誤検知の原因になる。)",
       "commands": [
         "set -e",
         "for d in transformer_v3_cfg vae_encoder vae_decoder language_model_v3 vision_encoder_v3; do",
@@ -121,7 +130,39 @@
         "  size=$(du -sh {{COMPILED_MODELS_DIR}}/$d | awk '{print $1}')",
         "  echo \"  [OK] $d ($size, $count entries)\"",
         "done",
-        "echo '[OK] all V3 CFG artifacts verified'"
+        "T={{COMPILED_MODELS_DIR}}/transformer_v3_cfg",
+        "if [ -f {{WORK_DIR}}/neuron_qwen_image_edit/verify_artifacts.py ]; then",
+        "  PYTHONPATH={{WORK_DIR}}:${PYTHONPATH:-} {{VENV}}/bin/python -m neuron_qwen_image_edit.verify_artifacts \"$T\" || { echo '[NG] transformer consistency gate failed'; exit 1; }",
+        "else",
+        "  echo '[INFO] verify_artifacts.py not in WORK_DIR (compile was skipped / restored from EFS); running an inline equivalent gate'",
+        "  test -f \"$T/.compile_stamp\" || { echo '[NG] no .compile_stamp -> incomplete/legacy artifact set'; exit 1; }",
+        "  sw=$({{VENV}}/bin/python -c \"import json;print(json.load(open('$T/.compile_stamp'))['world_size'])\" 2>/dev/null || echo x)",
+        "  cw=$({{VENV}}/bin/python -c \"import json;print(json.load(open('$T/config.json'))['world_size'])\" 2>/dev/null || echo y)",
+        "  st=$({{VENV}}/bin/python -c \"import json;print(json.load(open('$T/.compile_stamp'))['tp_degree'])\" 2>/dev/null || echo 0)",
+        "  sh=$(ls \"$T/weights\"/tp*_sharded_checkpoint.safetensors 2>/dev/null | wc -l)",
+        "  [ \"$sw\" = \"$cw\" ] || { echo \"[NG] stamp world_size=$sw != config world_size=$cw\"; exit 1; }",
+        "  [ \"$st\" -gt 0 ] && [ \"$sh\" -eq \"$st\" ] || { echo \"[NG] shard count $sh != tp_degree $st\"; exit 1; }",
+        "  echo \"[OK] inline gate: world_size=$cw, tp_degree=$st, shards=$sh\"",
+        "fi",
+        "echo '[OK] all V3 CFG artifacts verified + transformer layout consistent'"
+      ]
+    },
+    {
+      "id": "60-persist-to-efs",
+      "name": "Persist the verified compiled set to EFS for fast recover",
+      "description": "compile artifact は NVMe (/mnt/local) にあり instance 交換で消える。 検証済みの完成セットを EFS の qwen-image-edit-compiled/ に rsync して永続化し、 次回 recover 時に setup-efs-paths の 50-restore-compiled-models が EFS->NVMe へ戻せるようにする (90-120 分の再 compile を回避)。 .compile_stamp も含めて転送するので、 restore 後も整合性ゲートが効く。 EFS が未マウントなら skip (壊さない)。",
+      "commands": [
+        "set -e",
+        "EFS_DST={{EFS_ROOT}}/{{MODELS_DIR_NAME}}/qwen-image-edit-compiled",
+        "if ! mountpoint -q /mnt/efs 2>/dev/null; then echo '[WARN] /mnt/efs not mounted; skipping EFS persist (NVMe-only this run)'; exit 0; fi",
+        "test -f {{COMPILED_MODELS_DIR}}/transformer_v3_cfg/.compile_stamp || { echo '[NG] refusing to persist an unstamped (incomplete) set'; exit 1; }",
+        "mkdir -p \"$EFS_DST\"",
+        "echo '[INFO] persisting compiled set NVMe -> EFS (~5-10 min)'",
+        "rsync -a --delete {{COMPILED_MODELS_DIR}}/ \"$EFS_DST\"/",
+        "test -f \"$EFS_DST/transformer_v3_cfg/.compile_stamp\" || { echo '[NG] stamp missing on EFS after rsync'; exit 1; }",
+        "_owner=$(getent passwd ubuntu >/dev/null 2>&1 && echo 'ubuntu:ubuntu' || echo 'root:root')",
+        "chown -R \"$_owner\" \"$EFS_DST\" 2>/dev/null || true",
+        "echo '[OK] compiled set persisted to EFS; next recover can restore without recompiling'"
       ]
     }
   ]

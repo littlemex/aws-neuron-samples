@@ -178,6 +178,50 @@ def load_pipeline():
     pipe.processor.image_processor.min_pixels = target_pixels
     pipe.processor.image_processor.max_pixels = target_pixels
 
+    # Consistency gate (post-incident 2026-06): refuse to load an artifact set
+    # whose graph / config / weight-shard layout disagree, instead of crash-
+    # looping inside to_neuron() with "Expected weight tensors for N ranks".
+    # The transformer compile writes a .compile_stamp LAST; if it is present we
+    # enforce stamp == config and shard_count == tp_degree. A missing stamp
+    # means artifacts pre-date this change: warn and continue unless
+    # QIE_REQUIRE_STAMP=1 demands strictness.
+    transformer_dir = os.path.join(args.compiled_models_dir, "transformer_v3_cfg")
+    if os.path.isdir(transformer_dir):
+        try:
+            from neuron_qwen_image_edit.verify_artifacts import (
+                verify_component,
+                ArtifactInconsistencyError,
+            )
+        except ImportError:
+            # serve.py lives in the qwen-image-edit dir; load the module by its
+            # absolute path next to this file so the gate works regardless of
+            # how sys.path was set up by the launcher.
+            import importlib.util
+            _vp = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "neuron_qwen_image_edit", "verify_artifacts.py",
+            )
+            _spec = importlib.util.spec_from_file_location("qie_verify_artifacts", _vp)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            verify_component = _mod.verify_component
+            ArtifactInconsistencyError = _mod.ArtifactInconsistencyError
+        require_stamp = os.environ.get("QIE_REQUIRE_STAMP", "0") == "1"
+        has_stamp = os.path.isfile(os.path.join(transformer_dir, ".compile_stamp"))
+        if has_stamp or require_stamp:
+            try:
+                verify_component(transformer_dir, require_stamp=True)
+            except ArtifactInconsistencyError as exc:
+                print(f"[FATAL] artifact consistency check failed: {exc}", flush=True)
+                raise SystemExit(1)
+        else:
+            print(
+                "[WARN] transformer_v3_cfg has no .compile_stamp (pre-dates the "
+                "completion-stamp change); skipping consistency gate. Recompile "
+                "to enable it, or set QIE_REQUIRE_STAMP=1 to enforce.",
+                flush=True,
+            )
+
     print("Loading compiled Neuron models (this takes a few minutes)...")
     pipe = inference_module.load_all_compiled_models(args.compiled_models_dir, pipe, args)
 

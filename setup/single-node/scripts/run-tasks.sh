@@ -459,7 +459,19 @@ for idx, task in enumerate(task_definition['tasks'], 1):
     # 'pending-rerun' above). Tasks whose rendered commands changed --
     # for example a new tarball URL with a different S3 key, a bumped
     # port, or a re-staged source -- fall through and execute again.
-    if task_id in state['tasks'] and state['tasks'][task_id].get('status') == 'success':
+    # A task may opt out of the state-file short-circuit with "always_run": true.
+    # Use this for tasks whose correctness depends on the CURRENT on-host state,
+    # not just on their command text — e.g. the qwen-image-edit compile, which
+    # carries its own cheap idempotency check (a .compile_stamp consistency
+    # gate). Without this, deleting a stale/corrupt artifact set and re-running
+    # would be silently skipped as "Already completed" because the command text
+    # (hence fingerprint) never changed — exactly the trap that blocked recovery
+    # during the 2026-06 incident. always_run tasks still record their status;
+    # they just never get short-circuited.
+    always_run = bool(task.get('always_run', False))
+    if (not always_run
+            and task_id in state['tasks']
+            and state['tasks'][task_id].get('status') == 'success'):
         prev_fp = state['tasks'][task_id].get('fingerprint')
         if prev_fp == current_fp:
             log_success(f"[{idx}/{total_tasks}] Already completed: {task_id} - {task_name}")

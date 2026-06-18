@@ -48,6 +48,38 @@ else
     COMPILED_MODELS_DIR="/mnt/local/compiled_models"
 fi
 
+# ---------------------------------------------------------------------------
+# Scope the Neuron compiler workdir AND the persistent compile cache PER
+# VERSION_MODE so that a graph compiled for one parallel layout can never be
+# served back for a different one.
+#
+# Why this matters (post-incident, 2026-06): the Neuron compile cache keys
+# entries on sha256(HLO + compiler_flags). The CFG-parallel transformer's HLO
+# does not differ enough across world_size to force a distinct key, so a
+# v3_cfg build (world_size=8) could hit-cache and return an 8-rank NEFF for a
+# v3_tp16 request (world_size=32) in ~3 minutes. config.json/weights were then
+# regenerated at 32 while the graph stayed at 8 -> serve.py crash-loops with
+# "Expected weight tensors for 8 ranks. Received 32". Isolating the cache root
+# by VERSION_MODE makes a stale cross-layout hit structurally impossible, while
+# still letting same-layout recompiles hit-cache correctly (fast + correct).
+#
+# NEURON_COMPILE_CACHE_URL is honoured by libneuronxla's CompileCache; the
+# per-mode compiler_workdir keeps the scratch HLO/NEFF artifacts separated too.
+# Operators can override either via the environment before calling compile.sh.
+# ---------------------------------------------------------------------------
+COMPILER_WORKDIR="${COMPILER_WORKDIR%/}/${VERSION_MODE}"
+# Bare filesystem path (NOT a file:// URL): this matches how the rest of the
+# repo sets NEURON_COMPILE_CACHE_URL (setup-persistence.sh, samples/models/qwen3-vl)
+# and is the form libneuronxla's CompileCache resolves. A wrong value here would
+# silently fall back to the default cache location and defeat the scoping, so we
+# keep it identical to the known-good usage elsewhere.
+export NEURON_COMPILE_CACHE_URL="${NEURON_COMPILE_CACHE_URL:-/mnt/local/neuron-compile-cache/${VERSION_MODE}}"
+# Surface the mode to the python compile scripts so the completion stamp can
+# record which layout produced the artifacts.
+export VERSION_MODE
+echo "Compiler workdir:        ${COMPILER_WORKDIR}"
+echo "Neuron compile cache:    ${NEURON_COMPILE_CACHE_URL}"
+
 # Parse arguments
 HEIGHT=${1:-1024}
 WIDTH=${2:-1024}
