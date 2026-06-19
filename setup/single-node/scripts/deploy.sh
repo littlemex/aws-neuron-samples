@@ -226,6 +226,7 @@ INSTANCE_TYPE="trn2.3xlarge"
 # recover path tell "operator asked for X" apart from "default X".
 INSTANCE_TYPE_EXPLICIT=false
 PURCHASE_MODE_EXPLICIT=false
+VOLUME_SIZE_EXPLICIT=false
 USE_CAPACITY_BLOCK=false
 CAPACITY_RESERVATION_ID=""
 # Set to the operator-supplied --capacity-reservation-id (if any). When
@@ -349,6 +350,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --volume-size)
             VOLUME_SIZE="$2"
+            VOLUME_SIZE_EXPLICIT=true
             shift 2
             ;;
         --allowed-ip)
@@ -1139,6 +1141,18 @@ recover_seed_shape_from_launch_template() {
                 USE_CAPACITY_BLOCK=true
                 USE_SPOT=false
                 echo -e "${BLUE}[RECOVER] Adopting purchase mode from LaunchTemplate: capacity-block${NC}"
+                # [lt-cr-id-not-seeded] Seed CAPACITY_RESERVATION_ID from LaunchTemplate so the
+                # downstream SSM lookup is skipped and the heal scan is not triggered unnecessarily.
+                if [[ -z "$CB_EXPLICIT_RES_ID" ]]; then
+                    local lt_cr_seed
+                    lt_cr_seed=$(echo "$lt_json" | jq -r \
+                        '.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId // empty' \
+                        2>/dev/null)
+                    if [[ -n "$lt_cr_seed" ]]; then
+                        CAPACITY_RESERVATION_ID="$lt_cr_seed"
+                        echo -e "${BLUE}[RECOVER] Seeding CAPACITY_RESERVATION_ID from LaunchTemplate: $lt_cr_seed${NC}"
+                    fi
+                fi
                 ;;
             spot)
                 USE_SPOT=true
@@ -1150,6 +1164,18 @@ recover_seed_shape_from_launch_template() {
                 echo -e "${BLUE}[RECOVER] LaunchTemplate purchase mode: on-demand${NC}"
                 ;;
         esac
+    fi
+
+    # [volume-size-not-round-tripped] Adopt root volume size from LT unless operator pinned it.
+    if [[ "$VOLUME_SIZE_EXPLICIT" != true ]]; then
+        local lt_vol
+        lt_vol=$(echo "$lt_json" | jq -r '.BlockDeviceMappings[0].Ebs.VolumeSize // empty' 2>/dev/null)
+        if [[ -n "$lt_vol" && "$lt_vol" != "null" ]]; then
+            if [[ "$VOLUME_SIZE" != "$lt_vol" ]]; then
+                echo -e "${BLUE}[RECOVER] Adopting root volume size from LaunchTemplate: ${lt_vol} GB (was default ${VOLUME_SIZE})${NC}"
+            fi
+            VOLUME_SIZE="$lt_vol"
+        fi
     fi
 }
 
@@ -1287,7 +1313,49 @@ reregister_alb_targets() {
             echo -e "      ${YELLOW}[WARN] register-targets failed for $tg_name${NC}"
         }
     done
-    echo -e "${GREEN}    [OK] ALB target groups synced${NC}"
+    echo -e "${GREEN}    [OK] ALB instance-type target groups synced${NC}"
+
+    # [neuron-anatomy-ip-tg-not-reregistered] Also re-register IP-type target groups
+    # (e.g. NeuronAnatomyStack uses TargetType=ip with the instance private IP baked in).
+    # IP-type TGs do NOT auto-deregister terminated hosts, so stale entries accumulate.
+    local ip_tgs new_private_ip
+    ip_tgs=$(aws elbv2 describe-target-groups --load-balancer-arn "$alb_arn" --region "$rg" \
+        --query 'TargetGroups[?TargetType==`ip`].TargetGroupArn' --output text 2>/dev/null)
+    if [[ -n "$ip_tgs" ]]; then
+        new_private_ip=$(aws ec2 describe-instances --instance-ids "$instance_id" --region "$rg" \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text 2>/dev/null || true)
+        if [[ -n "$new_private_ip" && "$new_private_ip" != "None" ]]; then
+            echo -e "${BLUE}[ALB-TG] Re-registering IP-type target groups (new private IP: $new_private_ip)${NC}"
+            for tg_arn in $ip_tgs; do
+                local ip_tg_name ip_tg_port existing_targets
+                ip_tg_name=$(aws elbv2 describe-target-groups --target-group-arns "$tg_arn" --region "$rg" \
+                    --query 'TargetGroups[0].TargetGroupName' --output text 2>/dev/null)
+                ip_tg_port=$(aws elbv2 describe-target-groups --target-group-arns "$tg_arn" --region "$rg" \
+                    --query 'TargetGroups[0].Port' --output text 2>/dev/null)
+                # Deregister stale IPs (any that are NOT the new instance's private IP).
+                existing_targets=$(aws elbv2 describe-target-health --target-group-arn "$tg_arn" --region "$rg" \
+                    --query 'TargetHealthDescriptions[].Target.Id' --output text 2>/dev/null || true)
+                for stale_ip in $existing_targets; do
+                    if [[ "$stale_ip" != "$new_private_ip" ]]; then
+                        echo "    [DEREGISTER] $ip_tg_name: removing stale IP $stale_ip"
+                        aws elbv2 deregister-targets --target-group-arn "$tg_arn" --region "$rg" \
+                            --targets "Id=${stale_ip},Port=${ip_tg_port}" >/dev/null 2>&1 || true
+                    fi
+                done
+                # Register new private IP if not already present.
+                if [[ "$existing_targets" == *"$new_private_ip"* ]]; then
+                    echo "    [OK] $ip_tg_name (port=$ip_tg_port) already has $new_private_ip"
+                else
+                    echo "    [REGISTER] $ip_tg_name (port=$ip_tg_port) <- $new_private_ip"
+                    aws elbv2 register-targets --target-group-arn "$tg_arn" --region "$rg" \
+                        --targets "Id=${new_private_ip},Port=${ip_tg_port}" >/dev/null 2>&1 || {
+                        echo -e "      ${YELLOW}[WARN] register-targets failed for $ip_tg_name${NC}"
+                    }
+                fi
+            done
+            echo -e "${GREEN}    [OK] ALB IP-type target groups synced${NC}"
+        fi
+    fi
 }
 
 # ----------------------------------------------------------------------
@@ -1346,6 +1414,156 @@ maybe_heal_stack() {
 }
 
 # ----------------------------------------------------------------------
+# Helper: deploy_auth_stacks
+# ----------------------------------------------------------------------
+# Re-deploys cognito + alb + frontend in ONE cdk run so that CloudFormation
+# ExportsOutput* bridge outputs are never dropped while sibling stacks hold
+# active Fn::ImportValue references against them (root cause of the
+# UPDATE_ROLLBACK_COMPLETE cycle).
+#
+# Args:
+#   $1  = base stack name (STACK_NAME)
+#   $2  = EC2 instance id to wire into albEc2InstanceId
+#   $3  = EC2 security group id (SG of the instance) — pass "" or "None" to
+#         fall back to CDK_SG_ID
+#   $4  = CDK directory
+#   $5  = AWS region
+#
+# Reads back cognitoDomainPrefix and operatorEmail from the live Cognito
+# stack outputs so re-runs produce a no-op diff on those parameters.
+# SESSION_TTL_SECONDS is forwarded when non-empty.
+# OPERATOR_PASSWORD_SECRET_ARN is recovered from Secrets Manager when empty.
+# Fresh deploys where siblings are all MISSING are a no-op (inner guard).
+# ----------------------------------------------------------------------
+deploy_auth_stacks() {
+    local base_stack="$1"
+    local ec2_instance_id="$2"
+    local ec2_sg_arg="$3"
+    local cdk_dir="$4"
+    local rg="$5"
+
+    local cognito_sn="${base_stack}-cognito"
+    local alb_sn="${base_stack}-alb"
+    local frontend_sn="${base_stack}-frontend"
+
+    # Determine which sibling stacks exist and their health.
+    local cognito_st alb_st frontend_st
+    cognito_st=$(get_stack_status "$cognito_sn" "$rg" 2>/dev/null || echo "MISSING")
+    alb_st=$(get_stack_status "$alb_sn" "$rg" 2>/dev/null || echo "MISSING")
+    frontend_st=$(get_stack_status "$frontend_sn" "$rg" 2>/dev/null || echo "MISSING")
+
+    # If no auth sibling exists at all, nothing to do.
+    if [[ "$cognito_st" == "MISSING" && "$alb_st" == "MISSING" && "$frontend_st" == "MISSING" ]]; then
+        return 0
+    fi
+
+    # Check if any sibling needs healing (unhealthy = not a clean terminal good state).
+    local needs_heal=false
+    local _good_re='^(CREATE_COMPLETE|UPDATE_COMPLETE|IMPORT_COMPLETE)$'
+    [[ ! "$cognito_st" =~ $_good_re && "$cognito_st" != "MISSING" ]] && needs_heal=true
+    [[ ! "$alb_st" =~ $_good_re && "$alb_st" != "MISSING" ]] && needs_heal=true
+    [[ ! "$frontend_st" =~ $_good_re && "$frontend_st" != "MISSING" ]] && needs_heal=true
+
+    # Always run when SESSION_TTL_SECONDS is non-empty (propagate TTL change even if healthy).
+    [[ -n "$SESSION_TTL_SECONDS" ]] && needs_heal=true
+
+    if [[ "$needs_heal" != true ]]; then
+        # All siblings healthy and no config change — skip to avoid ~60s CDK no-op overhead.
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BLUE}[AUTH] Re-deploying auth stacks (cognito=${cognito_st} alb=${alb_st} frontend=${frontend_st})${NC}"
+
+    # Resolve EC2 SG: prefer the passed arg, fall back to CDK_SG_ID (from fast path).
+    local sg_used="$ec2_sg_arg"
+    if [[ -z "$sg_used" || "$sg_used" == "None" ]]; then
+        sg_used="${CDK_SG_ID:-}"
+    fi
+    # Last resort: query live instance SG.
+    if [[ -z "$sg_used" || "$sg_used" == "None" ]] && [[ -n "$ec2_instance_id" ]]; then
+        sg_used=$(aws ec2 describe-instances --instance-ids "$ec2_instance_id" --region "$rg" \
+            --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' \
+            --output text 2>/dev/null || true)
+    fi
+    [[ "$sg_used" == "None" ]] && sg_used=""
+
+    # Round-trip cognitoDomainPrefix and operatorEmail from existing Cognito outputs.
+    local existing_domain existing_email
+    existing_domain=$(aws cloudformation describe-stacks --stack-name "$cognito_sn" --region "$rg" \
+        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' \
+        --output text 2>/dev/null || true)
+    existing_email=$(aws cloudformation describe-stacks --stack-name "$cognito_sn" --region "$rg" \
+        --query 'Stacks[0].Outputs[?OutputKey==`OperatorEmail`].OutputValue' \
+        --output text 2>/dev/null || true)
+    [[ "$existing_domain" == "None" ]] && existing_domain=""
+    [[ "$existing_email" == "None" ]] && existing_email=""
+
+    # CLI values win; stack outputs fill in when CLI didn't pass them.
+    local domain_used email_used
+    domain_used="${COGNITO_DOMAIN_PREFIX:-$existing_domain}"
+    email_used="${OPERATOR_EMAIL:-$existing_email}"
+
+    # Round-trip the operator-password secret ARN from Secrets Manager when not supplied.
+    local op_secret_arn_used="$OPERATOR_PASSWORD_SECRET_ARN"
+    if [[ -z "$op_secret_arn_used" ]]; then
+        local _recovered_arn
+        _recovered_arn=$(aws secretsmanager describe-secret \
+            --secret-id "${base_stack}-operator-password" \
+            --region "$rg" \
+            --query 'ARN' --output text 2>/dev/null || true)
+        if [[ -n "$_recovered_arn" && "$_recovered_arn" != "None" ]]; then
+            op_secret_arn_used="$_recovered_arn"
+        fi
+    fi
+
+    # Build the combined CDK params array.
+    local auth_params=(
+        "-c" "stackName=$base_stack"
+        "-c" "createCognito=true"
+        "-c" "createAlbBackend=true"
+        "-c" "createCloudFrontFrontend=true"
+    )
+    if [[ -n "$ec2_instance_id" && "$ec2_instance_id" != "None" ]]; then
+        auth_params+=("-c" "albEc2InstanceId=$ec2_instance_id")
+    fi
+    if [[ -n "$sg_used" ]]; then
+        auth_params+=("-c" "albEc2SecurityGroupId=$sg_used")
+    fi
+    [[ -n "$SESSION_TTL_SECONDS" ]] && auth_params+=("-c" "sessionTtlSeconds=$SESSION_TTL_SECONDS")
+    [[ -n "$domain_used" ]] && auth_params+=("-c" "cognitoDomainPrefix=$domain_used")
+    [[ -n "$email_used" ]] && auth_params+=("-c" "operatorEmail=$email_used")
+    [[ -n "$op_secret_arn_used" ]] && auth_params+=("-c" "operatorPasswordSecretArn=$op_secret_arn_used")
+    [[ -n "$PROJECT" ]] && auth_params+=("-c" "project=$PROJECT")
+    [[ -n "$PURPOSE" ]] && auth_params+=("-c" "purpose=$PURPOSE")
+
+    # Determine which stacks to include in the deploy target.
+    local deploy_targets=()
+    [[ "$cognito_st" != "MISSING" ]] && deploy_targets+=("$cognito_sn")
+    [[ "$alb_st" != "MISSING" ]] && deploy_targets+=("$alb_sn")
+    [[ "$frontend_st" != "MISSING" ]] && deploy_targets+=("$frontend_sn")
+
+    if [[ ${#deploy_targets[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    ensure_cdk_node_modules "$cdk_dir" || return 1
+    (cd "$cdk_dir" && npm run build 2>/dev/null | tail -5 || true)
+    (cd "$cdk_dir" && aws_creds_refresh && \
+        AWS_REGION="$rg" AWS_DEFAULT_REGION="$rg" \
+        npx cdk deploy \
+            "${deploy_targets[@]}" \
+            "${auth_params[@]}" \
+            --require-approval never) || {
+        echo -e "${YELLOW}[WARN] auth-stack re-deploy failed — sibling stacks may still be unhealthy.${NC}"
+        echo -e "${YELLOW}       Re-run manually:${NC}"
+        echo -e "${YELLOW}       cd $cdk_dir && npx cdk deploy ${deploy_targets[*]} ${auth_params[*]}${NC}"
+        return 1
+    }
+    echo -e "${GREEN}[OK] auth stacks re-deployed (cognito=${cognito_sn} alb=${alb_sn} frontend=${frontend_sn})${NC}"
+}
+
+# ----------------------------------------------------------------------
 # Recover mode (--recover)
 # ----------------------------------------------------------------------
 # Heal an existing stack in place WITHOUT changing instance type or
@@ -1387,6 +1605,26 @@ if [[ "$RECOVER" == true ]]; then
             AUTO_HEAL_STACK=true
             # Allow the rest of deploy.sh to run with the current --instance-type / --use-* flags.
             ;;
+        UPDATE_ROLLBACK_FAILED)
+            # [B-5/update-rollback-failed-unhandled] ContinueUpdateRollback moves the stack
+            # from UPDATE_ROLLBACK_FAILED -> UPDATE_ROLLBACK_COMPLETE so the fast-path can run.
+            echo -e "${YELLOW}[RECOVER] Stack is UPDATE_ROLLBACK_FAILED — attempting ContinueUpdateRollback${NC}"
+            if ! aws cloudformation continue-update-rollback \
+                    --stack-name "$STACK_NAME" --region "$REGION" 2>&1; then
+                echo -e "${RED}[NG] ContinueUpdateRollback failed.${NC}"
+                echo -e "${RED}     Inspect the stack events, then run manually:${NC}"
+                echo -e "${RED}       aws cloudformation continue-update-rollback --stack-name $STACK_NAME --region $REGION${NC}"
+                exit 1
+            fi
+            echo -e "${BLUE}[RECOVER] Waiting for rollback to complete (up to 10 min)...${NC}"
+            for i in $(seq 1 20); do
+                sleep 30
+                S=$(get_stack_status "$STACK_NAME" "$REGION")
+                echo "    wait $i: $S"
+                case "$S" in *_IN_PROGRESS) ;; *) STACK_STATUS="$S"; break ;; esac
+            done
+            echo -e "${GREEN}[RECOVER] Stack is now $STACK_STATUS after ContinueUpdateRollback${NC}"
+            ;;
         *_IN_PROGRESS)
             echo -e "${YELLOW}[RECOVER] Stack is $STACK_STATUS; waiting for completion before recovery${NC}"
             for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
@@ -1397,6 +1635,25 @@ if [[ "$RECOVER" == true ]]; then
             done
             ;;
     esac
+
+    # [B-5/rollback-complete-post-in-progress-wait] Re-evaluate STACK_STATUS after any wait loop.
+    # The *_IN_PROGRESS wait may have resolved to ROLLBACK_COMPLETE/CREATE_FAILED/DELETE_FAILED
+    # or UPDATE_ROLLBACK_FAILED; handle them inline because maybe_heal_stack is gated out for --recover.
+    if [[ "$STACK_STATUS" =~ ^(ROLLBACK_COMPLETE|CREATE_FAILED|DELETE_FAILED)$ ]]; then
+        echo -e "${YELLOW}[RECOVER] Stack resolved to $STACK_STATUS — deleting before redeploy${NC}"
+        aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$REGION"
+        aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$REGION" || true
+        STACK_STATUS="MISSING"
+        AUTO_HEAL_STACK=true
+    elif [[ "$STACK_STATUS" == "UPDATE_ROLLBACK_FAILED" ]]; then
+        echo -e "${RED}[RECOVER] Stack is still UPDATE_ROLLBACK_FAILED after wait — aborting.${NC}" >&2
+        echo -e "${RED}          Inspect the stack events, then:${NC}" >&2
+        echo -e "${RED}            aws cloudformation continue-update-rollback --stack-name $STACK_NAME --region $REGION${NC}" >&2
+        exit 1
+    elif [[ "$STACK_STATUS" =~ _IN_PROGRESS$ ]]; then
+        echo -e "${RED}[RECOVER] Stack still $STACK_STATUS after 7.5-min wait — aborting${NC}" >&2
+        exit 1
+    fi
 
     # Re-seed INSTANCE_TYPE / purchase mode from the live LaunchTemplate so
     # a bare `--recover` (no -t / --use-* flags) reproduces the shape the
@@ -1430,6 +1687,20 @@ if [[ "$RECOVER" == true ]]; then
             STACK_EFS_ID=""
         fi
 
+        # [efs-subpath-not-round-tripped] Back-fill EFS_SUBPATH from the stack output when the
+        # operator did not pass --efs-subpath. Without this, setup-persistence.sh always uses
+        # /neuron-workspace even when the original deploy used a custom subpath.
+        if [[ -z "$EFS_SUBPATH" ]]; then
+            _cfn_subpath=$(aws cloudformation describe-stacks \
+                --stack-name "$STACK_NAME" --region "$REGION" \
+                --query 'Stacks[0].Outputs[?OutputKey==`EfsSubpath`].OutputValue' \
+                --output text 2>/dev/null || true)
+            if [[ -n "$_cfn_subpath" && "$_cfn_subpath" != "None" ]]; then
+                EFS_SUBPATH="$_cfn_subpath"
+                echo -e "${BLUE}[RECOVER] Adopting EFS subpath from stack output: $EFS_SUBPATH${NC}"
+            fi
+        fi
+
         echo "  Instance ID:  $INSTANCE_ID"
         echo "  CDK SG:       $CDK_SG_ID"
         if [[ -n "$STACK_EFS_ID" ]]; then
@@ -1457,6 +1728,19 @@ if [[ "$RECOVER" == true ]]; then
 
         echo "  State:        ${STATE:-unknown}"
         echo "  Current SG:   ${CURRENT_SGS:-(none)}"
+
+        # [B-7/stopping-instance-no-wait] Wait for 'stopping' to finish before state dispatch.
+        if [[ "$STATE" == "stopping" ]]; then
+            echo -e "${YELLOW}[RECOVER] Instance is stopping — waiting for it to reach stopped (up to 3 min)${NC}"
+            for i in $(seq 1 18); do
+                sleep 10
+                STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+                    --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "unknown")
+                echo "    wait $i: state=$STATE"
+                [[ "$STATE" == "stopped" || "$STATE" == "terminated" || "$STATE" == "unknown" ]] && break
+            done
+            echo "  State (resolved): $STATE"
+        fi
 
         # Step: terminated instance -> rerun cdk deploy to replace.
         if [[ "$STATE" == "terminated" ]] || [[ "$STATE" == "shutting-down" ]] || [[ "$STATE" == "unknown" ]]; then
@@ -1549,16 +1833,26 @@ if [[ "$RECOVER" == true ]]; then
                 echo "  EIP:          $ASSOCIATED_EIP (kept)"
             fi
 
-            # Step: SSM Online probe (agent comes back ~1 min after start).
-            echo -e "${BLUE}[RECOVER] Waiting for SSM agent to come Online${NC}"
-            for i in 1 2 3 4 5 6 7 8 9 10; do
-                sleep 10
+            # [B-8/ssm-probe-too-short-fast-path] Extended SSM probe to match normal-deploy path
+            # (12×15s=180s) and hard-fail if the agent never comes Online.
+            echo -e "${BLUE}[RECOVER] Waiting for SSM agent to come Online (up to 180s)${NC}"
+            SSM_READY=false
+            for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+                sleep 15
                 P=$(aws ssm describe-instance-information --region "$REGION" \
                     --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
                     --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)
                 echo "    wait $i: SSM=${P:-not-registered}"
-                [[ "$P" == "Online" ]] && break
+                if [[ "$P" == "Online" ]]; then
+                    SSM_READY=true
+                    break
+                fi
             done
+            if [[ "$SSM_READY" != true ]]; then
+                echo -e "${RED}[NG] SSM agent did not come Online after 180s — aborting recover${NC}" >&2
+                echo -e "${YELLOW}     Check the instance health: aws ec2 describe-instance-status --instance-ids $INSTANCE_ID --region $REGION${NC}"
+                exit 1
+            fi
 
             # Step: authorize NFS ingress on the EFS mount target SG. The fast
             # path bypasses CDK redeploy, so normal-path manage_efs_mt_ingress
@@ -1591,13 +1885,17 @@ if [[ "$RECOVER" == true ]]; then
                 echo -e "${BLUE}[RECOVER] Re-running setup-persistence.sh (EFS=$STACK_EFS_ID)${NC}"
                 PERSIST_B64=$(base64 < "$PERSIST_LOCAL" | tr -d '\n')
                 EFS_SUBPATH_VALUE="${EFS_SUBPATH:-/neuron-workspace}"
+                # [B-9/ssm-pipe-masks-setup-persistence-exit-code] set -o pipefail inside the
+                # bash -c string so tail's exit 0 does not hide setup-persistence.sh failures.
                 PERSIST_CMD_ID=$(aws ssm send-command --region "$REGION" \
                     --instance-ids "$INSTANCE_ID" \
                     --document-name AWS-RunShellScript \
-                    --parameters "commands=[\"bash -c 'echo ${PERSIST_B64} | base64 -d > /tmp/setup-persistence.sh && chmod +x /tmp/setup-persistence.sh && EFS_ID=${STACK_EFS_ID} EFS_SUBPATH=${EFS_SUBPATH_VALUE} AWS_REGION=${REGION} bash /tmp/setup-persistence.sh 2>&1 | tail -40'\"]" \
+                    --parameters "commands=[\"bash -c 'set -o pipefail; echo ${PERSIST_B64} | base64 -d > /tmp/setup-persistence.sh && chmod +x /tmp/setup-persistence.sh && EFS_ID=${STACK_EFS_ID} EFS_SUBPATH=${EFS_SUBPATH_VALUE} AWS_REGION=${REGION} bash /tmp/setup-persistence.sh 2>&1 | tail -40'\"]" \
                     --query 'Command.CommandId' --output text 2>/dev/null)
                 if [[ -n "$PERSIST_CMD_ID" ]]; then
-                    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                    # [B-10/setup-persistence-ssm-wait-too-short] Extended to 600s to survive
+                    # cold apt-get under package-mirror congestion.
+                    for i in $(seq 1 60); do
                         sleep 10
                         PS=$(aws ssm get-command-invocation --region "$REGION" \
                             --command-id "$PERSIST_CMD_ID" --instance-id "$INSTANCE_ID" \
@@ -1611,8 +1909,9 @@ if [[ "$RECOVER" == true ]]; then
                         echo -e "    ${GREEN}[OK] setup-persistence.sh completed${NC}"
                         echo "$PO" | grep -E "WRITE OK|DONE" | sed 's/^/    /' || true
                     else
-                        echo -e "    ${YELLOW}[WARN] setup-persistence.sh status=$PS${NC}"
+                        echo -e "    ${RED}[NG] setup-persistence.sh status=$PS — aborting recover${NC}"
                         echo "$PO" | tail -10 | sed 's/^/    /'
+                        exit 1
                     fi
                 fi
             fi
@@ -1675,85 +1974,39 @@ if [[ "$RECOVER" == true ]]; then
             fi
 
             # ----------------------------------------------------------
-            # Step: re-deploy auth-related sibling stacks if the operator
-            # passed a setting that lives there but not on the EC2 stack
-            # (currently: --session-ttl). The fast recover path otherwise
-            # never touches AlbBackendStack, so a `--recover --session-ttl
-            # 86400` would silently keep the old SESSION_TTL_SECONDS=3600
-            # on the OAuth Lambda.
-            #
-            # Critical: AlbBackendStack and CloudFrontFrontendStack share
-            # cross-stack references via Fn::ImportValue. Deploying ALB
-            # alone with `cdk deploy <alb-stack>` would synth without the
-            # frontend stack in the assembly, so CloudFormation would see
-            # the related Outputs as orphaned and try to delete them —
-            # breaking the Frontend stack that imports them. We therefore
-            # synth Cognito + ALB + CloudFront in the same run (mirroring
-            # the original deploy) and let CDK update only the diffs.
-            # Cognito and CloudFront are no-ops; only the OAuth Lambda
-            # env on ALB actually changes.
+            # Step: heal auth sibling stacks (cognito/alb/frontend).
+            # [B-2/recover-no-sibling-stack-heal] Unconditional — not gated on
+            # SESSION_TTL_SECONDS. deploy_auth_stacks() probes each sibling and
+            # only deploys when any is unhealthy OR when SESSION_TTL_SECONDS is
+            # non-empty. All three stacks are synth'd together so CloudFormation
+            # ExportsOutput* bridge outputs are never dropped.
             # ----------------------------------------------------------
-            if [[ -n "$SESSION_TTL_SECONDS" ]]; then
-                ALB_STACK_NAME_RECOVER="${STACK_NAME}-alb"
-                COGNITO_STACK_NAME_RECOVER="${STACK_NAME}-cognito"
-                FRONTEND_STACK_NAME_RECOVER="${STACK_NAME}-frontend"
-                ALB_STACK_STATUS_RECOVER=$(get_stack_status "$ALB_STACK_NAME_RECOVER" "$REGION" 2>/dev/null || echo "")
-                if [[ "$ALB_STACK_STATUS_RECOVER" =~ ^(CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)$ ]]; then
-                    echo ""
-                    echo -e "${BLUE}[RECOVER] Re-deploying auth stacks (cognito + alb + frontend) to apply --session-ttl ${SESSION_TTL_SECONDS}${NC}"
-                    # Recover the operator email / cognito domain prefix
-                    # from the existing Cognito stack outputs. This keeps
-                    # the synth identical to the original deploy so CDK
-                    # produces a no-op diff for everything except the
-                    # OAuth Lambda env we are actually trying to change.
-                    EC2_SG_RECOVER=$(aws ec2 describe-instances \
-                        --instance-ids "$INSTANCE_ID" --region "$REGION" \
-                        --query 'Reservations[0].Instances[0].SecurityGroups[0].GroupId' \
-                        --output text 2>/dev/null)
-                    EXISTING_DOMAIN_PREFIX=$(aws cloudformation describe-stacks --stack-name "$COGNITO_STACK_NAME_RECOVER" --region "$REGION" \
-                        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' --output text 2>/dev/null)
-                    EXISTING_OPERATOR_EMAIL=$(aws cloudformation describe-stacks --stack-name "$COGNITO_STACK_NAME_RECOVER" --region "$REGION" \
-                        --query 'Stacks[0].Outputs[?OutputKey==`OperatorEmail`].OutputValue' --output text 2>/dev/null)
-                    AUTH_RECOVER_PARAMS=(
-                        "-c" "stackName=$STACK_NAME"
-                        "-c" "createAlbBackend=true"
-                        "-c" "albEc2InstanceId=$INSTANCE_ID"
-                        "-c" "albEc2SecurityGroupId=$EC2_SG_RECOVER"
-                        "-c" "createCognito=true"
-                        "-c" "createCloudFrontFrontend=true"
-                        "-c" "sessionTtlSeconds=$SESSION_TTL_SECONDS"
-                    )
-                    # Prefer the value the user just passed; otherwise
-                    # round-trip through the existing Cognito stack
-                    # outputs so we don't accidentally rename the domain
-                    # or drop the bootstrapped operator email.
-                    DOMAIN_PREFIX_USED="${COGNITO_DOMAIN_PREFIX:-$EXISTING_DOMAIN_PREFIX}"
-                    OPERATOR_EMAIL_USED="${OPERATOR_EMAIL:-$EXISTING_OPERATOR_EMAIL}"
-                    [[ -n "$DOMAIN_PREFIX_USED" ]] && AUTH_RECOVER_PARAMS+=("-c" "cognitoDomainPrefix=$DOMAIN_PREFIX_USED")
-                    [[ -n "$OPERATOR_EMAIL_USED" ]] && AUTH_RECOVER_PARAMS+=("-c" "operatorEmail=$OPERATOR_EMAIL_USED")
-                    [[ -n "$OPERATOR_PASSWORD_SECRET_ARN" ]] && AUTH_RECOVER_PARAMS+=("-c" "operatorPasswordSecretArn=$OPERATOR_PASSWORD_SECRET_ARN")
-                    [[ -n "$PROJECT" ]] && AUTH_RECOVER_PARAMS+=("-c" "project=$PROJECT")
-                    [[ -n "$PURPOSE" ]] && AUTH_RECOVER_PARAMS+=("-c" "purpose=$PURPOSE")
+            deploy_auth_stacks "$STACK_NAME" "$INSTANCE_ID" "" "$CDK_DIR" "$REGION" || true
 
-                    # Deploy all three stacks in one cdk run so the
-                    # cross-stack ImportValue references are preserved.
-                    # Cognito + Frontend produce no real changes; ALB
-                    # gets a Lambda env update.
-                    (cd "$CDK_DIR" && aws_creds_refresh && \
-                        AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" \
-                        npx cdk deploy \
-                            "$COGNITO_STACK_NAME_RECOVER" \
-                            "$ALB_STACK_NAME_RECOVER" \
-                            "$FRONTEND_STACK_NAME_RECOVER" \
-                            "${AUTH_RECOVER_PARAMS[@]}" \
-                            --require-approval never) || {
-                        echo -e "${YELLOW}[WARN] auth-stack re-deploy failed — session TTL may not be applied.${NC}"
-                        echo -e "${YELLOW}    Re-run manually:${NC}"
-                        echo -e "${YELLOW}    cd $CDK_DIR && npx cdk deploy $COGNITO_STACK_NAME_RECOVER $ALB_STACK_NAME_RECOVER $FRONTEND_STACK_NAME_RECOVER ${AUTH_RECOVER_PARAMS[*]}${NC}"
+            # ----------------------------------------------------------
+            # Step: app/model layer — voice-image-edit model servers.
+            # [recover-never-calls-deploy-all] deploy-all.sh is idempotent:
+            # compile steps short-circuit on EFS stamp files; server steps
+            # reinstall systemd units. Gated on script existence and
+            # $SKIP_SETUP so --skip-setup still suppresses it.
+            # ----------------------------------------------------------
+            if [[ "$SKIP_SETUP" != true ]]; then
+                VIE_DEPLOY="$SCRIPT_DIR/../../../samples/voice-image-edit/scripts/deploy-all.sh"
+                if [[ -x "$VIE_DEPLOY" ]]; then
+                    echo ""
+                    echo -e "${BLUE}[RECOVER] Running deploy-all.sh (model servers + neuron-anatomy)${NC}"
+                    VIE_ARGS=(
+                        --base-stack-name "$STACK_NAME"
+                        --region "$REGION"
+                        --recover
+                    )
+                    bash "$VIE_DEPLOY" "${VIE_ARGS[@]}" || {
+                        echo -e "${YELLOW}[WARN] deploy-all.sh failed — model servers may not be fully running.${NC}"
+                        echo -e "${YELLOW}       Re-run manually: bash $VIE_DEPLOY ${VIE_ARGS[*]}${NC}"
                     }
-                    echo -e "${GREEN}[OK] auth stacks re-deployed (sessionTtlSeconds=$SESSION_TTL_SECONDS)${NC}"
                 else
-                    echo -e "${YELLOW}[WARN] $ALB_STACK_NAME_RECOVER status=$ALB_STACK_STATUS_RECOVER — skipping auth re-deploy. session-ttl not applied.${NC}"
+                    echo -e "${YELLOW}[WARN] deploy-all.sh not found at $VIE_DEPLOY — model servers not started${NC}"
+                    echo -e "${YELLOW}       Run manually when available: bash $VIE_DEPLOY --base-stack-name $STACK_NAME --region $REGION --recover${NC}"
                 fi
             fi
 
@@ -1874,13 +2127,16 @@ if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
     # when the operator did NOT pin an explicit --capacity-reservation-id.
     # ------------------------------------------------------------------
     cr_is_active() {
+        # [cr-available-count-not-checked] Require State=active AND AvailableInstanceCount>=1.
+        # A CR that is active but AvailableInstanceCount=0 (old instance still in shutting-down)
+        # would cause CDK deploy to fail with "insufficient capacity".
         local cr="$1"
         [[ -z "$cr" || "$cr" == "None" ]] && return 1
-        local st
-        st=$(aws ec2 describe-capacity-reservations --region "$REGION" \
+        local st cavail
+        read -r st cavail < <(aws ec2 describe-capacity-reservations --region "$REGION" \
             --capacity-reservation-ids "$cr" \
-            --query 'CapacityReservations[0].State' --output text 2>/dev/null)
-        [[ "$st" == "active" ]]
+            --query 'CapacityReservations[0].[State,AvailableInstanceCount]' --output text 2>/dev/null) || true
+        [[ "$st" == "active" ]] && [[ "${cavail:-0}" -gt 0 ]]
     }
 
     if [[ -z "$CB_EXPLICIT_RES_ID" ]]; then
@@ -1890,22 +2146,22 @@ if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
             echo -e "${YELLOW}  [HEAL] Capacity Reservation '${CAPACITY_RESERVATION_ID:-<none>}' is missing/expired/not-active${NC}"
             echo -e "${BLUE}  [HEAL] Scanning SSM slots for an active ${INSTANCE_TYPE} reservation...${NC}"
             BEST_SLOT="" ; BEST_CR="" ; BEST_SUBNET="" ; BEST_END=""
-            # Enumerate every slot reservation-id key under this region.
+            # Enumerate every named slot reservation-id key under this region.
             while read -r pname; do
                 [[ -z "$pname" ]] && continue
                 slot_cr=$(aws ssm get-parameter --name "$pname" --region "$REGION" \
                     --query 'Parameter.Value' --output text 2>/dev/null)
                 [[ -z "$slot_cr" || "$slot_cr" == "None" ]] && continue
-                # Pull state + type + end date in one call. The `|| true`
-                # is load-bearing: a since-deleted CR makes `aws` emit
-                # nothing, so `read` hits EOF and returns non-zero — under
-                # `set -e` that would abort the entire recovery instead of
-                # just skipping this slot.
-                cstate="" ; ctype="" ; cend=""
-                read -r cstate ctype cend < <(aws ec2 describe-capacity-reservations --region "$REGION" \
+                # [cr-available-count-not-checked] Fetch State+InstanceType+EndDate+AvailableInstanceCount.
+                # The `|| true` is load-bearing: a since-deleted CR returns nothing from aws,
+                # `read` hits EOF and returns non-zero — under `set -e` that aborts recovery.
+                cstate="" ; ctype="" ; cend="" ; cavail=""
+                read -r cstate ctype cend cavail < <(aws ec2 describe-capacity-reservations --region "$REGION" \
                     --capacity-reservation-ids "$slot_cr" \
-                    --query 'CapacityReservations[0].[State,InstanceType,EndDate]' --output text 2>/dev/null) || true
+                    --query 'CapacityReservations[0].[State,InstanceType,EndDate,AvailableInstanceCount]' \
+                    --output text 2>/dev/null) || true
                 [[ "$cstate" != "active" ]] && continue
+                [[ "${cavail:-0}" -le 0 ]] && continue
                 [[ "$ctype" != "$INSTANCE_TYPE" ]] && continue
                 # Prefer the reservation that ends latest (most runway).
                 if [[ -z "$BEST_END" || "$cend" > "$BEST_END" ]]; then
@@ -1917,13 +2173,42 @@ if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
                 --path "/capacity-block/${REGION}/slots/" --recursive --region "$REGION" \
                 --query "Parameters[?ends_with(Name,'reservation-id')].Name" --output text 2>/dev/null | tr '\t' '\n')
 
+            # [heal-scan-skips-default-flat-slot] Also probe the flat default slot
+            # (/capacity-block/<region>/reservation-id) which manage-capacity-block.sh
+            # writes when --slot is omitted. It lives outside the slots/ subtree so the
+            # while-loop above never sees it.
+            if [[ -z "$BEST_CR" ]]; then
+                default_flat_cr=$(aws ssm get-parameter \
+                    --name "/capacity-block/${REGION}/reservation-id" \
+                    --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)
+                if [[ -n "$default_flat_cr" && "$default_flat_cr" != "None" ]]; then
+                    cstate="" ; ctype="" ; cend="" ; cavail=""
+                    read -r cstate ctype cend cavail < <(aws ec2 describe-capacity-reservations --region "$REGION" \
+                        --capacity-reservation-ids "$default_flat_cr" \
+                        --query 'CapacityReservations[0].[State,InstanceType,EndDate,AvailableInstanceCount]' \
+                        --output text 2>/dev/null) || true
+                    if [[ "$cstate" == "active" && "${cavail:-0}" -gt 0 && "$ctype" == "$INSTANCE_TYPE" ]]; then
+                        BEST_CR="$default_flat_cr"
+                        BEST_SLOT="default"
+                        BEST_END="$cend"
+                    fi
+                fi
+            fi
+
             if [[ -n "$BEST_CR" ]]; then
                 CAPACITY_RESERVATION_ID="$BEST_CR"
                 CB_SLOT="$BEST_SLOT"
                 # Re-resolve the subnet for the chosen slot so they stay paired.
-                SUBNET_ID=$(aws ssm get-parameter \
-                    --name "/capacity-block/${REGION}/slots/${BEST_SLOT}/subnet-id" \
-                    --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null)
+                # The default slot stores its subnet at the flat path, not under slots/.
+                if [[ "$BEST_SLOT" == "default" ]]; then
+                    SUBNET_ID=$(aws ssm get-parameter \
+                        --name "/capacity-block/${REGION}/subnet-id" \
+                        --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)
+                else
+                    SUBNET_ID=$(aws ssm get-parameter \
+                        --name "/capacity-block/${REGION}/slots/${BEST_SLOT}/subnet-id" \
+                        --region "$REGION" --query 'Parameter.Value' --output text 2>/dev/null || true)
+                fi
                 [[ "$SUBNET_ID" == "None" ]] && SUBNET_ID=""
                 echo -e "${GREEN}  [HEAL] Adopted active reservation ${CAPACITY_RESERVATION_ID} (slot=${BEST_SLOT}, ends ${BEST_END})${NC}"
             else
@@ -2054,23 +2339,28 @@ if [[ "$CREATE_EFS" == true ]]; then
     NO_EFS=false
     # Strip any previously appended efsId=... entries to keep the array
     # consistent if the user passed --efs-id <other> before --create-efs.
+    #
+    # CDK_PARAMS is a FLAT list of ("-c" "key=value" "-c" "key=value" ...)
+    # pairs, so an efsId entry occupies TWO adjacent slots: the "-c" flag and
+    # the "efsId=..." value. We must drop BOTH. The previous implementation
+    # dropped only the value slot and left the "-c" flag orphaned, which then
+    # collided with the next parameter's "-c" and produced a malformed
+    # "... -c -c instanceType=..." command line that cdk rejected with
+    # "Not enough arguments following: c". Walk by index and skip the pair.
     NEW_PARAMS=()
-    SKIP_NEXT=0
-    for p in "${CDK_PARAMS[@]}"; do
-        if [[ "$SKIP_NEXT" -eq 1 ]]; then
-            SKIP_NEXT=0
+    i=0
+    n=${#CDK_PARAMS[@]}
+    while [[ $i -lt $n ]]; do
+        cur="${CDK_PARAMS[$i]}"
+        nxt=""
+        [[ $((i + 1)) -lt $n ]] && nxt="${CDK_PARAMS[$((i + 1))]}"
+        if [[ "$cur" == "-c" && "$nxt" == "efsId="* ]]; then
+            # Drop the whole "-c efsId=..." pair (re-added with the new id below).
+            i=$((i + 2))
             continue
         fi
-        if [[ "$p" == "efsId="* ]]; then
-            continue
-        fi
-        if [[ "$p" == "-c" ]] && [[ "$p" != "${CDK_PARAMS[${#CDK_PARAMS[@]}-1]}" ]]; then
-            # Peek at the next entry; if it starts with efsId= drop the pair.
-            idx=$((${#NEW_PARAMS[@]}))
-            NEW_PARAMS+=("$p")
-            continue
-        fi
-        NEW_PARAMS+=("$p")
+        NEW_PARAMS+=("$cur")
+        i=$((i + 1))
     done
     CDK_PARAMS=("${NEW_PARAMS[@]}")
     CDK_PARAMS+=("-c" "efsId=$EFS_ID")
@@ -2151,6 +2441,18 @@ fi
 # until we rewrite them via the API. Skips silently when no ALB exists.
 if [[ -n "$INSTANCE_ID" ]] && [[ "$INSTANCE_ID" != "None" ]]; then
     reregister_alb_targets "$STACK_NAME" "$INSTANCE_ID" "$REGION" || true
+fi
+
+# [force-recreate-skips-auth-stack-rewire / B-11] After FORCE_RECREATE CDK deploy, heal auth
+# sibling stacks with the new instance ID so ALB CFN templates are updated and any URC is fixed.
+# Also runs when RECOVER=true (fall-through from terminated instance path) so --recover alone
+# heals auth stacks after an instance replacement.
+if [[ "$FORCE_RECREATE" == true ]] || [[ "$RECOVER" == true ]]; then
+    _auth_sg=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`SecurityGroupId`].OutputValue' \
+        --output text 2>/dev/null || true)
+    [[ "$_auth_sg" == "None" ]] && _auth_sg=""
+    deploy_auth_stacks "$STACK_NAME" "$INSTANCE_ID" "$_auth_sg" "$CDK_DIR" "$REGION" || true
 fi
 
 echo "Public DNS: $PUBLIC_DNS"
@@ -2329,6 +2631,47 @@ if [[ "$CREATE_COGNITO" == true ]]; then
         OPERATOR_PASSWORD=""
     fi
 
+    # [cognito-params-no-round-trip / cognito-operatorEmail-not-roundtripped]
+    # Read back cognitoDomainPrefix and operatorEmail from the existing Cognito stack
+    # so a re-run without --operator-email/--cognito-domain-prefix does not drop
+    # the bootstrap block or rename the Hosted UI domain.
+    if [[ -z "$COGNITO_DOMAIN_PREFIX" ]]; then
+        _existing_cog_domain=$(aws cloudformation describe-stacks \
+            --stack-name "$COGNITO_STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' \
+            --output text 2>/dev/null || true)
+        if [[ -n "$_existing_cog_domain" && "$_existing_cog_domain" != "None" ]]; then
+            COGNITO_DOMAIN_PREFIX="$_existing_cog_domain"
+        fi
+    fi
+    if [[ -z "$OPERATOR_EMAIL" ]]; then
+        _existing_cog_email=$(aws cloudformation describe-stacks \
+            --stack-name "$COGNITO_STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`OperatorEmail`].OutputValue' \
+            --output text 2>/dev/null || true)
+        if [[ -n "$_existing_cog_email" && "$_existing_cog_email" != "None" ]]; then
+            OPERATOR_EMAIL="$_existing_cog_email"
+        fi
+    fi
+    # [cognito-operatorPasswordSecretArn-missing] Also recover the operator-password
+    # secret ARN from Secrets Manager when not supplied on the CLI.
+    if [[ -z "$OPERATOR_PASSWORD_SECRET_ARN" ]]; then
+        _existing_op_arn=$(aws secretsmanager describe-secret \
+            --secret-id "${STACK_NAME}-operator-password" \
+            --region "$REGION" \
+            --query 'ARN' --output text 2>/dev/null || true)
+        if [[ -n "$_existing_op_arn" && "$_existing_op_arn" != "None" ]]; then
+            OPERATOR_PASSWORD_SECRET_ARN="$_existing_op_arn"
+        fi
+    fi
+
+    # [cognito-solo-drops-exports / full-not-idempotent-on-redeploy]
+    # Probe whether ALB and frontend sibling stacks exist. When they do,
+    # include them in the SAME cdk deploy invocation so CDK emits the
+    # ExportsOutput* bridge outputs that Fn::ImportValue depends on.
+    _phase_c_alb_st=$(get_stack_status "${STACK_NAME}-alb" "$REGION" 2>/dev/null || echo "MISSING")
+    _phase_c_fe_st=$(get_stack_status "${STACK_NAME}-frontend" "$REGION" 2>/dev/null || echo "MISSING")
+    _alb_live_re='^(CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)$'
     COGNITO_CDK_PARAMS=(
         "-c" "stackName=$STACK_NAME"
         "-c" "createCognito=true"
@@ -2349,15 +2692,42 @@ if [[ "$CREATE_COGNITO" == true ]]; then
         COGNITO_CDK_PARAMS+=("-c" "purpose=$PURPOSE")
     fi
 
+    COGNITO_DEPLOY_TARGETS=("$COGNITO_STACK_NAME")
+    if [[ "$_phase_c_alb_st" =~ $_alb_live_re ]]; then
+        COGNITO_CDK_PARAMS+=("-c" "createAlbBackend=true")
+        COGNITO_CDK_PARAMS+=("-c" "albEc2InstanceId=$INSTANCE_ID")
+        COGNITO_CDK_PARAMS+=("-c" "albEc2SecurityGroupId=$SG_ID")
+        COGNITO_DEPLOY_TARGETS+=("${STACK_NAME}-alb")
+        if [[ "$_phase_c_fe_st" =~ $_alb_live_re ]]; then
+            COGNITO_CDK_PARAMS+=("-c" "createCloudFrontFrontend=true")
+            COGNITO_DEPLOY_TARGETS+=("${STACK_NAME}-frontend")
+        fi
+    fi
+
     cd "$CDK_DIR"
     aws_creds_refresh
     AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" \
-        npm run deploy -- "$COGNITO_STACK_NAME" "${COGNITO_CDK_PARAMS[@]}" --require-approval never
+        npx cdk deploy "${COGNITO_DEPLOY_TARGETS[@]}" "${COGNITO_CDK_PARAMS[@]}" --require-approval never
     if [[ $? -ne 0 ]]; then
         echo -e "${RED}[NG] CognitoOperatorStack deploy failed${NC}"
         exit 1
     fi
-    echo -e "${GREEN}[OK] CognitoOperatorStack deployed${NC}"
+    echo -e "${GREEN}[OK] CognitoOperatorStack deployed (targets: ${COGNITO_DEPLOY_TARGETS[*]})${NC}"
+
+    # Round-trip the authoritative values back into shell variables so Phase B/D
+    # pick them up without a second describe-stacks call (alb-params-no-cognito-round-trip).
+    if [[ -z "$COGNITO_DOMAIN_PREFIX" ]]; then
+        _rt=$(aws cloudformation describe-stacks --stack-name "$COGNITO_STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' \
+            --output text 2>/dev/null || true)
+        [[ -n "$_rt" && "$_rt" != "None" ]] && COGNITO_DOMAIN_PREFIX="$_rt"
+    fi
+    if [[ -z "$OPERATOR_EMAIL" ]]; then
+        _rt=$(aws cloudformation describe-stacks --stack-name "$COGNITO_STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`OperatorEmail`].OutputValue' \
+            --output text 2>/dev/null || true)
+        [[ -n "$_rt" && "$_rt" != "None" ]] && OPERATOR_EMAIL="$_rt"
+    fi
 fi
 
 # ----------------------------------------------------------------------
@@ -2400,6 +2770,12 @@ if [[ "$CREATE_ALB_BACKEND" == true ]]; then
     echo "  EC2 instance: $INSTANCE_ID"
     echo "  EC2 SG:       $SG_ID"
 
+    # [alb-solo-drops-exports / phase-b-alb-solo-drops-frontend-exports]
+    # If the frontend stack already exists, include it in the same synth so CDK
+    # emits ExportsOutput* outputs that Fn::ImportValue in the frontend depends on.
+    _phase_b_fe_st=$(get_stack_status "${STACK_NAME}-frontend" "$REGION" 2>/dev/null || echo "MISSING")
+    _alb_live_re2='^(CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)$'
+
     ALB_CDK_PARAMS=(
         "-c" "stackName=$STACK_NAME"
         "-c" "createAlbBackend=true"
@@ -2426,17 +2802,23 @@ if [[ "$CREATE_ALB_BACKEND" == true ]]; then
         ALB_CDK_PARAMS+=("-c" "purpose=$PURPOSE")
     fi
 
+    ALB_DEPLOY_TARGETS=("$ALB_STACK_NAME")
+    if [[ "$_phase_b_fe_st" =~ $_alb_live_re2 ]] || [[ "$CREATE_CLOUDFRONT_FRONTEND" == true ]]; then
+        ALB_CDK_PARAMS+=("-c" "createCloudFrontFrontend=true")
+        ALB_DEPLOY_TARGETS+=("${STACK_NAME}-frontend")
+    fi
+
     cd "$CDK_DIR"
     aws_creds_refresh
     AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" \
-        npm run deploy -- "$ALB_STACK_NAME" "${ALB_CDK_PARAMS[@]}" --require-approval never
+        npx cdk deploy "${ALB_DEPLOY_TARGETS[@]}" "${ALB_CDK_PARAMS[@]}" --require-approval never
 
     if [[ $? -ne 0 ]]; then
         echo -e "${RED}[NG] AlbBackendStack deploy failed${NC}"
         echo -e "${YELLOW}    The EC2 stack remains intact (SSM port forwarding still works).${NC}"
         exit 1
     fi
-    echo -e "${GREEN}[OK] AlbBackendStack deployed${NC}"
+    echo -e "${GREEN}[OK] AlbBackendStack deployed (targets: ${ALB_DEPLOY_TARGETS[*]})${NC}"
 
     ALB_DNS=$(aws cloudformation describe-stacks --stack-name "$ALB_STACK_NAME" --region "$REGION" \
         --query 'Stacks[0].Outputs[?OutputKey==`AlbDnsName`].OutputValue' --output text 2>/dev/null)
@@ -2504,10 +2886,14 @@ if [[ "$CREATE_CLOUDFRONT_FRONTEND" == true ]]; then
         FRONTEND_CDK_PARAMS+=("-c" "purpose=$PURPOSE")
     fi
 
+    # [frontend-params-no-cognito-round-trip] COGNITO_DOMAIN_PREFIX and OPERATOR_EMAIL
+    # are now populated by the Phase C round-trip above, so Phase D picks them up
+    # through the existing -n guards — no extra describe-stacks call needed here.
+    # Use npx cdk deploy for consistency with the combined Phase B/C pattern.
     cd "$CDK_DIR"
     aws_creds_refresh
     AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" \
-        npm run deploy -- "$FRONTEND_STACK_NAME" "${FRONTEND_CDK_PARAMS[@]}" --require-approval never
+        npx cdk deploy "$FRONTEND_STACK_NAME" "${FRONTEND_CDK_PARAMS[@]}" --require-approval never
     if [[ $? -ne 0 ]]; then
         echo -e "${RED}[NG] CloudFrontFrontendStack deploy failed${NC}"
         echo -e "${YELLOW}    The EC2 / ALB / Cognito stacks remain intact.${NC}"

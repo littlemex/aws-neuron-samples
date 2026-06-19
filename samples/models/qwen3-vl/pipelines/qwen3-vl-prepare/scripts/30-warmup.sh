@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# vllm serve を foreground 起動 (TP=16, NeuronCore ${NEURON_CORES})。
-# /health 200 を 7200 秒以内に返したら kill。
-# Neuron 成果物は ~/.cache/neuron-compile-cache か NEURON_COMPILE_CACHE_URL に永続化される。
-# 1 回成功すれば次回以降の vllm serve は数分で起動する。
+# Launch vllm serve in one-shot warm-up mode (TP=16, NeuronCores ${NEURON_CORES}).
+# Kill it after /health returns 200 (within 7200 s). Neuron compile artifacts
+# are written to NEURON_COMPILE_CACHE_URL (EFS-backed) so they survive instance
+# replacement. Once the cache is populated, subsequent vllm serve starts in
+# minutes rather than ~60 min.
 
 if [ -f "${MODEL_DIR}/.precompile_skipped" ] && [ "${FORCE_REWARMUP}" != "true" ]; then
   echo "[OK] skipped (cached)"
@@ -16,6 +17,9 @@ fi
 export NEURON_RT_VISIBLE_CORES="${NEURON_CORES}"
 export VLLM_NEURON_FRAMEWORK=neuronx-distributed-inference
 export NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE=146800640
+mkdir -p "${COMPILE_CACHE}"
+export NEURON_COMPILE_CACHE_URL="${COMPILE_CACHE}"
+echo "[INFO] NEURON_COMPILE_CACHE_URL=${COMPILE_CACHE} (EFS-backed; survives instance replacement)"
 
 _lo=$(echo "${NEURON_CORES}" | cut -d- -f1)
 _hi=$(echo "${NEURON_CORES}" | cut -d- -f2)
@@ -125,5 +129,9 @@ if [ "$ok" -ne 1 ]; then
   exit 1
 fi
 
+if [ ! -d "${COMPILE_CACHE}" ] || [ -z "$(ls -A "${COMPILE_CACHE}" 2>/dev/null)" ]; then
+  echo "[NG] warm-up healthy but compile cache ${COMPILE_CACHE} empty -- refusing to write marker (would cause cold recompile after instance replacement)"
+  exit 1
+fi
 date -u +'%Y-%m-%dT%H:%M:%SZ' > "${WARMUP_MARKER}"
-echo "[OK] warm-up complete, marker written"
+echo "[OK] warm-up complete, compile cache populated on EFS, marker written"

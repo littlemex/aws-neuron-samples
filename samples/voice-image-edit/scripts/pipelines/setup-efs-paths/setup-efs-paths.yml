@@ -23,12 +23,14 @@ tasks:
 
   - id: 10-mkdir-efs
     needs: [00-precheck]
-    timeout: 30s
+    # chown -R walks the EFS-backed model trees (NFS latency), which can take
+    # well over 30s once artifacts are persisted. 10m matches the link tasks.
+    timeout: 10m
     script: scripts/10-mkdir-efs.sh
 
   - id: 20-mkdir-canonical
     needs: [10-mkdir-efs]
-    timeout: 30s
+    timeout: 10m
     script: scripts/20-mkdir-canonical.sh
 
   - id: 30-link-models

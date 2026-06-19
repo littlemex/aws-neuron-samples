@@ -11,6 +11,7 @@ vars:
   NEURON_CORES: "16-31"
   PORT: "8090"
   WARMUP_MARKER: "/models/Qwen3-VL-8B-Instruct/.neuron_warmup_done"
+  COMPILE_CACHE: "/models/Qwen3-VL-8B-Instruct/.neuron_compile_cache"
   FORCE_REWARMUP: "false"
 
 required_vars: []
@@ -24,7 +25,8 @@ max_concurrency: 1
 
 tasks:
   - id: 00-precheck
-    timeout: 30s
+    # `import vllm` on the Neuron build can take well over 30s on a cold venv.
+    timeout: 5m
     script: scripts/00-precheck.sh
 
   - id: 10-download-model

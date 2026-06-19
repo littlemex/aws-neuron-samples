@@ -12,6 +12,7 @@ vars:
   MODEL_DIR: /models/Qwen3-VL-8B-Instruct
   NEURON_CORES: 16-31
   VENV: /opt/aws_neuronx_venv_pytorch_inference_vllm_0_16
+  COMPILE_CACHE: "/models/Qwen3-VL-8B-Instruct/.neuron_compile_cache"
 
 required_vars:
   - SERVER_TARBALL_URL
@@ -53,6 +54,6 @@ tasks:
   - id: 50-health-check
     needs: [40-enable-start]
     timeout: 30m
-    retries: 150
+    retries: 360
     retry_delay: 10s
     script: scripts/50-health-check.sh

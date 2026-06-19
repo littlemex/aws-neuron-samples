@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Task: Install qwen3-vl.service systemd unit
-# Description: Restart=always で常駐。 NEURON_RT_VISIBLE_CORES=${NEURON_CORES} (default 16-31, 16 cores 専有, trn2.48xlarge 前提)。
-#              vllm serve は既存 cache を使うので 5-10 min で /health 200 になる想定。
+# Install qwen3-vl.service systemd unit.
+# Runs permanently via Restart=always. NEURON_RT_VISIBLE_CORES pins NeuronCores
+# 16-31 (TP=16, trn2.48xlarge). NEURON_COMPILE_CACHE_URL points at the
+# EFS-backed compile cache so vllm reuses compiled artifacts after instance
+# replacement (avoids ~60 min cold recompile). TimeoutStartSec=3900 covers the
+# worst-case cold compile path.
 
 cat > /etc/systemd/system/qwen3-vl.service <<EOF
 [Unit]
@@ -21,12 +24,13 @@ Environment=MODEL_DIR=${MODEL_DIR}
 Environment=VENV=${VENV}
 Environment=NEURON_CORES=${NEURON_CORES}
 Environment=LOG_DIR=${SERVE_DIR}/logs
+Environment=NEURON_COMPILE_CACHE_URL=${COMPILE_CACHE}
 ExecStart=/bin/bash ${SERVE_DIR}/start.sh --port ${PORT} --model-dir ${MODEL_DIR} --venv ${VENV} --cores ${NEURON_CORES}
 Restart=always
 RestartSec=15s
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=1800
+TimeoutStartSec=3900
 
 [Install]
 WantedBy=multi-user.target

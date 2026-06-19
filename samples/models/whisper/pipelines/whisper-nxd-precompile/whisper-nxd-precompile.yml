@@ -28,7 +28,8 @@ max_concurrency: 1
 
 tasks:
   - id: 00-precheck
-    timeout: 30s
+    # `import neuronx_distributed_inference` on a cold venv can exceed 30s.
+    timeout: 5m
     script: scripts/00-precheck.sh
 
   - id: 10-skip-if-cached

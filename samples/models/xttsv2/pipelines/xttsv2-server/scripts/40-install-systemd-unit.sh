@@ -26,7 +26,7 @@ ExecStart=/usr/bin/docker run --rm \\
   --name xttsv2-server \\
   --device /dev/neuron0 \\
   --shm-size 8g \\
-  -p 127.0.0.1:${PORT}:${PORT} \\
+  -p ${PORT}:${PORT} \\
   -e PORT=${PORT} \\
   -e PYTHONUNBUFFERED=1 \\
   -e NEURON_RT_VISIBLE_CORES=${NEURON_CORES} \\

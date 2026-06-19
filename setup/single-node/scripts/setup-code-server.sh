@@ -1,5 +1,5 @@
 #!/bin/bash
-# Code Server setup script (wrapper around the task runner)
+# Code Server setup script (wrapper around the pipeline runner)
 
 set -e
 
@@ -19,19 +19,20 @@ Options:
     -d, --home-dir DIR              Home directory (default: /work)
     --internal-port PORT            Code Server internal port (default: 8080)
     --nginx-port PORT               nginx external port (default: 80)
-    --efs-id ID                     EFS file system ID (uses default from tasks JSON if not specified)
+    --efs-id ID                     EFS file system ID
     --efs-subpath PATH              Subpath within EFS (default: /neuron-workspace)
                                     For multi-instance parallel use, specify a unique path per instance
                                     e.g. /neuron-workspace/manual, /neuron-workspace/experiment
-    --start-from TASK_ID            Resume from the specified task ID
-    --clean-state                   Clear state file and run from the beginning
-    --dry-run                       Display tasks without actually executing them
+    --start-from TASK_ID            Informational only; use 'run-pipeline rerun --from <id>' for
+                                    fine-grained resume control with the YAML pipeline runner.
+    --clean-state                   Informational only; use 'run-pipeline run --force-all' instead.
+    --dry-run                       Display pipeline plan without executing (passed to run-pipeline).
     --reboot                        Reboot the instance after setup completes
     --install-claude-code           Opt-in: install Anthropic Claude Code CLI and
                                     neuron-agentic-development agents/skills into
                                     ~/.claude for the code-server user.
-    --use-pipeline-runner           Dispatch through tools/pipeline-runner instead of
-                                    the legacy run-tasks.sh.
+    --use-pipeline-runner           Accepted for backward compatibility; YAML pipeline runner is
+                                    always used and this flag has no effect.
     -h, --help                      Show this help message
 
 Examples:
@@ -43,12 +44,6 @@ Examples:
 
     # Specify password directly
     $0 -i i-1234567890abcdef0 -p MySecurePassword123
-
-    # Resume from a specific task
-    $0 -i i-1234567890abcdef0 --start-from 09-install-code-server
-
-    # Dry run (preview what will be executed)
-    $0 -i i-1234567890abcdef0 --dry-run
 
     # Reboot after setup
     $0 -i i-1234567890abcdef0 --reboot
@@ -73,10 +68,8 @@ CLEAN_STATE=false
 DRY_RUN=false
 REBOOT=false
 INSTALL_CLAUDE_CODE=false
-# When true, dispatch through tools/pipeline-runner; when false, the
-# historical run-tasks.sh path is used. Same flag name as the other
-# callers so operators can pass the same value top-down.
-USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
+# Accepted for backward compatibility; YAML pipeline runner is always used.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-true}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -200,20 +193,13 @@ fi
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-TASK_FILE="$PROJECT_DIR/tasks/code-server-setup.json"
 
-# Check if task file exists
-if [[ ! -f "$TASK_FILE" ]]; then
-    echo "❌ Error: Task definition file not found: $TASK_FILE"
-    exit 1
-fi
-
-# Variable definitions (JSON format)
-# If --efs-id / --efs-subpath are specified, they override the defaults in tasks JSON.
-# If not specified, the values from the variables section of tasks/code-server-setup.json are used.
-# For multi-instance parallel use, always specify a unique --efs-subpath per instance (e.g. /neuron-workspace/manual).
+# Variable definitions passed to the pipeline runner as -v KEY=VALUE pairs.
+# EFS_ID / EFS_SUBPATH override the YAML defaults when provided.
+# INSTALL_CLAUDE_CODE is forwarded so pipeline tasks can gate on it.
 VARS_BASE=$(cat << EOF
 {
+    "AWS_REGION": "$REGION",
     "USER": "$USER",
     "PASSWORD": "$PASSWORD",
     "HOME_DIR": "$HOME_DIR",
@@ -229,13 +215,13 @@ fi
 if [[ -n "$EFS_SUBPATH" ]]; then
     VARIABLES_JSON=$(echo "$VARIABLES_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["EFS_SUBPATH"]="'"$EFS_SUBPATH"'"; print(json.dumps(d))')
 fi
-# Pass INSTALL_CLAUDE_CODE through so tasks gated on it (for example
-# 18-install-claude-code) can decide at runtime whether to run.
+# Pass INSTALL_CLAUDE_CODE through so pipeline tasks gated on it
+# (e.g. 18-install-claude-code) can decide at runtime whether to run.
 INSTALL_CLAUDE_CODE_VAL=$([[ "$INSTALL_CLAUDE_CODE" == true ]] && echo "yes" || echo "no")
 VARIABLES_JSON=$(echo "$VARIABLES_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); d["INSTALL_CLAUDE_CODE"]="'"$INSTALL_CLAUDE_CODE_VAL"'"; print(json.dumps(d))')
 
-# Transfer setup-persistence.sh to the instance (called by tasks/00-setup-persistence)
-# Encode with base64 and place in /tmp via SSM with sudo
+# Transfer setup-persistence.sh to the instance (called by pipeline task 00-setup-persistence).
+# Encode with base64 and place in /tmp via SSM Run Command.
 PERSIST_SH="$SCRIPT_DIR/setup-persistence.sh"
 if [[ -f "$PERSIST_SH" ]]; then
     echo "==> Uploading setup-persistence.sh to instance (/tmp/setup-persistence-full.sh)"
@@ -258,9 +244,7 @@ if [[ -f "$PERSIST_SH" ]]; then
     fi
 fi
 
-# Dispatch through the new pipeline-runner when --use-pipeline-runner is
-# set; otherwise fall back to the legacy run-tasks.sh. The dispatch helper
-# encapsulates the choice so this wrapper does not need two code paths.
+# Dispatch through the YAML pipeline runner (the only supported path).
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
 DISPATCH_HELPER="$REPO_ROOT/tools/pipeline-runner/lib-sh/dispatch.sh"
 if [[ ! -f "$DISPATCH_HELPER" ]]; then
@@ -271,35 +255,14 @@ export REPO_ROOT
 # shellcheck disable=SC1090
 source "$DISPATCH_HELPER"
 
-# Map tasks/code-server-setup.json -> pipelines/code-server-setup/code-server-setup.yml.
-PIPELINE_NAME="$(basename "$TASK_FILE" .json)"
-NEW_YML="$PROJECT_DIR/pipelines/${PIPELINE_NAME}/${PIPELINE_NAME}.yml"
+PIPELINE_NAME="code-server-setup"
+NEW_YML="$PROJECT_DIR/pipelines/code-server-setup/code-server-setup.yml"
 
-# The legacy runner accepted --start-from and --clean-state for resume
-# semantics; the new runner offers `rerun --from <task-id>` and
-# `--force-all`. We keep the wrapper minimal and only respect
-# --start-from when on the legacy path; on the new path we inform the
-# operator and proceed without it (this is documented in the README).
-if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
-    if [[ -n "$START_FROM" || "$CLEAN_STATE" == "true" || "$DRY_RUN" == "true" ]]; then
-        echo "[INFO] --start-from / --clean-state / --dry-run on the new runner: use 'rerun --from <id>' / '--force-all' / '--dry-run' against $NEW_YML directly for fine control."
-    fi
+if [[ -n "$START_FROM" || "$CLEAN_STATE" == "true" || "$DRY_RUN" == "true" ]]; then
+    echo "[INFO] --start-from / --clean-state / --dry-run: use 'run-pipeline rerun --from <id>' / '--force-all' / '--dry-run' against $NEW_YML for fine control."
 fi
 
-if [[ "$DRY_RUN" == "true" && "$USE_PIPELINE_RUNNER" != "true" ]]; then
-    # Preserve the legacy --dry-run behaviour when going through the old runner.
-    bash "$SCRIPT_DIR/run-tasks.sh" -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON" --dry-run
-elif [[ "$USE_PIPELINE_RUNNER" != "true" && (-n "$START_FROM" || "$CLEAN_STATE" == "true") ]]; then
-    # Legacy resume / clean-state forms: keep using run-tasks.sh directly.
-    RUN_TASKS_ARGS=(
-        -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON"
-    )
-    [[ -n "$START_FROM" ]] && RUN_TASKS_ARGS+=(--start-from "$START_FROM")
-    [[ "$CLEAN_STATE" == "true" ]] && RUN_TASKS_ARGS+=(--clean-state)
-    bash "$SCRIPT_DIR/run-tasks.sh" "${RUN_TASKS_ARGS[@]}"
-else
-    pipeline_dispatch "$INSTANCE_ID" "$REGION" "$TASK_FILE" "$NEW_YML" "$VARIABLES_JSON" "$PIPELINE_NAME"
-fi
+pipeline_dispatch "$INSTANCE_ID" "$REGION" "" "$NEW_YML" "$VARIABLES_JSON" "$PIPELINE_NAME"
 
 # Execution result
 if [[ $? -eq 0 ]]; then
