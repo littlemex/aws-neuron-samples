@@ -107,6 +107,18 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3-VL-8B-Instruct}"
 # enable_thinking=False` actually short-circuit the thinking phase.
 REASONING_PARSER="${REASONING_PARSER:-qwen3}"
 
+# --no-async-scheduling is REQUIRED on this Neuron stack (vllm 0.16 +
+# vllm-neuron 0.5.1). vLLM defaults async scheduling to ON (its auto-enable
+# logic in config/vllm.py does not recognise the Neuron executor as
+# incompatible), which routes requests through step_with_batch_queue. The
+# vllm-neuron ContinuousBatchingNeuronScheduler / neuronx_distributed_model_runner
+# pair does not hold the execute_model()->sample_tokens() invariant under that
+# path: an empty-token scheduler step leaves _cached_logits unset, so a later
+# sample_tokens() raises "sample_tokens() called without prior execute_model()",
+# kills the EngineCore, and systemd restart-loops it (each restart re-compiles,
+# taking the model down for minutes). Disabling async scheduling makes
+# execute_model + sample_tokens run in the same synchronous step, removing the
+# race. Verified: 12 consecutive mixed requests, 0 restarts.
 if [[ -t 1 ]]; then
   # Interactive shell: keep legacy nohup behaviour for manual launches.
   nohup vllm serve \
@@ -117,6 +129,7 @@ if [[ -t 1 ]]; then
     --additional-config="${ADDITIONAL_CONFIG}" \
     --limit-mm-per-prompt="${LIMIT_MM}" \
     --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --no-async-scheduling \
     --reasoning-parser="${REASONING_PARSER}" \
     --host=0.0.0.0 --port="${PORT}" \
     >>"${LOG}" 2>&1 &
@@ -133,6 +146,7 @@ else
     --additional-config="${ADDITIONAL_CONFIG}" \
     --limit-mm-per-prompt="${LIMIT_MM}" \
     --no-enable-chunked-prefill --no-enable-prefix-caching \
+    --no-async-scheduling \
     --reasoning-parser="${REASONING_PARSER}" \
     --host=0.0.0.0 --port="${PORT}"
 fi

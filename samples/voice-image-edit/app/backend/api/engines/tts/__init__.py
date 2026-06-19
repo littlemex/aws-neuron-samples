@@ -61,9 +61,11 @@ ENGINES: dict[str, Callable[[], TtsEngine]] = {
 }
 
 DEFAULT_ENV_VAR = "TTS_ENGINE_DEFAULT"
-# Tomoko / neural was selected as the default voice for the demo. Operators
-# can flip via /manage UI, env override, or per-request engine field.
-DEFAULT_FALLBACK = "bedrock_polly_tomoko_neural"
+# This is a Trainium demo, so the self-hosted TTS (XTTS / F5-TTS) is the
+# headline default — matching ASR / VLM / EDIT. Operators can flip to a
+# managed Polly voice via /manage UI, env override, or per-request engine
+# field (bedrock_polly_tomoko_neural etc. remain registered).
+DEFAULT_FALLBACK = "trainium"
 
 _cache: dict[str, TtsEngine] = {}
 

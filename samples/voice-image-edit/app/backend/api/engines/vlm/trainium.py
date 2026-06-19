@@ -35,6 +35,7 @@ from engines.vlm._prompts import (
 from engines._common import (
     build_metadata,
     decode_image_b64,
+    downscale_image_for_vlm,
     env_float,
     env_required,
     guess_image_mime,
@@ -61,17 +62,32 @@ class TrainiumVlmEngine(VlmEngine):
         start = time.monotonic()
         system_prompt = _resolve_system_prompt(req.mode)
 
-        # Build user content: image+text for instruction/review, text-only
-        # for translate. The OpenAI Chat schema accepts either a string or
-        # a list of content parts; we always send the list form for image
-        # modes and a plain string for translate so models that reject
-        # vision-style content for text-only prompts still work.
-        if req.mode == "translate":
+        # Build user content: image+text for review ONLY; text-only for
+        # instruction and translate.
+        #
+        # instruction = "turn the user's (Japanese) voice instruction into an
+        # English edit prompt" — a pure language transform that does NOT need
+        # the BEFORE image. Sending the image here was unnecessary and harmful:
+        # a large image overruns the Neuron vision bucket (image patches >
+        # 16384) and raises AssertionError, which kills the whole vLLM
+        # EngineCore, takes the demo down, and forces a multi-minute recompile.
+        # Only review (which grades the AFTER image) genuinely needs vision.
+        #
+        # The OpenAI Chat schema accepts either a plain string or a list of
+        # content parts; we send a plain string for the text-only modes so
+        # models that reject vision-style content for text prompts still work.
+        if req.mode in ("translate", "instruction"):
             user_content: Any = req.prompt
         else:
-            image_bytes = decode_image_b64(req.image_b64)
+            # review: downscale the AFTER image so its patch count stays under
+            # the Neuron vision bucket (>16384 patches kills the EngineCore).
+            # Re-encode the (possibly) resized bytes; do not reuse the original
+            # req.image_b64, which may be the oversized source.
+            import base64 as _b64
+
+            image_bytes = downscale_image_for_vlm(decode_image_b64(req.image_b64))
             mime = guess_image_mime(image_bytes)
-            data_uri = f"data:{mime};base64,{req.image_b64}"
+            data_uri = f"data:{mime};base64,{_b64.b64encode(image_bytes).decode('ascii')}"
             user_content = [
                 {"type": "image_url", "image_url": {"url": data_uri}},
                 {"type": "text", "text": req.prompt},

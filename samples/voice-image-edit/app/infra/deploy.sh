@@ -44,15 +44,13 @@
 #   --origin-verify-secret-arn ARN     上書き (デバッグ用)
 #
 # 任意 (3 スロット既定値):
-#   --asr-engine-default NAME          default: bedrock_transcribe
-#   --vlm-engine-default NAME          default: bedrock_nova_lite
-#   --edit-engine-default NAME         default: bedrock_nova_canvas
+#   --asr-engine-default NAME          default: trainium
+#   --vlm-engine-default NAME          default: trainium
+#   --edit-engine-default NAME         default: trainium
 #
 # 任意 (Bedrock model 上書き):
 #   --bedrock-asr-backend BACKEND      transcribe / nova_sonic (default: transcribe)
-#   --bedrock-claude-sonnet-model ID   default: anthropic.claude-3-5-sonnet-20241022-v2:0
-#   --bedrock-nova-pro-model ID        default: amazon.nova-pro-v1:0
-#   --bedrock-nova-lite-model ID       default: amazon.nova-lite-v1:0
+#   --bedrock-claude-opus-model ID   default: us.anthropic.claude-opus-4-5-20251101-v1:0
 #   --bedrock-nova-canvas-model ID     default: amazon.nova-canvas-v1:0
 #   --trainium-edit-model-id ID        Trainium 自前 EDIT サーバが返す model id (default: Qwen/Qwen-Image-Edit-2511)
 #
@@ -86,7 +84,7 @@
 # Examples:
 #   bash deploy.sh --base-stack-name neuron-code-server --bedrock-region us-east-1
 #   bash deploy.sh --base-stack-name neuron-code-server -r sa-east-1 \
-#       --vlm-engine-default bedrock_claude_sonnet
+#       --vlm-engine-default bedrock_claude_opus
 #   bash deploy.sh --base-stack-name neuron-code-server --skip-frontend
 #   bash deploy.sh --destroy --base-stack-name neuron-code-server
 
@@ -129,9 +127,8 @@ VLM_ENGINE_DEFAULT="${VLM_ENGINE_DEFAULT:-${DEFAULT_VLM_ENGINE}}"
 EDIT_ENGINE_DEFAULT="${EDIT_ENGINE_DEFAULT:-${DEFAULT_EDIT_ENGINE}}"
 
 BEDROCK_ASR_BACKEND="${BEDROCK_ASR_BACKEND:-${DEFAULT_BEDROCK_ASR_BACKEND}}"
-BEDROCK_CLAUDE_SONNET_MODEL_ID="${BEDROCK_CLAUDE_SONNET_MODEL_ID:-${DEFAULT_BEDROCK_CLAUDE_SONNET_MODEL_ID}}"
-BEDROCK_NOVA_PRO_MODEL_ID="${BEDROCK_NOVA_PRO_MODEL_ID:-${DEFAULT_BEDROCK_NOVA_PRO_MODEL_ID}}"
-BEDROCK_NOVA_LITE_MODEL_ID="${BEDROCK_NOVA_LITE_MODEL_ID:-${DEFAULT_BEDROCK_NOVA_LITE_MODEL_ID}}"
+BEDROCK_CLAUDE_OPUS_MODEL_ID="${BEDROCK_CLAUDE_OPUS_MODEL_ID:-${DEFAULT_BEDROCK_CLAUDE_OPUS_MODEL_ID}}"
+# VLM スロットの Bedrock は Claude Opus 1 本に集約済み (Nova Pro / Lite は撤廃)。
 # 旧 BEDROCK_EDIT_MODEL_ID は撤廃。Nova Canvas を指す唯一の env は
 # BEDROCK_NOVA_CANVAS_MODEL_ID に統一 (engines/edit/__init__.py がこれだけを読む)。
 BEDROCK_NOVA_CANVAS_MODEL_ID="${BEDROCK_NOVA_CANVAS_MODEL_ID:-${DEFAULT_BEDROCK_NOVA_CANVAS_MODEL_ID}}"
@@ -192,9 +189,7 @@ while [[ $# -gt 0 ]]; do
         --vlm-engine-default)           VLM_ENGINE_DEFAULT="$2"; shift 2 ;;
         --edit-engine-default)          EDIT_ENGINE_DEFAULT="$2"; shift 2 ;;
         --bedrock-asr-backend)          BEDROCK_ASR_BACKEND="$2"; shift 2 ;;
-        --bedrock-claude-sonnet-model)  BEDROCK_CLAUDE_SONNET_MODEL_ID="$2"; shift 2 ;;
-        --bedrock-nova-pro-model)       BEDROCK_NOVA_PRO_MODEL_ID="$2"; shift 2 ;;
-        --bedrock-nova-lite-model)      BEDROCK_NOVA_LITE_MODEL_ID="$2"; shift 2 ;;
+        --bedrock-claude-opus-model)  BEDROCK_CLAUDE_OPUS_MODEL_ID="$2"; shift 2 ;;
         --bedrock-nova-canvas-model)    BEDROCK_NOVA_CANVAS_MODEL_ID="$2"; shift 2 ;;
         --bedrock-edit-model)
             # 後方互換: 旧フラグ名。BEDROCK_NOVA_CANVAS_MODEL_ID と同じ意味で受ける。
@@ -566,9 +561,7 @@ echo
 echo "  ASR default                : $ASR_ENGINE_DEFAULT  (bedrock backend: $BEDROCK_ASR_BACKEND)"
 echo "  VLM default                : $VLM_ENGINE_DEFAULT"
 echo "  EDIT default               : $EDIT_ENGINE_DEFAULT"
-echo "  Bedrock Claude Sonnet      : $BEDROCK_CLAUDE_SONNET_MODEL_ID"
-echo "  Bedrock Nova Pro           : $BEDROCK_NOVA_PRO_MODEL_ID"
-echo "  Bedrock Nova Lite          : $BEDROCK_NOVA_LITE_MODEL_ID"
+echo "  Bedrock Claude Opus (VLM)  : $BEDROCK_CLAUDE_OPUS_MODEL_ID"
 echo "  Bedrock Nova Canvas (EDIT) : $BEDROCK_NOVA_CANVAS_MODEL_ID"
 echo "  Trainium EDIT model id     : $TRAINIUM_EDIT_MODEL_ID"
 echo "  Trainium ASR URL           : ${TRAINIUM_ASR_URL:-(none)}"
@@ -883,9 +876,7 @@ deploy_api_service() {
         --arg vlm "$VLM_ENGINE_DEFAULT" \
         --arg edit "$EDIT_ENGINE_DEFAULT" \
         --arg asr_backend "$BEDROCK_ASR_BACKEND" \
-        --arg claude "$BEDROCK_CLAUDE_SONNET_MODEL_ID" \
-        --arg nova_pro "$BEDROCK_NOVA_PRO_MODEL_ID" \
-        --arg nova_lite "$BEDROCK_NOVA_LITE_MODEL_ID" \
+        --arg claude "$BEDROCK_CLAUDE_OPUS_MODEL_ID" \
         --arg nova_canvas "$BEDROCK_NOVA_CANVAS_MODEL_ID" \
         --arg trainium_asr "$TRAINIUM_ASR_URL" \
         --arg trainium_vlm "$TRAINIUM_VLM_URL" \
@@ -906,11 +897,9 @@ deploy_api_service() {
           VLM_ENGINE_DEFAULT: $vlm,
           EDIT_ENGINE_DEFAULT: $edit,
           BEDROCK_ASR_BACKEND: $asr_backend,
-          BEDROCK_CLAUDE_SONNET_MODEL_ID: $claude,
-          BEDROCK_NOVA_PRO_MODEL_ID: $nova_pro,
-          BEDROCK_NOVA_LITE_MODEL_ID: $nova_lite,
+          BEDROCK_CLAUDE_OPUS_MODEL_ID: $claude,
           BEDROCK_NOVA_CANVAS_MODEL_ID: $nova_canvas,
-          BEDROCK_VLM_MODEL_ID: $nova_lite,
+          BEDROCK_VLM_MODEL_ID: $claude,
           TRAINIUM_ASR_URL: $trainium_asr,
           TRAINIUM_VLM_URL: $trainium_vlm,
           TRAINIUM_EDIT_URL: $trainium_edit,

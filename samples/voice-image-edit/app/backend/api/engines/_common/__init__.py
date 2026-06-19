@@ -11,7 +11,13 @@
 from __future__ import annotations
 
 from .env import env_required, env_float, env_int
-from .decode import decode_image_b64, decode_audio_b64, guess_image_mime, guess_image_format
+from .decode import (
+    decode_image_b64,
+    decode_audio_b64,
+    guess_image_mime,
+    guess_image_format,
+    downscale_image_for_vlm,
+)
 from .http import raise_for_status, safe_decode
 from .lang import whisper_language
 from .meta import build_metadata
@@ -25,6 +31,7 @@ __all__ = [
     "decode_audio_b64",
     "guess_image_mime",
     "guess_image_format",
+    "downscale_image_for_vlm",
     "raise_for_status",
     "safe_decode",
     "whisper_language",

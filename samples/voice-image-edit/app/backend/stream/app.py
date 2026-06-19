@@ -272,9 +272,14 @@ async def _run_pipeline(req: PipelineRequest) -> AsyncIterator[bytes]:
     # 1 つの AsyncClient を全段で使い回す (keep-alive)。
     async with httpx.AsyncClient(http2=False) as client:
         # ---- Stage 2: VLM (instruction) ---------------------------------
+        # instruction is a text-only language transform (JA voice -> EN edit
+        # prompt); it does not use the BEFORE image. We therefore do NOT send
+        # image_b64 here — sending it was wasteful (a full base64 image copied
+        # to the API for nothing) and, on the Neuron VLM, a large image would
+        # overrun the vision bucket and crash the engine. review (Stage 4)
+        # remains the only image-grounded VLM call.
         yield _sse_event("stage_start", {"stage": "vlm_instruction"})
         vlm_body: dict[str, Any] = {
-            "image_b64": req.image_b64,
             "prompt": req.user_instruction,
             "mode": "instruction",
             "request_id": request_id,

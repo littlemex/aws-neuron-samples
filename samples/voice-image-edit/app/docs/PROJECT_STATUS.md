@@ -93,23 +93,21 @@ Browser
 - 環境変数のみで接続先を受け取る (ハードコード禁止):
   - 共通: `BEDROCK_REGION` / `EDIT_RESULT_BUCKET` / `EDIT_RESULT_TTL_SECONDS` / `EDIT_RESULT_PREFIX`
   - 既定: `ASR_ENGINE_DEFAULT` / `VLM_ENGINE_DEFAULT` / `EDIT_ENGINE_DEFAULT`
-  - Bedrock model ID: `BEDROCK_ASR_BACKEND` / `BEDROCK_CLAUDE_SONNET_MODEL_ID` / `BEDROCK_NOVA_PRO_MODEL_ID` / `BEDROCK_NOVA_LITE_MODEL_ID` / `BEDROCK_NOVA_CANVAS_MODEL_ID` / `BEDROCK_VLM_MODEL_ID` / `BEDROCK_EDIT_MODEL_ID`
+  - Bedrock model ID: `BEDROCK_ASR_BACKEND` / `BEDROCK_CLAUDE_OPUS_MODEL_ID` (VLM, Nova Pro/Lite は撤廃) / `BEDROCK_NOVA_CANVAS_MODEL_ID` (EDIT) / `BEDROCK_VLM_MODEL_ID` (Bedrock VLM フォールバック = Opus)
   - Trainium 自前サービング URL: `TRAINIUM_ASR_URL` (Whisper) / `TRAINIUM_VLM_URL` (OpenAI 互換 chat/completions) / `TRAINIUM_EDIT_URL` (Qwen-Image-Edit `/edit`)
 
 ## Stage 2 deploy.sh の引数
 
 ```
 # 3 スロット既定値
---asr-engine-default     bedrock_transcribe (default)
---vlm-engine-default     bedrock_nova_lite (default)
---edit-engine-default    bedrock_nova_canvas (default)
+--asr-engine-default     trainium (default)
+--vlm-engine-default     trainium (default)
+--edit-engine-default    trainium (default)
 
 # Bedrock model ID 上書き
 --bedrock-asr-backend          transcribe (default) | nova_sonic
---bedrock-claude-sonnet-model  anthropic.claude-3-5-sonnet-20241022-v2:0 (default)
---bedrock-nova-pro-model       amazon.nova-pro-v1:0 (default)
---bedrock-nova-lite-model      amazon.nova-lite-v1:0 (default)
---bedrock-edit-model           amazon.nova-canvas-v1:0 (default)
+--bedrock-claude-opus-model    us.anthropic.claude-opus-4-5-20251101-v1:0 (default, VLM)
+--bedrock-nova-canvas-model    amazon.nova-canvas-v1:0 (default, EDIT)
 
 # Trainium 自前サービング URL (空ならエンジンは config_missing で 503 を返す)
 --trainium-asr-url   http://internal-...:8000/transcribe

@@ -36,6 +36,7 @@ from engines.vlm._prompts import (
 from engines._common import (
     build_metadata,
     decode_image_b64,
+    downscale_image_for_vlm,
     env_required,
     guess_image_format,
 )
@@ -69,14 +70,21 @@ class BedrockVlmEngine(VlmEngine):
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
         system_prompt = _resolve_system_prompt(req.mode)
-        # mode="translate" is text-only and intentionally skips the image
-        # input. Other modes (instruction / review) require the BEFORE/AFTER
-        # image like before.
-        if req.mode == "translate":
+        # Only review needs the image. translate and instruction are text-only:
+        # instruction just rewrites the user's (Japanese) voice instruction into
+        # an English edit prompt and does not look at the BEFORE image, so we
+        # skip the image input for it too. (On the Trainium path an oversized
+        # image here overruns the Neuron vision bucket and crashes the engine;
+        # keeping the two engines' mode→content mapping identical avoids
+        # surprising behaviour differences between them.)
+        if req.mode in ("translate", "instruction"):
             user_content: list[dict[str, Any]] = [{"text": req.prompt}]
             image_format: Optional[str] = None
         else:
-            image_bytes = decode_image_b64(req.image_b64)
+            # review: downscale the AFTER image to a safe size before sending.
+            # (Bedrock has its own dimension limits, and keeping the cap shared
+            # with the Trainium path means the demo behaves the same on both.)
+            image_bytes = downscale_image_for_vlm(decode_image_b64(req.image_b64))
             image_format = guess_image_format(image_bytes)
             user_content = [
                 {

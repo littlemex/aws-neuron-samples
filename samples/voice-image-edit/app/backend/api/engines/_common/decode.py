@@ -50,3 +50,54 @@ def guess_image_mime(image_bytes: bytes) -> str:
 def guess_image_format(image_bytes: bytes) -> str:
     """Bedrock Converse API が受ける format string (``png`` 等) を返す。"""
     return guess_image_mime(image_bytes).split("/", 1)[1]
+
+
+# The Neuron Qwen3-VL vision encoder is compiled with a fixed maximum image
+# patch bucket (16384 raw 14x14 patches ~= a 1792x1792 image). An image larger
+# than that makes the model runner raise
+#   AssertionError: Total number of image patches N exceeds largest bucket (16384)
+# which kills the whole vLLM EngineCore (and then systemd restart-loops it,
+# recompiling each time). Bedrock has its own size limits too. So before we
+# ever hand an image to a VLM we downscale its longest side to a safe bound.
+# 1568px -> (1568/14)^2 = 12544 patches, comfortably under 16384 with margin
+# for non-square aspect ratios. Downscaling only; small images pass untouched.
+_VLM_MAX_IMAGE_LONG_SIDE = 1568
+
+
+def downscale_image_for_vlm(
+    image_bytes: bytes, *, max_long_side: int = _VLM_MAX_IMAGE_LONG_SIDE
+) -> bytes:
+    """Return ``image_bytes`` resized so its longest side <= ``max_long_side``.
+
+    Returns the input unchanged when it is already small enough or when Pillow
+    is unavailable / the bytes cannot be parsed (we must never turn a working
+    request into a hard failure just because resizing was not possible — the
+    engine-side handling still applies).
+    """
+    try:
+        import io
+
+        from PIL import Image
+    except Exception:
+        return image_bytes
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as im:
+            w, h = im.size
+            longest = max(w, h)
+            if longest <= max_long_side:
+                return image_bytes
+            scale = max_long_side / float(longest)
+            new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+            fmt = im.format or "PNG"
+            # Drop alpha for JPEG; keep mode otherwise.
+            resized = im.resize(new_size, Image.LANCZOS)
+            buf = io.BytesIO()
+            if fmt.upper() in ("JPG", "JPEG") and resized.mode not in ("RGB", "L"):
+                resized = resized.convert("RGB")
+            resized.save(buf, format=fmt)
+            return buf.getvalue()
+    except Exception:
+        # Parsing/resizing failed — return original; the engine may still cope
+        # (or fail with its own clear error) rather than us masking the problem.
+        return image_bytes
