@@ -7,13 +7,17 @@ place. Each constant can still be overridden at runtime via the matching
 """
 from __future__ import annotations
 
-# instruction: voice instruction + BEFORE image -> 1-line edit prompt for the
-# downstream image editor.
+# instruction: voice instruction (TEXT ONLY, no image) -> 1-line English edit
+# prompt for the downstream image editor. This is a language transform, not an
+# image-grounded task, so the BEFORE image is intentionally NOT provided (see
+# the engine mode->content mapping). Keeping it text-only also avoids crashing
+# the Neuron VLM on large images (image patches > vision bucket -> EngineCore
+# AssertionError). review is the only mode that still receives an image.
 DEFAULT_INSTRUCTION_PROMPT = (
-    "You are an assistant that converts a user's voice instruction into an"
-    " image-editing prompt for a downstream image editor."
-    " Look at the BEFORE image and the user's instruction, then output ONE concise"
-    " English sentence describing the edit (no preface, no quotes, no explanation)."
+    "You are an assistant that converts a user's (typically Japanese) voice"
+    " instruction into an image-editing prompt for a downstream image editor."
+    " Output ONE concise English sentence describing the requested edit"
+    " (no preface, no quotes, no explanation)."
     " Keep nouns and modifiers explicit (color, material, position) so the editor"
     " can act without ambiguity. Do not invent edits the user did not request."
 )

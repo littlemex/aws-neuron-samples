@@ -69,10 +69,14 @@ class BedrockVlmEngine(VlmEngine):
     def invoke(self, req: VlmRequest) -> VlmResponse:
         start = time.monotonic()
         system_prompt = _resolve_system_prompt(req.mode)
-        # mode="translate" is text-only and intentionally skips the image
-        # input. Other modes (instruction / review) require the BEFORE/AFTER
-        # image like before.
-        if req.mode == "translate":
+        # Only review needs the image. translate and instruction are text-only:
+        # instruction just rewrites the user's (Japanese) voice instruction into
+        # an English edit prompt and does not look at the BEFORE image, so we
+        # skip the image input for it too. (On the Trainium path an oversized
+        # image here overruns the Neuron vision bucket and crashes the engine;
+        # keeping the two engines' mode→content mapping identical avoids
+        # surprising behaviour differences between them.)
+        if req.mode in ("translate", "instruction"):
             user_content: list[dict[str, Any]] = [{"text": req.prompt}]
             image_format: Optional[str] = None
         else:

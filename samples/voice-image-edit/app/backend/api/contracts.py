@@ -122,12 +122,15 @@ class VlmRequest:
     """VLM slot input.
 
     Three supported modes:
-      - "instruction": voice instruction + BEFORE image -> editing prompt for EDIT slot
-      - "review"     : editing instruction + AFTER image -> review comment
+      - "instruction": voice instruction (TEXT ONLY) -> editing prompt for EDIT slot.
+                       A pure language transform (JA voice -> EN edit prompt); the
+                       BEFORE image is NOT used, so image_b64 is optional/ignored.
+      - "review"     : editing instruction + AFTER image -> review comment.
+                       image_b64 is REQUIRED (the only image-grounded mode).
       - "translate"  : free-text only (no image) -> English image-generation prompt
                        used by the GENERATE slot to localise non-English input.
-    For modes other than "translate" image_b64 is required; for "translate"
-    it is ignored even if supplied.
+    image_b64 is required ONLY for "review"; it is optional for "instruction"
+    and ignored for "translate".
 
     ``language`` selects the response language for the review mode (other modes
     have a fixed response language). Accepted values are short codes such as
@@ -154,9 +157,13 @@ class VlmRequest:
         if mode not in {"instruction", "review", "translate"}:
             raise EngineError("invalid_request", f"unknown mode: {mode}")
         image_b64 = d.get("image_b64") or ""
-        if mode != "translate" and not image_b64:
+        # Only review is image-grounded. instruction is a text-only language
+        # transform now (it used to require the BEFORE image, which was both
+        # unnecessary and a crash vector on the Neuron VLM for large images),
+        # and translate has always been text-only.
+        if mode == "review" and not image_b64:
             raise EngineError(
-                "invalid_request", "image_b64 is required for mode != translate"
+                "invalid_request", "image_b64 is required for mode=review"
             )
         return cls(
             image_b64=image_b64,

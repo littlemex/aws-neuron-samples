@@ -427,6 +427,9 @@ class TestBedrockVlm:
             }
         )
         engine = _make_bedrock_vlm(monkeypatch, client)
+        # instruction is a text-only language transform: even if an image is
+        # supplied it must NOT be sent to the model (unnecessary, and a large
+        # image crashes the Neuron VLM). Only review sends an image.
         out = engine.invoke(
             VlmRequest(image_b64=_png_b64(), prompt="赤いドレスに変更", mode="instruction")
         )
@@ -436,8 +439,9 @@ class TestBedrockVlm:
         assert client.last_kwargs["system"][0]["text"]
         msg = client.last_kwargs["messages"][0]
         assert msg["role"] == "user"
-        assert msg["content"][0]["image"]["format"] == "png"
-        assert msg["content"][1]["text"] == "赤いドレスに変更"
+        # text-only: no image part present, the prompt is the first content part
+        assert all("image" not in part for part in msg["content"])
+        assert msg["content"][0]["text"] == "赤いドレスに変更"
 
     def test_review_mode_uses_review_prompt(self, monkeypatch):
         client = _FakeBedrockClient(
@@ -456,8 +460,10 @@ class TestBedrockVlm:
 
     def test_invalid_image_b64(self, monkeypatch):
         engine = _make_bedrock_vlm(monkeypatch, _FakeBedrockClient())
+        # Only review decodes the image, so the invalid-base64 guard fires for
+        # review (instruction/translate are text-only and ignore image_b64).
         with pytest.raises(EngineError) as exc:
-            engine.invoke(VlmRequest(image_b64="!!!", prompt="x"))
+            engine.invoke(VlmRequest(image_b64="!!!", prompt="x", mode="review"))
         assert exc.value.code == "invalid_request"
 
     def test_empty_text_is_invalid_response(self, monkeypatch):
@@ -488,6 +494,9 @@ class TestTrainiumVlm:
                 b'"usage":{"prompt_tokens":3,"completion_tokens":4}}',
             )
         )
+        # instruction is now text-only: the request body must carry the prompt
+        # as a plain string content (no image_url part), even if image_b64 is
+        # supplied on the request.
         out = engine.invoke(
             VlmRequest(
                 image_b64=_png_b64(),
@@ -500,10 +509,8 @@ class TestTrainiumVlm:
         body = json.loads(sent["body"].decode("utf-8"))
         assert body["model"] == engine.model_id
         assert body["messages"][0]["role"] == "system"
-        assert body["messages"][1]["content"][0]["type"] == "image_url"
-        assert body["messages"][1]["content"][0]["image_url"]["url"].startswith(
-            "data:image/png;base64,"
-        )
+        # text-only content: a plain string, not a list with an image_url part
+        assert body["messages"][1]["content"] == "赤くして"
 
     def test_api_key_passed_as_bearer(self, monkeypatch):
         monkeypatch.setenv("TRAINIUM_VLM_URL", "http://example.invalid/v1/chat/completions")
