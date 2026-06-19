@@ -77,16 +77,10 @@ def test_caller_sources_dispatch_helper(caller: Path):
 _PIPELINE_NAME_RE = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
 
 
-# Pipelines kept on disk but no longer wired to any caller. We
-# maintain this list rather than silently passing the test so the
-# orphans stay visible (delete them when ready). Note the policy:
-# every entry must come with a one-line reason a human can verify.
-_KNOWN_ORPHAN_PIPELINES = {
-    "whisper-precompile":   # superseded by whisper-nxd-precompile
-        "Replaced by NxD-Inference variant; deploy-all.sh references whisper-nxd-precompile only.",
-    "whisper-server":
-        "Replaced by NxD-Inference variant; deploy-all.sh references whisper-nxd-server only.",
-}
+# Pipelines kept on disk but no longer wired to any caller.
+# The legacy whisper-precompile and whisper-server orphans were deleted
+# together with the JSON retirement in STEP 2. The allowlist is now empty.
+_KNOWN_ORPHAN_PIPELINES: dict[str, str] = {}
 
 
 def _pipelines_on_disk() -> list[Path]:

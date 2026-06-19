@@ -64,10 +64,9 @@ SKIP_STEPS=""
 ONLY_STEPS=""
 INTEGRATE_VIE=false
 DRY_RUN=false
-# When true, the backend systemd deploy is dispatched through
-# tools/pipeline-runner instead of the legacy run-tasks.sh. The CDK
-# steps are unaffected. Same flag name as deploy-all.sh / app/infra/deploy.sh.
-USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
+# Accepted for backward compatibility; YAML pipeline runner is always used.
+# CDK steps are unaffected.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-true}"
 
 ALL_STEPS=(precheck backend infra integrate)
 
@@ -80,7 +79,7 @@ while [[ $# -gt 0 ]]; do
         --only)            ONLY_STEPS="$2"; shift 2 ;;
         --integrate-voice-image-edit) INTEGRATE_VIE=true; shift ;;
         --dry-run)         DRY_RUN=true; shift ;;
-        --use-pipeline-runner) USE_PIPELINE_RUNNER=true; shift ;;
+        --use-pipeline-runner) shift ;;  # no-op: YAML runner is always used
         -h|--help)
             sed -n '1,30p' "$0"
             exit 0
@@ -135,12 +134,9 @@ should_skip() {
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SAMPLE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../" && pwd)"
-RUNNER="$REPO_ROOT/setup/single-node/scripts/run-tasks.sh"
 ANATOMY_TASKS="$SAMPLE_DIR/scripts/tasks"
 INFRA_DIR="$SAMPLE_DIR/infra"
 BACKEND_DIR="$SAMPLE_DIR/backend"
-
-[[ -x "$RUNNER" ]] || { err "$RUNNER missing or not executable"; exit 1; }
 
 log "REPO_ROOT=$REPO_ROOT"
 log "BASE_STACK_NAME=$BASE_STACK_NAME"
@@ -261,11 +257,10 @@ stage_dir_to_s3() {
 }
 
 run_task_json() {
-    # Dispatch through the new pipeline-runner when USE_PIPELINE_RUNNER=true;
-    # otherwise keep using the legacy run-tasks.sh by sourcing the same
-    # helper deploy-all.sh uses.
+    # Dispatch a YAML pipeline via pipeline-runner. The legacy JSON path is
+    # accepted only for deriving the pipeline name by convention:
+    #   <dir>/tasks/<name>.json  ->  <dir>/pipelines/<name>/<name>.yml
     local task_file="$1" vars_json="${2:-{\}}" state_label="${3:-$(basename "$task_file" .json)}"
-    local state_file="/tmp/task-state-${EC2_INSTANCE_ID}-${state_label}.json"
 
     if ! declare -F pipeline_dispatch >/dev/null; then
         local helper="$REPO_ROOT/tools/pipeline-runner/lib-sh/dispatch.sh"
@@ -283,15 +278,11 @@ run_task_json() {
     yml_path="$(dirname "$(dirname "$task_file")")/pipelines/${pipeline_name}/${pipeline_name}.yml"
 
     if [[ "$DRY_RUN" == true ]]; then
-        if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
-            log "[dry] pipeline-runner: $yml_path on $EC2_INSTANCE_ID"
-        else
-            log "[dry] $RUNNER -i $EC2_INSTANCE_ID -r $REGION -f $task_file -v '$vars_json' --state-file $state_file"
-        fi
+        log "[dry] pipeline-runner: $yml_path on $EC2_INSTANCE_ID"
         return 0
     fi
-    log "running: $task_file (USE_PIPELINE_RUNNER=$USE_PIPELINE_RUNNER, state=$state_file)"
-    pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "$task_file" "$yml_path" "$vars_json" "$state_label"
+    log "running pipeline: $pipeline_name on $EC2_INSTANCE_ID"
+    pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "" "$yml_path" "$vars_json" "$state_label"
 }
 
 # ---------------------------------------------------------------------------

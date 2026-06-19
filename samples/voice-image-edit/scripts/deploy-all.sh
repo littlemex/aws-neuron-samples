@@ -1,39 +1,38 @@
 #!/bin/bash
 # voice-image-edit one-shot deploy
 #
-# このスクリプトは以下を順次実行する。 各 step は idempotent で、
-# CodeBuild Capacity Block / Spot terminate 後に再実行しても、
-# キャッシュ済みの artifact (Neuron compile, HF download, NEFF cache) を
-# 再利用してサービングを再開できることを目指す。
+# Each step is idempotent. After a CodeBuild Capacity Block or Spot termination,
+# re-running the script reuses cached artifacts (Neuron compile, HF download,
+# NEFF cache) to bring services back up without a full cold build.
 #
-#   precheck            base stack output / EFS mount / NeuronCore を確認
-#   setup-efs-paths     /models, /opt/voice-image-edit, compile artifact dir を EFS に向ける symlink layer
-#   whisper-precompile  encoder/decoder/proj.pt を EFS に compile (cache hit で skip)
-#   qwen3-vl-prepare    weights + warmup artifact を EFS に置く (cache hit で skip)
-#   qwen-image-edit-prepare V3 CFG 5 component を EFS に compile (cache hit で skip)
-#   whisper-server      systemd unit install + start (port 8765)
-#   qwen3-vl-server     systemd unit install + start (port 8090)
-#   qwen-image-edit-server systemd unit install + start (port 8081)
-#   voice-image-edit-app  ApiStack/FrontendStack/StreamStack に TRAINIUM_*_URL を inject
-#   neuron-anatomy        sibling stack: ALB rule /neuron/* + backend on EC2 を再 wire
+#   precheck            verify base stack outputs / EFS mount / NeuronCore
+#   setup-efs-paths     create EFS-backed symlinks for /models, /opt/voice-image-edit, compile artifacts
+#   whisper-precompile  compile encoder/decoder/proj.pt to EFS (skips on cache hit)
+#   qwen3-vl-prepare    download weights + run vLLM warmup to EFS (skips on cache hit)
+#   qwen-image-edit-prepare  compile V3 CFG 5 components to EFS (skips on cache hit)
+#   whisper-server      install + start systemd unit (port 8765)
+#   qwen3-vl-server     install + start systemd unit (port 8090)
+#   qwen-image-edit-server  install + start systemd unit (port 8081)
+#   voice-image-edit-app  inject TRAINIUM_*_URL into ApiStack/FrontendStack/StreamStack
+#   neuron-anatomy      sibling stack: re-wire ALB rule /neuron/* + backend on EC2
 #
-# 使い方:
+# Usage:
 #   bash deploy-all.sh \
 #     --base-stack-name storeai-validation-use2 \
 #     --region us-east-2
 #
-# 主な flag:
-#   --base-stack-name   base stack 名 (EC2 インスタンスや EFS mount 情報を output から拾う)
+# Key flags:
+#   --base-stack-name   base stack name (EC2 instance and EFS mount info from CFn outputs)
 #   --region            AWS region (default: us-east-2)
-#   --skip <names>      , 区切りで step を skip ("setup-efs-paths,migrate-to-efs" など)
-#   --only <names>      , 区切りで指定 step のみ実行 (debug 用)
-#   --migrate           初回 EFS 移行で migrate-to-efs を setup-efs-paths の前に挟む
-#   --recover           CB / Spot terminate 後の recovery mode (= --skip migrate-to-efs と同義、 default)
-#   --dry-run           各 step の表示のみ。 SSM 送信は走らない
-#   --use-pipeline-runner  全 step を tools/pipeline-runner 経由で実行 (default: 旧 run-tasks.sh)
+#   --skip <names>      comma-separated steps to skip (e.g. "setup-efs-paths,migrate-to-efs")
+#   --only <names>      run only the listed steps (debug)
+#   --migrate           include migrate-to-efs before setup-efs-paths (first-time EFS migration)
+#   --recover           recovery mode after CB/Spot termination (= --skip migrate-to-efs, default)
+#   --dry-run           print each step without sending SSM commands
+#   --use-pipeline-runner  accepted for backward compatibility; YAML pipeline runner is always used
 #
-# 必須環境変数:
-#   AWS_PROFILE=claude-code  (他 profile 禁止: 2026-04-20 厳命)
+# Required environment variable:
+#   AWS_PROFILE=claude-code
 set -euo pipefail
 
 # Always emit a final-line marker so an operator (or wrapper that looks
@@ -72,12 +71,8 @@ SKIP_STEPS=""
 ONLY_STEPS=""
 MIGRATE=false
 DRY_RUN=false
-# When true, every step is dispatched through tools/pipeline-runner
-# (YAML+bash pipelines under <consumer>/pipelines/<name>/). Otherwise
-# the legacy run-tasks.sh JSON path is used. Same flag name as the
-# voice-image-edit/app/infra/deploy.sh switch so operators can pass the
-# same value top-down.
-USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
+# Accepted for backward compatibility; YAML pipeline runner is always used.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-true}"
 
 # Step granularity: --skip prepare で 3 prepare 全部 skip / --skip setup-efs-paths で 1 step skip
 #
@@ -112,7 +107,7 @@ while [[ $# -gt 0 ]]; do
     --migrate)         MIGRATE=true; shift ;;
     --recover)         MIGRATE=false; shift ;;
     --dry-run)         DRY_RUN=true; shift ;;
-    --use-pipeline-runner) USE_PIPELINE_RUNNER=true; shift ;;
+    --use-pipeline-runner) shift ;;  # no-op: YAML runner is always used
     -h|--help)
       sed -n '1,40p' "$0"
       exit 0
@@ -179,7 +174,6 @@ validate_step_list "--skip" "$SKIP_STEPS"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VIE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../" && pwd)"  # samples/.. = repo root
-RUNNER="$REPO_ROOT/setup/single-node/scripts/run-tasks.sh"
 WHISPER_TASKS="$REPO_ROOT/samples/models/whisper/tasks"
 QWEN3VL_TASKS="$REPO_ROOT/samples/models/qwen3-vl/tasks"
 QIE_TASKS="$REPO_ROOT/samples/models/qwen-image-edit/tasks"
@@ -188,10 +182,7 @@ XTTSV2_DIR="$REPO_ROOT/samples/models/xttsv2"
 SCRIPTS_TASKS="$VIE_DIR/scripts/tasks"
 APP_INFRA_DIR="$VIE_DIR/app/infra"
 
-[[ -x "$RUNNER" ]] || { err "$RUNNER missing or not executable"; exit 1; }
-
 log "REPO_ROOT=$REPO_ROOT"
-log "RUNNER=$RUNNER"
 log "BASE_STACK_NAME=$BASE_STACK_NAME"
 log "REGION=$REGION"
 log "AWS_PROFILE=$AWS_PROFILE"
@@ -245,20 +236,17 @@ xttsv2_profile_for_instance() {
   echo "4 0-3 /models/xttsv2-neuron-nxd-tp4"
 }
 
-# --- helper: run a task JSON via run-tasks.sh, OR the matching YAML pipeline ---
+# --- helper: run a YAML pipeline via the pipeline runner ---
 #
 # Mapping convention used by every consumer in this repo:
 #   <dir>/tasks/<name>.json   <->   <dir>/pipelines/<name>/<name>.yml
 #
-# Callers still hand us the legacy JSON path (since deploy-all.sh predates
-# the new runner); we derive the YAML path by string substitution. If the
-# YAML is missing when --use-pipeline-runner is requested, fall back to the
-# legacy path with a loud warning so a half-migrated tree still deploys.
+# Callers pass the legacy task file path (still used to derive the YAML path
+# by convention); the JSON file itself no longer needs to exist on disk.
 run_task_json() {
   local task_file="$1"
   local vars_json="${2:-{\}}"
   local state_label="${3:-$(basename "$task_file" .json)}"
-  local state_file="/tmp/task-state-${EC2_INSTANCE_ID}-${state_label}.json"
 
   # Source the dispatch helper lazily; we cd to REPO_ROOT before invoking
   # so the runner anchors .runner-state/ at a predictable spot.
@@ -278,22 +266,12 @@ run_task_json() {
   yml_path="$(dirname "$(dirname "$task_file")")/pipelines/${pipeline_name}/${pipeline_name}.yml"
 
   if [[ "$DRY_RUN" == true ]]; then
-    if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
-      log "[dry] pipeline-runner: $yml_path on $EC2_INSTANCE_ID"
-    else
-      log "[dry] $RUNNER -i $EC2_INSTANCE_ID -r $REGION -f $task_file -v '$vars_json' --state-file $state_file"
-    fi
+    log "[dry] pipeline-runner: $yml_path on $EC2_INSTANCE_ID"
     return 0
   fi
 
-  if [[ "$USE_PIPELINE_RUNNER" == "true" && ! -f "$yml_path" ]]; then
-    warn "USE_PIPELINE_RUNNER=true but $yml_path missing; falling back to legacy $task_file"
-    USE_PIPELINE_RUNNER=false pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "$task_file" "$yml_path" "$vars_json" "$state_label"
-    return $?
-  fi
-
-  log "running: $task_file (USE_PIPELINE_RUNNER=$USE_PIPELINE_RUNNER, state=$state_file)"
-  pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "$task_file" "$yml_path" "$vars_json" "$state_label"
+  log "running pipeline: $pipeline_name on $EC2_INSTANCE_ID"
+  pipeline_dispatch "$EC2_INSTANCE_ID" "$REGION" "" "$yml_path" "$vars_json" "$state_label"
 }
 
 # --- step: setup-efs-paths ---
@@ -449,18 +427,13 @@ step_voice_image_edit_app() {
     log "[dry] cd $APP_INFRA_DIR && bash deploy.sh --base-stack-name $BASE_STACK_NAME --region $REGION --trainium-asr-url $asr_url --trainium-vlm-url $vlm_url --trainium-edit-url $edit_url --trainium-tts-url $tts_url"
     return 0
   fi
-  local extra_args=()
-  if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
-    extra_args+=(--use-pipeline-runner)
-  fi
   ( cd "$APP_INFRA_DIR" && bash deploy.sh \
     --base-stack-name "$BASE_STACK_NAME" \
     --region "$REGION" \
     --trainium-asr-url "$asr_url" \
     --trainium-vlm-url "$vlm_url" \
     --trainium-edit-url "$edit_url" \
-    --trainium-tts-url "$tts_url" \
-    "${extra_args[@]}" )
+    --trainium-tts-url "$tts_url" )
 }
 
 # --- step: neuron-anatomy (sibling stack, must follow EC2 recover) ---
@@ -481,15 +454,10 @@ step_neuron_anatomy() {
     log "[dry] $anatomy_deploy --base-stack-name $BASE_STACK_NAME --region $REGION --only backend,infra"
     return 0
   fi
-  local anatomy_extra_args=()
-  if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
-    anatomy_extra_args+=(--use-pipeline-runner)
-  fi
   bash "$anatomy_deploy" \
     --base-stack-name "$BASE_STACK_NAME" \
     --region "$REGION" \
-    --only backend,infra \
-    "${anatomy_extra_args[@]}"
+    --only backend,infra
 }
 
 # --- helper: stage a single file or directory tar to the stage S3 bucket ---
