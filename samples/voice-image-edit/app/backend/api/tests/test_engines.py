@@ -147,12 +147,13 @@ class TestRegistry:
         assert "bedrock_nova_sonic" in names
         assert "trainium" in names
 
-    def test_vlm_engines_have_multiple_bedrock(self):
+    def test_vlm_engines_are_opus_and_trainium_only(self):
+        # VLM の Bedrock は Claude Opus 1 本に集約済み。Nova Pro / Lite は
+        # 撤廃したので registry に出てきてはいけない (回帰防止)。
         names = registry.list_engines("vlm")
-        assert "bedrock_claude_opus" in names
-        assert "bedrock_nova_pro" in names
-        assert "bedrock_nova_lite" in names
-        assert "trainium" in names
+        assert names == ["bedrock_claude_opus", "trainium"]
+        assert "bedrock_nova_pro" not in names
+        assert "bedrock_nova_lite" not in names
 
     def test_unknown_slot_raises(self):
         with pytest.raises(EngineError) as exc:

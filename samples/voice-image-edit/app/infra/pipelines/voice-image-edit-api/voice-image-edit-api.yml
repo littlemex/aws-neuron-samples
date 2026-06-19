@@ -33,8 +33,6 @@ required_vars:
   - BEDROCK_ASR_BACKEND
   # Bedrock model ids
   - BEDROCK_CLAUDE_OPUS_MODEL_ID
-  - BEDROCK_NOVA_PRO_MODEL_ID
-  - BEDROCK_NOVA_LITE_MODEL_ID
   - BEDROCK_NOVA_CANVAS_MODEL_ID
   - BEDROCK_VLM_MODEL_ID
   # Trainium endpoints (empty string is fine, but the variable must be set)

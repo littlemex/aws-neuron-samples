@@ -28,29 +28,23 @@ def _bedrock_claude_opus() -> VlmEngine:
     )
 
 
-def _bedrock_nova_pro() -> VlmEngine:
-    return BedrockVlmEngine(
-        model_id=env_required("BEDROCK_NOVA_PRO_MODEL_ID"),
-        engine_name="bedrock_nova_pro",
-    )
-
-
-def _bedrock_nova_lite() -> VlmEngine:
-    return BedrockVlmEngine(
-        model_id=env_required("BEDROCK_NOVA_LITE_MODEL_ID"),
-        engine_name="bedrock_nova_lite",
-    )
-
-
+# NOTE: the VLM slot intentionally exposes ONLY two engines — the self-hosted
+# Trainium Qwen3-VL (the headline path) and a single managed Bedrock fallback
+# (Claude Opus). The Nova Pro / Nova Lite VLM engines were removed: a second
+# Bedrock VLM only widened the surface for review/instruction failures without
+# adding demo value, so we consolidated to one. (Nova Canvas lives in the EDIT
+# slot and Nova Sonic in the ASR slot — those are unrelated and stay.)
 ENGINES: dict[str, Callable[[], VlmEngine]] = {
     "bedrock_claude_opus": _bedrock_claude_opus,
-    "bedrock_nova_pro": _bedrock_nova_pro,
-    "bedrock_nova_lite": _bedrock_nova_lite,
     "trainium": TrainiumVlmEngine,
 }
 
 DEFAULT_ENV_VAR = "VLM_ENGINE_DEFAULT"
-DEFAULT_FALLBACK = "bedrock_nova_lite"
+# Last-resort fallback when VLM_ENGINE_DEFAULT is unset. Points at the managed
+# Bedrock engine (not trainium) to match the other slots' convention: the
+# self-hosted engine needs TRAINIUM_VLM_URL which may be absent, whereas the
+# Bedrock engine works as long as the account has model access.
+DEFAULT_FALLBACK = "bedrock_claude_opus"
 
 _cache: dict[str, VlmEngine] = {}
 
