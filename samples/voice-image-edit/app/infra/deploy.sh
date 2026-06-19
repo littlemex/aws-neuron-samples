@@ -77,8 +77,8 @@
 #   --reset-app-stacks            base ALB と紐づかない既存 VoiceImageEdit*Stack を deploy 前に強制 destroy。
 #                                 base stack 再作成後の orphan stack を正規に作り直す唯一のパス。
 #   --destroy                     全 stack を destroy する
-#   --use-pipeline-runner         api / frontend / stream の deploy を新 pipeline-runner で実行
-#                                 (default: 旧 run-tasks.sh)。CDK 部分は影響なし。
+#   --use-pipeline-runner         accepted for backward compatibility; YAML pipeline runner
+#                                 is always used. CDK steps are unaffected.
 #   -h, --help                    このヘルプ
 #
 # Examples:
@@ -163,11 +163,9 @@ STREAM_PATH_PATTERN="${STREAM_PATH_PATTERN:-${DEFAULT_STREAM_PATH_PATTERN}}"
 
 RESET_APP_STACKS=false
 DESTROY=false
-# When true, all three application deploys (api / frontend / stream) flow
-# through tools/pipeline-runner instead of the legacy run-tasks.sh. The
-# CDK steps are unaffected. Defaults off so existing operators keep their
-# muscle memory until the legacy runner is retired.
-USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
+# Accepted for backward compatibility; YAML pipeline runner is always used.
+# CDK steps are unaffected.
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-true}"
 
 usage() {
     sed -n '3,86p' "$0"
@@ -218,7 +216,7 @@ while [[ $# -gt 0 ]]; do
         --stream-path-pattern)          STREAM_PATH_PATTERN="$2"; shift 2 ;;
         --reset-app-stacks)             RESET_APP_STACKS=true; shift ;;
         --destroy)                      DESTROY=true; shift ;;
-        --use-pipeline-runner)          USE_PIPELINE_RUNNER=true; shift ;;
+        --use-pipeline-runner)          shift ;;  # no-op: YAML runner is always used
         -h|--help)                      usage; exit 0 ;;
         *)
             echo -e "${RED}Error: unknown option: $1${NC}"
@@ -730,13 +728,11 @@ fi
 
 # -----------------------------------------------------------------------------
 # Common helpers for tarball staging + SSM Run Command dispatch.
-#   resolve_deploy_bucket            : CDK bootstrap asset bucket を 1 度解決して echo
-#   ensure_runner                    : run-tasks.sh の実行権限を確認 (なければ exit)
-#   stage_tarball <tar> <s3-prefix>  : S3 にアップロードして presigned URL を echo
+#   resolve_deploy_bucket            : resolve CDK bootstrap asset bucket once
+#   stage_tarball <tar> <s3-prefix>  : upload to S3 and return presigned URL
 #   run_task <instance> <task.json> <vars-json>
 # -----------------------------------------------------------------------------
 DEPLOY_BUCKET=""
-RUNNER_PATH=""
 
 resolve_deploy_bucket() {
     if [[ -n "$DEPLOY_BUCKET" ]]; then
@@ -752,18 +748,7 @@ resolve_deploy_bucket() {
             "${PROFILE_ARG[@]}" 2>/dev/null || true)"
     fi
     if [[ -z "$DEPLOY_BUCKET" || "$DEPLOY_BUCKET" == "None" ]]; then
-        echo -e "${RED}[NG] tarball アップロード先 bucket が解決できませんでした。--deploy-bucket で CDK bootstrap 済 bucket を指定してください。${NC}" >&2
-        exit 1
-    fi
-}
-
-ensure_runner() {
-    if [[ -n "$RUNNER_PATH" ]]; then
-        return 0
-    fi
-    RUNNER_PATH="$(cd "$INFRA_DIR/../../../../setup/single-node/scripts" && pwd)/run-tasks.sh"
-    if [[ ! -x "$RUNNER_PATH" ]]; then
-        echo -e "${RED}[NG] $RUNNER_PATH が見つかりません (基盤 scripts と同じ tree 内に配置されている前提)。${NC}" >&2
+        echo -e "${RED}[NG] Could not resolve tarball upload bucket. Pass --deploy-bucket with a CDK-bootstrapped bucket name.${NC}" >&2
         exit 1
     fi
 }
@@ -785,39 +770,30 @@ stage_tarball() {
 }
 
 run_task() {
-    # Thin shim that delegates to tools/pipeline-runner/lib-sh/dispatch.sh,
-    # which picks the new pipeline-runner or the legacy run-tasks.sh based
-    # on USE_PIPELINE_RUNNER. Callers pass BOTH the legacy JSON path and
-    # the new YAML path so the switch is a single env var away.
+    # Dispatch a YAML pipeline via tools/pipeline-runner/lib-sh/dispatch.sh.
+    # Convention: tasks/<name>.json -> pipelines/<name>/<name>.yml
+    # The JSON file no longer needs to exist; only the YAML path is used.
     local instance_id="$1" legacy_json="$2" vars_json="$3" service="$4"
 
-    # Resolve the matching new-runner YAML by convention:
-    #   tasks/voice-image-edit-api.json  ->  pipelines/voice-image-edit-api/voice-image-edit-api.yml
     local pipeline_name new_yml
     pipeline_name="$(basename "$legacy_json" .json)"
     new_yml="$INFRA_DIR/pipelines/${pipeline_name}/${pipeline_name}.yml"
 
-    # Source the dispatch helper lazily so the original run_task callers
-    # do not have to know about the helper's path.
+    # Source the dispatch helper lazily.
     if ! declare -F pipeline_dispatch >/dev/null; then
         local helper="$INFRA_DIR/../../../../tools/pipeline-runner/lib-sh/dispatch.sh"
         if [[ ! -f "$helper" ]]; then
             echo -e "${RED}[NG] dispatch helper missing at $helper${NC}" >&2
             exit 1
         fi
-        # REPO_ROOT is needed by the helper so the new runner anchors
-        # .runner-state/ at the repo root, not at the deploy.sh cwd.
+        # REPO_ROOT anchors .runner-state/ at the repo root.
         export REPO_ROOT="$(cd "$INFRA_DIR/../../../.." && pwd)"
         # shellcheck disable=SC1090
         source "$helper"
     fi
 
-    if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
-        echo -e "${BLUE}[INFO] running ${pipeline_name}.yml via pipeline-runner on ${instance_id}${NC}"
-    else
-        echo -e "${BLUE}[INFO] running $(basename "$legacy_json") on ${instance_id} (legacy run-tasks.sh)${NC}"
-    fi
-    pipeline_dispatch "$instance_id" "$REGION" "$legacy_json" "$new_yml" "$vars_json" "$service"
+    echo -e "${BLUE}[INFO] running ${pipeline_name}.yml via pipeline-runner on ${instance_id}${NC}"
+    pipeline_dispatch "$instance_id" "$REGION" "" "$new_yml" "$vars_json" "$service"
 }
 
 # -----------------------------------------------------------------------------
@@ -836,7 +812,6 @@ deploy_api_service() {
     fi
 
     resolve_deploy_bucket
-    ensure_runner
 
     local tarball
     tarball="$(mktemp -t voice-image-edit-api.XXXXXX.tar.gz)"
@@ -933,7 +908,6 @@ deploy_frontend_service() {
     fi
 
     resolve_deploy_bucket
-    ensure_runner
 
     if [[ "$FRONTEND_NO_BUILD" != "true" ]]; then
         echo -e "${BLUE}[INFO] building frontend (next build, standalone) in ${fe_dir}${NC}"
@@ -1006,7 +980,6 @@ deploy_stream_service() {
     fi
 
     resolve_deploy_bucket
-    ensure_runner
 
     local tarball
     tarball="$(mktemp -t voice-image-edit-stream.XXXXXX.tar.gz)"

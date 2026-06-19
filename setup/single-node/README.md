@@ -23,16 +23,17 @@ on ParallelCluster or HyperPod.
 ```
 single-node/
 ├── cdk/           AWS CDK TypeScript app (CloudFormation stack definition)
-├── scripts/       deploy.sh, recover.sh, capacity-block helpers, SSM task runner
-└── tasks/         JSON task definitions executed by scripts/run-tasks.sh
+├── scripts/       deploy.sh, recover.sh, capacity-block helpers, pipeline runner callers
+└── pipelines/     YAML+bash pipeline definitions executed by tools/pipeline-runner
 ```
 
 The separation is deliberate. The CDK app owns the shape of the stack
 (security group, IAM role, launch template, EC2 instance, Secrets Manager
 secret, outputs). The shell scripts drive the lifecycle around it -
-deploy, setup, recover, tear down. The JSON tasks define what actually
-runs on the instance after it boots, and are invoked over SSM Run Command
-so they can be re-executed idempotently at any time.
+deploy, setup, recover, tear down. The YAML pipeline tasks define what
+actually runs on the instance after it boots, and are dispatched over
+SSM Run Command via `tools/pipeline-runner` so they can be re-executed
+idempotently at any time.
 
 ## Architecture
 
@@ -168,11 +169,11 @@ bash scripts/deploy.sh \
 3. Authorizes NFS (2049/tcp) from the new instance SG on every mount
    target SG of the EFS, so mounts will succeed.
 4. Waits for the SSM agent to come Online (typically 2-3 minutes).
-5. Uploads `scripts/setup-persistence.sh` to the instance and invokes
-   `tasks/code-server-setup.json` through SSM Run Command. This installs
-   and configures code-server, nginx, persistent storage, and a set of
-   VS Code extensions. Every task is idempotent; re-running the whole
-   setup is safe.
+5. Uploads `scripts/setup-persistence.sh` to the instance and runs
+   `pipelines/code-server-setup/` through SSM Run Command via
+   `tools/pipeline-runner`. This installs and configures code-server,
+   nginx, persistent storage, and a set of VS Code extensions. Every
+   task is idempotent; re-running the whole setup is safe.
 
 The script prints the code-server password, the instance id, and the
 exact port-forwarding command to run when it completes.
@@ -497,7 +498,7 @@ bash scripts/deploy.sh -r us-west-2 --stack-name neuron-ws --install-claude-code
   and CloudFormation stack outputs. If you manually mutate either, the
   tooling will happily use your modifications.
 - The setup tasks install a curated set of VS Code extensions. Trim or
-  extend them in `tasks/code-server-setup.json` task `15`.
+  extend them in `pipelines/code-server-setup/scripts/15-vscode-extensions.sh`.
 
 ## Troubleshooting
 
@@ -507,7 +508,8 @@ bash scripts/deploy.sh -r us-west-2 --stack-name neuron-ws --install-claude-code
   the same `authorize-security-group-ingress` manually.
 - **`Instances not in a valid state`** from the setup script: the SSM
   agent has not registered yet. Wait another minute and re-run
-  `scripts/setup-code-server.sh` manually with `--start-from 00-setup-persistence`.
+  `scripts/setup-code-server.sh` manually (use `run-pipeline rerun --from 00-setup-persistence`
+  against the pipeline YAML for fine-grained resume control).
 - **code-server returns 502** through port forward: nginx or code-server
   is not active. SSH in over SSM (`aws ssm start-session --target <id>`)
   and check `systemctl status nginx code-server@coder` and their logs.

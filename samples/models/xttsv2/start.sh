@@ -14,7 +14,11 @@
 set -euo pipefail
 
 PORT="${PORT:-8770}"
-HOST="${HOST:-127.0.0.1}"
+# Publish on 0.0.0.0 so the ALB health check (which hits the instance's
+# private IP, not loopback) can reach the container. Other model servers
+# (qwen3-vl etc.) bind 0.0.0.0 for the same reason; 127.0.0.1 here left the
+# avatar/TTS ALB target group permanently unhealthy.
+HOST="${HOST:-0.0.0.0}"
 COMPILED_DIR="${COMPILED_MODEL_PATH:-/models/xttsv2-neuron-nxd}"
 MODEL_DIR="${XTTS_MODEL_DIR:-/models/XTTS-v2}"
 VOICES_DIR="${XTTSV2_VOICES_DIR:-/models/xttsv2-voices}"

@@ -1,12 +1,12 @@
 #!/bin/bash
 # setup-explorer-wrapper.sh
 #
-# Thin wrapper around run-tasks.sh that:
+# Wrapper that:
 #
 #   1. Encodes scripts/setup-explorer.sh as base64 and drops it on the
 #      target instance at /tmp/setup-explorer.sh via SSM Run Command.
-#   2. Invokes run-tasks.sh with tasks/explorer-setup.json so the
-#      systemd unit + nginx fragment land idempotently.
+#   2. Invokes the YAML pipeline runner with pipelines/explorer-setup/
+#      so the systemd unit + nginx fragment land idempotently.
 #
 # Used by deploy.sh when --enable-explorer is set, and standalone for
 # re-runs after a Spot stop/start (no other tasks need to re-execute).
@@ -45,8 +45,8 @@ Options:
         --start-from TASK_ID            Resume from the specified task ID
         --clean-state                   Clear state file and run from start
         --dry-run                       Print plan only, do not execute
-        --use-pipeline-runner           Dispatch through tools/pipeline-runner
-                                        instead of the legacy run-tasks.sh.
+        --use-pipeline-runner           Accepted for backward compatibility; YAML
+                                        pipeline runner is always used.
     -h, --help                          Show this help
 
 Examples:
@@ -66,7 +66,7 @@ NGINX_LOCATION="/explorer"
 START_FROM=""
 CLEAN_STATE=false
 DRY_RUN=false
-USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-false}"
+USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-true}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -92,12 +92,10 @@ done
 EXPLORER_SH="$SCRIPT_DIR/setup-explorer.sh"
 REWRITER_SH="$SCRIPT_DIR/rewrite-explorer-bundle.py"
 CAPTURE_SH="$SCRIPT_DIR/capture-and-upload.sh"
-TASK_FILE="$PROJECT_DIR/tasks/explorer-setup.json"
 
 [[ -f "$EXPLORER_SH" ]] || { echo "ERROR: $EXPLORER_SH missing"; exit 2; }
 [[ -f "$REWRITER_SH" ]] || { echo "ERROR: $REWRITER_SH missing"; exit 2; }
 [[ -f "$CAPTURE_SH" ]]  || { echo "ERROR: $CAPTURE_SH missing"; exit 2; }
-[[ -f "$TASK_FILE" ]]   || { echo "ERROR: $TASK_FILE missing"; exit 2; }
 
 # Helper: upload a small file as base64 over SSM Run Command, then
 # verify the upload completed.  Returns 0 on success, exits the
@@ -188,22 +186,11 @@ export REPO_ROOT
 # shellcheck disable=SC1090
 source "$DISPATCH_HELPER"
 
-PIPELINE_NAME="$(basename "$TASK_FILE" .json)"
-NEW_YML="$PROJECT_DIR/pipelines/${PIPELINE_NAME}/${PIPELINE_NAME}.yml"
+PIPELINE_NAME="explorer-setup"
+NEW_YML="$PROJECT_DIR/pipelines/explorer-setup/explorer-setup.yml"
 
-if [[ "$USE_PIPELINE_RUNNER" == "true" ]]; then
-    if [[ -n "$START_FROM" || "$CLEAN_STATE" == "true" || "$DRY_RUN" == "true" ]]; then
-        echo "[INFO] --start-from / --clean-state / --dry-run on the new runner: invoke run-pipeline directly with rerun --from / --force-all / --dry-run against $NEW_YML for fine control."
-    fi
+if [[ -n "$START_FROM" || "$CLEAN_STATE" == "true" || "$DRY_RUN" == "true" ]]; then
+    echo "[INFO] --start-from / --clean-state / --dry-run: use 'run-pipeline rerun --from <id>' / '--force-all' / '--dry-run' against $NEW_YML for fine control."
 fi
 
-if [[ "$DRY_RUN" == "true" && "$USE_PIPELINE_RUNNER" != "true" ]]; then
-    bash "$SCRIPT_DIR/run-tasks.sh" -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON" --dry-run
-elif [[ "$USE_PIPELINE_RUNNER" != "true" && (-n "$START_FROM" || "$CLEAN_STATE" == "true") ]]; then
-    RUN_TASKS_ARGS=( -i "$INSTANCE_ID" -r "$REGION" -f "$TASK_FILE" -v "$VARIABLES_JSON" )
-    [[ -n "$START_FROM" ]] && RUN_TASKS_ARGS+=(--start-from "$START_FROM")
-    [[ "$CLEAN_STATE" == "true" ]] && RUN_TASKS_ARGS+=(--clean-state)
-    bash "$SCRIPT_DIR/run-tasks.sh" "${RUN_TASKS_ARGS[@]}"
-else
-    pipeline_dispatch "$INSTANCE_ID" "$REGION" "$TASK_FILE" "$NEW_YML" "$VARIABLES_JSON" "$PIPELINE_NAME"
-fi
+pipeline_dispatch "$INSTANCE_ID" "$REGION" "" "$NEW_YML" "$VARIABLES_JSON" "$PIPELINE_NAME"
