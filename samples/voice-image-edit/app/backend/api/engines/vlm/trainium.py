@@ -35,6 +35,7 @@ from engines.vlm._prompts import (
 from engines._common import (
     build_metadata,
     decode_image_b64,
+    downscale_image_for_vlm,
     env_float,
     env_required,
     guess_image_mime,
@@ -78,9 +79,15 @@ class TrainiumVlmEngine(VlmEngine):
         if req.mode in ("translate", "instruction"):
             user_content: Any = req.prompt
         else:
-            image_bytes = decode_image_b64(req.image_b64)
+            # review: downscale the AFTER image so its patch count stays under
+            # the Neuron vision bucket (>16384 patches kills the EngineCore).
+            # Re-encode the (possibly) resized bytes; do not reuse the original
+            # req.image_b64, which may be the oversized source.
+            import base64 as _b64
+
+            image_bytes = downscale_image_for_vlm(decode_image_b64(req.image_b64))
             mime = guess_image_mime(image_bytes)
-            data_uri = f"data:{mime};base64,{req.image_b64}"
+            data_uri = f"data:{mime};base64,{_b64.b64encode(image_bytes).decode('ascii')}"
             user_content = [
                 {"type": "image_url", "image_url": {"url": data_uri}},
                 {"type": "text", "text": req.prompt},

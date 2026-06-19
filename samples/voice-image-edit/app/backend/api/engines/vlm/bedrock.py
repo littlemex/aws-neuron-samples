@@ -36,6 +36,7 @@ from engines.vlm._prompts import (
 from engines._common import (
     build_metadata,
     decode_image_b64,
+    downscale_image_for_vlm,
     env_required,
     guess_image_format,
 )
@@ -80,7 +81,10 @@ class BedrockVlmEngine(VlmEngine):
             user_content: list[dict[str, Any]] = [{"text": req.prompt}]
             image_format: Optional[str] = None
         else:
-            image_bytes = decode_image_b64(req.image_b64)
+            # review: downscale the AFTER image to a safe size before sending.
+            # (Bedrock has its own dimension limits, and keeping the cap shared
+            # with the Trainium path means the demo behaves the same on both.)
+            image_bytes = downscale_image_for_vlm(decode_image_b64(req.image_b64))
             image_format = guess_image_format(image_bytes)
             user_content = [
                 {

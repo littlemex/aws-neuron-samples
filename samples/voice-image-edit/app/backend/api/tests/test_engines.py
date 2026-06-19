@@ -458,6 +458,22 @@ class TestBedrockVlm:
         sys_text = client.last_kwargs["system"][0]["text"]
         assert "レビュー" in sys_text
 
+    def test_review_downscales_oversized_image(self, monkeypatch):
+        # A large AFTER image must be downscaled before it reaches the model.
+        # On the Neuron VLM an oversized image overruns the vision patch bucket
+        # and crashes the EngineCore; here we assert the image actually sent is
+        # <= the safe long-side bound.
+        client = _FakeBedrockClient(
+            response={"output": {"message": {"content": [{"text": "ok"}]}}}
+        )
+        engine = _make_bedrock_vlm(monkeypatch, client)
+        engine.invoke(
+            VlmRequest(image_b64=_png_b64((3500, 3500)), prompt="確認", mode="review")
+        )
+        sent = client.last_kwargs["messages"][0]["content"][0]["image"]["source"]["bytes"]
+        w, h = Image.open(io.BytesIO(sent)).size
+        assert max(w, h) <= 1568
+
     def test_invalid_image_b64(self, monkeypatch):
         engine = _make_bedrock_vlm(monkeypatch, _FakeBedrockClient())
         # Only review decodes the image, so the invalid-base64 guard fires for
