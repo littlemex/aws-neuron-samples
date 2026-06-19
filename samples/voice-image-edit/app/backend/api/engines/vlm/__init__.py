@@ -16,10 +16,15 @@ from engines.vlm.bedrock import BedrockVlmEngine
 from engines.vlm.trainium import TrainiumVlmEngine
 
 
-def _bedrock_claude_sonnet() -> VlmEngine:
+def _bedrock_claude_opus() -> VlmEngine:
+    # Claude Opus 4.x is served only via a cross-region inference profile
+    # (us.anthropic.claude-opus-4-5-...), so the model id here is a profile id,
+    # not a bare foundation-model id, and the instance role must allow the
+    # bedrock inference-profile ARNs (see ApiInstanceRolePolicy). Replaces the
+    # retired claude-3-5-sonnet which reached end-of-life on Bedrock.
     return BedrockVlmEngine(
-        model_id=env_required("BEDROCK_CLAUDE_SONNET_MODEL_ID"),
-        engine_name="bedrock_claude_sonnet",
+        model_id=env_required("BEDROCK_CLAUDE_OPUS_MODEL_ID"),
+        engine_name="bedrock_claude_opus",
     )
 
 
@@ -38,7 +43,7 @@ def _bedrock_nova_lite() -> VlmEngine:
 
 
 ENGINES: dict[str, Callable[[], VlmEngine]] = {
-    "bedrock_claude_sonnet": _bedrock_claude_sonnet,
+    "bedrock_claude_opus": _bedrock_claude_opus,
     "bedrock_nova_pro": _bedrock_nova_pro,
     "bedrock_nova_lite": _bedrock_nova_lite,
     "trainium": TrainiumVlmEngine,

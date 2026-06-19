@@ -149,7 +149,7 @@ class TestRegistry:
 
     def test_vlm_engines_have_multiple_bedrock(self):
         names = registry.list_engines("vlm")
-        assert "bedrock_claude_sonnet" in names
+        assert "bedrock_claude_opus" in names
         assert "bedrock_nova_pro" in names
         assert "bedrock_nova_lite" in names
         assert "trainium" in names
@@ -404,7 +404,7 @@ class _FakeBedrockClient:
 
 def _make_bedrock_vlm(monkeypatch, client):
     monkeypatch.setenv("BEDROCK_REGION", "us-east-1")
-    monkeypatch.setenv("BEDROCK_VLM_MODEL_ID", "anthropic.claude-3-5-sonnet-20241022-v2:0")
+    monkeypatch.setenv("BEDROCK_VLM_MODEL_ID", "us.anthropic.claude-opus-4-5-20251101-v1:0")
     from engines.vlm.bedrock import BedrockVlmEngine
 
     engine = BedrockVlmEngine()
@@ -435,7 +435,7 @@ class TestBedrockVlm:
         )
         assert out.text == "Replace the dress with red."
         assert client.last_kwargs is not None
-        assert client.last_kwargs["modelId"].startswith("anthropic.claude")
+        assert client.last_kwargs["modelId"].startswith("us.anthropic.claude")
         assert client.last_kwargs["system"][0]["text"]
         msg = client.last_kwargs["messages"][0]
         assert msg["role"] == "user"
