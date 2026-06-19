@@ -768,8 +768,49 @@ def compile_transformer_v3_cfg(args):
             "txt_rotary_emb": txt_rotary_emb,
         }, os.path.join(output_path, "rope_cache.pt"))
 
+        # ------------------------------------------------------------------
+        # Completion stamp — WRITTEN LAST, ON PURPOSE.
+        #
+        # This file is the single source of truth for "this artifact dir holds
+        # a complete, self-consistent compile". Everything above (nxd_model.pt,
+        # the tp_degree weight shards, config.json, rope_cache.pt) is written
+        # first; only if all of it succeeds do we stamp the directory. A
+        # compile that is killed midway (Spot reclaim, operator Ctrl-C, EFS
+        # EPERM, OOM) therefore leaves NO stamp, and the serve-time / skip-time
+        # consistency gate refuses to use the half-written set instead of
+        # crash-looping deep inside to_neuron() with an opaque rank mismatch.
+        #
+        # We deliberately do NOT try to read the rank count back out of
+        # nxd_model.pt: the SPMD graph is a TorchScript archive whose
+        # __torch__.torch.classes.neuron.SPMDModel type is unregistered off
+        # the Neuron runtime, so torch.jit.load() fails on a plain CPU box.
+        # Instead we record the authoritative world_size/tp_degree HERE, in the
+        # same process that traced+compiled the graph, so a downstream gate can
+        # assert stamp.world_size == config.world_size and shard_count ==
+        # tp_degree. Combined with the per-VERSION_MODE compile-cache scoping in
+        # compile.sh (which makes a cross-layout stale-cache hit structurally
+        # impossible), the stamp closes the remaining "interrupted / partial"
+        # drift mode.
+        stamp = {
+            "schema": 1,
+            "component": "transformer_v3_cfg",
+            "world_size": world_size,
+            "tp_degree": tp_degree,
+            "dp_degree": dp_degree,
+            "shard_count": tp_degree,  # CFG duplicates TP shards to world_size at load time
+            "cfg_parallel": cfg_parallel_enabled,
+            "compile_mode": os.environ.get("VERSION_MODE", "unknown"),
+        }
+        stamp_tmp = os.path.join(output_path, ".compile_stamp.tmp")
+        with open(stamp_tmp, "w") as f:
+            json.dump(stamp, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(stamp_tmp, os.path.join(output_path, ".compile_stamp"))
+
         print("\nCompilation complete!")
         print(f"Model saved to: {output_path}")
+        print(f"Completion stamp: world_size={world_size}, tp_degree={tp_degree}, shards={tp_degree}")
 
 
 if __name__ == "__main__":

@@ -374,15 +374,54 @@ bash scripts/deploy.sh --use-spot --spot-interruption-behavior stop
 
 ## Disaster recovery
 
-`scripts/recover.sh` is a single-command recovery tool for when an
-instance is stopped, replaced, or otherwise disconnected from its SSM
-tunnel. It re-reads the CloudFormation stack outputs, starts the instance
-if it is stopped, re-authorizes the EFS NFS rule if it is missing, and
-runs the idempotent setup tasks again.
+`deploy.sh --recover` is the single command to heal a stack back to a
+healthy, reachable state after any AWS-side disruption — Spot
+interruption, Capacity Block expiry, a stopped or terminated instance, a
+mitigation policy that swapped the security group, or a detached EIP. It
+folds the responsibilities of the older `scripts/recover.sh` into
+`deploy.sh` so one entrypoint covers every failure mode:
 
 ```bash
-AWS_REGION=us-west-2 bash scripts/recover.sh --stack-name neuron-ws
+# Heal whatever is wrong, in place, reproducing the last-deployed shape:
+AWS_REGION=us-east-2 bash scripts/deploy.sh --recover --stack-name neuron-ws
 ```
+
+`--recover` is designed to be a true one-shot — you should not need to
+re-type the instance type or purchase mode. It heals, in order:
+
+- **stopped instance** → start (with Spot retry)
+- **security group replaced by AWS** → re-attach the CDK security group
+- **EIP missing** → allocate or reuse a free one (add `--reallocate-eip`
+  to roll the public IP)
+- **terminated or fully deregistered instance** → reproduce it via CDK.
+  The shape (instance type + purchase mode) is read back from the live
+  **LaunchTemplate**, so a bare `--recover` rebuilds, say, a
+  `trn2.48xlarge` / Capacity Block box as the same shape rather than
+  falling back to the on-demand `trn2.3xlarge` defaults. Pass `-t` /
+  `--use-spot` / `--use-capacity-block` only when you want to *change*
+  the shape during recovery.
+- **expired Capacity Block reservation** → when the reservation recorded
+  in SSM Parameter Store has ended, `--recover` scans every
+  `/capacity-block/<region>/slots/<name>/` entry, picks an `active`
+  reservation that matches the instance type (preferring the one with the
+  most runway), and uses it automatically. If none is active it aborts
+  *before* `cdk deploy` with a clear message instead of failing deep in
+  CloudFormation. Register fresh reservations with
+  `manage-capacity-block.sh save-params --slot <name>`.
+- **filesystem persistence** → re-run `setup-persistence.sh` (rebuilds the
+  NVMe RAID0, EFS mount, and the `/work` / `/home/coder` symlinks) and the
+  idempotent 20-task code-server setup. The model-cache layer (`/models`
+  and the compiled-artifact symlinks) is owned by the voice-image-edit
+  `setup-efs-paths` step, restored by the `deploy-all.sh --recover` below.
+
+After the base box is healthy, bring the demo workloads back with the
+matching one-shot in `samples/voice-image-edit/scripts/deploy-all.sh
+--recover` (model servers + app + anatomy; it reuses the compiled
+artifacts cached on EFS, so it is minutes rather than the multi-hour cold
+compile).
+
+> `scripts/recover.sh` is retained for backward compatibility but
+> `deploy.sh --recover` is the maintained path and supersedes it.
 
 ## Using a non-GA or private AMI
 
