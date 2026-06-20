@@ -47,8 +47,11 @@ if [[ -z "$ALB_SG" || -z "$EC2_SG" ]]; then
   exit 2
 fi
 if [[ -z "${AWS_PROFILE:-}" ]]; then
-  echo "[ERROR] AWS_PROFILE not set (claude-code を推奨)" >&2
-  exit 2
+  # Not fatal: when invoked from a deploy host the credentials may come from
+  # a default profile or an instance role rather than $AWS_PROFILE. Warn and
+  # proceed with whatever the aws CLI resolves. (When set, it is honored via
+  # PROFILE_ARG below.)
+  echo "[WARN] AWS_PROFILE not set; using default credential resolution" >&2
 fi
 
 AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
