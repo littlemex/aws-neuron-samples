@@ -2948,8 +2948,24 @@ fi
 # stacks orphaned against the old ALB (deploy-all aborts otherwise). Gated
 # on the frontend having been created (i.e. a real app deploy, not a bare
 # code-server stack) and on $SKIP_SETUP. Idempotent: safe to re-run.
-if [[ "$DESTROY" != true ]] && [[ "$RECOVER" != true ]] && \
-   [[ "$CREATE_CLOUDFRONT_FRONTEND" == true ]] && [[ "$SKIP_SETUP" != true ]]; then
+# Two cases reach this block: (a) a fresh `--full` deploy
+# (CREATE_CLOUDFRONT_FRONTEND=true); (b) a `--recover` against a TERMINATED
+# instance, which sets FORCE_RECREATE=true and falls through the recover
+# fast-path into this normal deploy path. A bare recover that healed in the
+# fast path already ran its own deploy-all chain and exited before here, so
+# any RECOVER=true reaching this line is the fall-through case that genuinely
+# needs the model/app layer rebuilt; detect it by the frontend stack existing.
+_run_app_chain=false
+if [[ "$DESTROY" != true ]] && [[ "$SKIP_SETUP" != true ]]; then
+    if [[ "$CREATE_CLOUDFRONT_FRONTEND" == true ]]; then
+        _run_app_chain=true
+    elif [[ "$RECOVER" == true ]] && \
+         aws cloudformation describe-stacks --stack-name "${STACK_NAME}-frontend" \
+             --region "$REGION" >/dev/null 2>&1; then
+        _run_app_chain=true
+    fi
+fi
+if [[ "$_run_app_chain" == true ]]; then
     VIE_DEPLOY="$SCRIPT_DIR/../../../samples/voice-image-edit/scripts/deploy-all.sh"
     if [[ -x "$VIE_DEPLOY" ]]; then
         echo ""
