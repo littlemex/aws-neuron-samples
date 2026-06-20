@@ -954,11 +954,29 @@ if [[ "$DESTROY" == true ]]; then
     fi
 
     # Tear-down order (reverse of deploy, post-ADR-011):
+    #   E. VoiceImageEdit{Api,Frontend,Stream}Stack - the app layer (separate
+    #      CDK app under app/infra). These import the base ALB; if left behind
+    #      they orphan against a rebuilt ALB and block the next deploy-all.
     #   D. CloudFrontFrontendStack  - owns the ALB SG inbound + UserPoolClient
     #   B. AlbBackendStack          - hosts the OAuth Lambda which references
     #                                 Cognito UserPool, so MUST go before Cognito
     #   C. CognitoOperatorStack     - UserPool can only go after the Lambda
     #   A. NeuronCodeServerStack    - last, plus EFS / EFS-MT cleanup
+
+    # E. Destroy the voice-image-edit app stacks first (best-effort). Their
+    # own deploy.sh --destroy knows the correct teardown order for the three
+    # ApiStack/FrontendStack/StreamStack. Without this they survive a base
+    # destroy and orphan against the next ALB.
+    VIE_APP_INFRA="$SCRIPT_DIR/../../../samples/voice-image-edit/app/infra/deploy.sh"
+    if [[ -x "$VIE_APP_INFRA" ]] && \
+       aws cloudformation describe-stacks --stack-name VoiceImageEditApiStack \
+           --region "$REGION" >/dev/null 2>&1; then
+        echo -e "${BLUE}[DESTROY] voice-image-edit app stacks (Api/Frontend/Stream) -> remove first${NC}"
+        AWS_PROFILE="${AWS_PROFILE:-}" bash "$VIE_APP_INFRA" --destroy \
+            --base-stack-name "$STACK_NAME" --region "$REGION" || \
+            echo -e "${YELLOW}[WARN] app-stack destroy returned non-zero; continuing${NC}"
+    fi
+
     FRONTEND_STACK_NAME="${STACK_NAME}-frontend"
     if aws cloudformation describe-stacks --stack-name "$FRONTEND_STACK_NAME" \
         --region "$REGION" >/dev/null 2>&1; then
@@ -2916,6 +2934,39 @@ if [[ "$CREATE_CLOUDFRONT_FRONTEND" == true ]]; then
         echo "    URL:   https://${CF_DOMAIN}/"
         echo "    Email: $OPERATOR_EMAIL"
         echo "    (password = SecretString of $OPERATOR_PASSWORD_SECRET_ARN)"
+    fi
+fi
+
+# ----------------------------------------------------------------------
+# Fresh-deploy app/model layer chain (mirrors the recover-path chain).
+# ----------------------------------------------------------------------
+# A `--full` fresh deploy creates the CDK stack family + code-server, but
+# historically stopped there: the operator then had to run deploy-all.sh
+# (model servers + neuron-anatomy) and app/infra/deploy.sh by hand. Chain
+# them here so `--full` is a true one-shot. We pass --reset-app-stacks so a
+# rebuilt base ALB does not leave the VoiceImageEdit{Api,Frontend,Stream}
+# stacks orphaned against the old ALB (deploy-all aborts otherwise). Gated
+# on the frontend having been created (i.e. a real app deploy, not a bare
+# code-server stack) and on $SKIP_SETUP. Idempotent: safe to re-run.
+if [[ "$DESTROY" != true ]] && [[ "$RECOVER" != true ]] && \
+   [[ "$CREATE_CLOUDFRONT_FRONTEND" == true ]] && [[ "$SKIP_SETUP" != true ]]; then
+    VIE_DEPLOY="$SCRIPT_DIR/../../../samples/voice-image-edit/scripts/deploy-all.sh"
+    if [[ -x "$VIE_DEPLOY" ]]; then
+        echo ""
+        echo -e "${BLUE}[FULL] Running deploy-all.sh (model servers + app + neuron-anatomy)${NC}"
+        VIE_ARGS=(
+            --base-stack-name "$STACK_NAME"
+            --region "$REGION"
+            --recover
+            --reset-app-stacks
+        )
+        bash "$VIE_DEPLOY" "${VIE_ARGS[@]}" || {
+            echo -e "${YELLOW}[WARN] deploy-all.sh failed — model/app layer may not be fully running.${NC}"
+            echo -e "${YELLOW}       Re-run manually: bash $VIE_DEPLOY ${VIE_ARGS[*]}${NC}"
+        }
+    else
+        echo -e "${YELLOW}[WARN] deploy-all.sh not found at $VIE_DEPLOY — model servers not started${NC}"
+        echo -e "${YELLOW}       Run manually: bash $VIE_DEPLOY --base-stack-name $STACK_NAME --region $REGION --recover --reset-app-stacks${NC}"
     fi
 fi
 

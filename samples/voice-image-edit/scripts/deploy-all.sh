@@ -28,6 +28,8 @@
 #   --only <names>      run only the listed steps (debug)
 #   --migrate           include migrate-to-efs before setup-efs-paths (first-time EFS migration)
 #   --recover           recovery mode after CB/Spot termination (= --skip migrate-to-efs, default)
+#   --reset-app-stacks  forwarded to app/infra/deploy.sh: destroy VoiceImageEdit*
+#                       stacks orphaned against a rebuilt base ALB before deploy
 #   --dry-run           print each step without sending SSM commands
 #   --use-pipeline-runner  accepted for backward compatibility; YAML pipeline runner is always used
 #
@@ -71,6 +73,9 @@ SKIP_STEPS=""
 ONLY_STEPS=""
 MIGRATE=false
 DRY_RUN=false
+# Forwarded to app/infra/deploy.sh so a rebuilt base ALB does not leave the
+# VoiceImageEdit{Api,Frontend,Stream} stacks orphaned against the old ALB.
+RESET_APP_STACKS=false
 # Accepted for backward compatibility; YAML pipeline runner is always used.
 USE_PIPELINE_RUNNER="${USE_PIPELINE_RUNNER:-true}"
 
@@ -106,6 +111,7 @@ while [[ $# -gt 0 ]]; do
     --only)            ONLY_STEPS="$2"; shift 2 ;;
     --migrate)         MIGRATE=true; shift ;;
     --recover)         MIGRATE=false; shift ;;
+    --reset-app-stacks) RESET_APP_STACKS=true; shift ;;
     --dry-run)         DRY_RUN=true; shift ;;
     --use-pipeline-runner) shift ;;  # no-op: YAML runner is always used
     -h|--help)
@@ -427,13 +433,16 @@ step_voice_image_edit_app() {
     log "[dry] cd $APP_INFRA_DIR && bash deploy.sh --base-stack-name $BASE_STACK_NAME --region $REGION --trainium-asr-url $asr_url --trainium-vlm-url $vlm_url --trainium-edit-url $edit_url --trainium-tts-url $tts_url"
     return 0
   fi
+  local reset_args=()
+  [[ "$RESET_APP_STACKS" == true ]] && reset_args+=(--reset-app-stacks)
   ( cd "$APP_INFRA_DIR" && bash deploy.sh \
     --base-stack-name "$BASE_STACK_NAME" \
     --region "$REGION" \
     --trainium-asr-url "$asr_url" \
     --trainium-vlm-url "$vlm_url" \
     --trainium-edit-url "$edit_url" \
-    --trainium-tts-url "$tts_url" )
+    --trainium-tts-url "$tts_url" \
+    "${reset_args[@]}" )
 }
 
 # --- step: neuron-anatomy (sibling stack, must follow EC2 recover) ---
