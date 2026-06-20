@@ -1044,6 +1044,30 @@ deploy_stream_service() {
 
     run_task "$EC2_INSTANCE_ID" "$INFRA_DIR/tasks/voice-image-edit-stream.json" "$vars_json" "voice-image-edit-stream"
     echo -e "${GREEN}[DONE] voice-image-edit-stream.service is running on ${EC2_INSTANCE_ID}:${STREAM_PORT}${NC}"
+
+    # --------------------------------------------------------------
+    # EC2 -> ALB :80 ingress for the stream backend's edit-API calls.
+    # --------------------------------------------------------------
+    # The stream backend drives the edit pipeline (ASR -> vlm_instruction
+    # -> edit -> vlm_review) by calling EDIT_API_BASE_URL, which is the
+    # INTERNAL ALB DNS. The ALB SG only allows :80 from the CloudFront
+    # origin-facing prefix list, so the EC2 -> ALB hop is blocked by
+    # default and vlm_instruction hangs until timeout ("指示生成 stalls").
+    # This rule was previously applied by hand via alb-sg-stream-ingress.sh
+    # and was lost on every instance/ALB replacement. Apply it here so a
+    # fresh deploy or a --recover restores it automatically. Idempotent:
+    # the helper is a no-op when the rule already exists.
+    local _sg_helper="$INFRA_DIR/scripts/alb-sg-stream-ingress.sh"
+    if [[ -x "$_sg_helper" ]] && [[ -n "$ALB_SG_ID" && "$ALB_SG_ID" != "None" ]] && \
+       [[ -n "$EC2_INSTANCE_SG_ID" && "$EC2_INSTANCE_SG_ID" != "None" ]]; then
+        echo -e "${BLUE}[STREAM-SG] Ensuring EC2 SG -> ALB SG :80 ingress (stream -> edit API)${NC}"
+        AWS_REGION="$REGION" AWS_DEFAULT_REGION="$REGION" \
+            bash "$_sg_helper" apply "$ALB_SG_ID" "$EC2_INSTANCE_SG_ID" || \
+            echo -e "${YELLOW}[WARN] stream->ALB ingress apply failed; the edit pipeline (指示生成) may stall.${NC}"
+    else
+        echo -e "${YELLOW}[WARN] Cannot ensure stream->ALB ingress (helper or SG ids missing).${NC}"
+        echo -e "${YELLOW}       Run: bash $_sg_helper apply <alb-sg> <ec2-sg>${NC}"
+    fi
 }
 
 echo
