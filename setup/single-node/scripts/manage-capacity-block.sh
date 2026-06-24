@@ -498,18 +498,24 @@ case "$COMMAND" in
         echo -e "${BLUE}=========================================${NC}"
         echo ""
 
-        # Check for existing parameters in this slot
+        # Check for existing parameters in this slot.
+        # `|| true`: when the slot does not exist yet (the common case for a
+        # fresh reservation) get-parameter exits non-zero with
+        # ParameterNotFound. `2>/dev/null` only hides stderr; the non-zero
+        # status still propagates and, under `set -e`, would abort save-params
+        # before it could write anything — making it impossible to register a
+        # brand new slot. Treat "not found" as an empty value instead.
         EXISTING_RESERVATION=$(aws ssm get-parameter \
             --name "$SAVE_RES_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
-            --output text 2>/dev/null)
+            --output text 2>/dev/null || true)
 
         EXISTING_SUBNET=$(aws ssm get-parameter \
             --name "$SAVE_SUB_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
-            --output text 2>/dev/null)
+            --output text 2>/dev/null || true)
 
         if [[ -n "$EXISTING_RESERVATION" ]] || [[ -n "$EXISTING_SUBNET" ]]; then
             echo -e "${YELLOW}⚠️  Existing parameters found in slot '$SLOT':${NC}"
@@ -570,18 +576,22 @@ case "$COMMAND" in
         echo -e "${BLUE}=========================================${NC}"
         echo ""
 
-        # Load parameters
+        # Load parameters.
+        # `|| true`: an unregistered slot makes get-parameter exit non-zero
+        # (ParameterNotFound). Without this, `set -e` would abort before the
+        # empty-value check below could print the friendly "slot not found"
+        # guidance. Treat "not found" as empty and let line ~592 handle it.
         LOADED_RESERVATION=$(aws ssm get-parameter \
             --name "$LOAD_RES_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
-            --output text 2>/dev/null)
+            --output text 2>/dev/null || true)
 
         LOADED_SUBNET=$(aws ssm get-parameter \
             --name "$LOAD_SUB_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
-            --output text 2>/dev/null)
+            --output text 2>/dev/null || true)
 
         if [[ -z "$LOADED_RESERVATION" ]] && [[ -z "$LOADED_SUBNET" ]]; then
             echo -e "${RED}❌ No parameters found in Parameter Store${NC}"
