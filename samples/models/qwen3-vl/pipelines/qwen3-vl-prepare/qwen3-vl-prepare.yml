@@ -44,6 +44,10 @@ tasks:
     fingerprint_inputs:
       - "{{WARMUP_MARKER}}"
       - "{{FORCE_REWARMUP}}"
+    # Probes EFS for the warmup marker + compile cache every run. Must not be
+    # served from the fingerprint cache, or a stale "not warmed" verdict would
+    # force a re-warmup even after the cached artifacts reappear on a new host.
+    always_run: true
 
   - id: 30-warmup
     needs: [20-skip-if-warmed]
