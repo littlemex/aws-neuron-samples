@@ -435,6 +435,10 @@ step_voice_image_edit_app() {
   fi
   local reset_args=()
   [[ "$RESET_APP_STACKS" == true ]] && reset_args+=(--reset-app-stacks)
+  # ${reset_args[@]+"${reset_args[@]}"} (not a bare "${reset_args[@]}") so an
+  # empty array expands to nothing under `set -u`. macOS /bin/bash is 3.2,
+  # where a bare expansion of an empty array aborts with "unbound variable" —
+  # the common path here (RESET_APP_STACKS != true) leaves reset_args empty.
   ( cd "$APP_INFRA_DIR" && bash deploy.sh \
     --base-stack-name "$BASE_STACK_NAME" \
     --region "$REGION" \
@@ -442,7 +446,7 @@ step_voice_image_edit_app() {
     --trainium-vlm-url "$vlm_url" \
     --trainium-edit-url "$edit_url" \
     --trainium-tts-url "$tts_url" \
-    "${reset_args[@]}" )
+    ${reset_args[@]+"${reset_args[@]}"} )
 }
 
 # --- step: neuron-anatomy (sibling stack, must follow EC2 recover) ---
