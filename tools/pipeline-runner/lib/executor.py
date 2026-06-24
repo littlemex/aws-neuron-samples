@@ -196,6 +196,11 @@ class Executor:
     def _can_skip(self, task: Task, force_ids: set[str]) -> bool:
         if task.id in force_ids or self.opts.force_all:
             return False
+        # always_run tasks probe external state the fingerprint deliberately
+        # ignores (e.g. presence of compiled artifacts on EFS), so they must
+        # never be served from the fingerprint cache.
+        if task.always_run:
+            return False
         prev = (self._state.get("tasks") or {}).get(task.id) or {}
         if prev.get("status") != "success":
             return False

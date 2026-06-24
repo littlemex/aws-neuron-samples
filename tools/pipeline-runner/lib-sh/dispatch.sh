@@ -70,10 +70,15 @@ _pipeline_dispatch_new() {
     local cwd_anchor="${REPO_ROOT:-$PWD}"
     (
         cd "$cwd_anchor"
+        # `${arr[@]+"${arr[@]}"}` so an empty array expands to nothing under
+        # `set -u`. Bash 3.2 (the /bin/bash shipped on macOS) treats a bare
+        # `"${arr[@]}"` on an empty array as an unbound variable and aborts;
+        # both var_args (no -v vars) and profile_args (no AWS_PROFILE) can be
+        # empty, which broke deploy-all.sh on macOS at the first pipeline step.
         "$_PIPELINE_RUNNER_BIN" run "$new_yml" \
             --instance "$instance_id" \
             --region "$region" \
-            "${profile_args[@]}" \
-            "${var_args[@]}"
+            ${profile_args[@]+"${profile_args[@]}"} \
+            ${var_args[@]+"${var_args[@]}"}
     )
 }

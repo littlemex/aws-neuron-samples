@@ -148,3 +148,46 @@ def test_changing_unrelated_env_does_not_invalidate(cwd_in: Path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert out.count("[SKIP ]") == 3
+
+
+def _write_always_run_pipeline(tmp_path: Path) -> Path:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "probe.sh").write_text("#!/usr/bin/env bash\necho probe\n")
+    (scripts / "work.sh").write_text("#!/usr/bin/env bash\necho work\n")
+
+    yml = tmp_path / "p.yml"
+    yml.write_text(
+        textwrap.dedent(
+            """
+            name: always
+            defaults:
+              cloudwatch_logs: false
+            tasks:
+              - id: probe
+                script: scripts/probe.sh
+                always_run: true
+              - id: work
+                script: scripts/work.sh
+                needs: [probe]
+            """
+        ).strip()
+    )
+    return yml
+
+
+def test_always_run_task_is_never_cached(cwd_in: Path, capsys):
+    """Regression guard for the recompile-loop bug: an always_run task probes
+    external state the fingerprint ignores, so it must re-run on every
+    invocation even when its script body and inputs are unchanged. Its
+    plain-cached sibling still skips."""
+    yml = _write_always_run_pipeline(cwd_in)
+    _run(yml, env={})
+    capsys.readouterr()
+
+    rc = _run(yml, env={})
+    out = capsys.readouterr().out
+    assert rc == 0
+    # probe is always_run -> re-runs; work is a normal cached task -> skips.
+    assert "[RUN  ] probe" in out
+    assert "[SKIP ] work" in out

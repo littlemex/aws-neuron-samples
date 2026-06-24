@@ -39,6 +39,14 @@ class Task:
     needs: list[str] = field(default_factory=list)
     fingerprint_inputs: list[str] = field(default_factory=list)
     cloudwatch_logs: bool = True
+    # When true the task is exempt from the fingerprint cache and runs on
+    # every invocation. Use for steps whose decision depends on external
+    # state that the fingerprint deliberately ignores (e.g. "is the compiled
+    # artifact already present on EFS?"). Without this, a step that probed
+    # external state once and was cached as success would never re-probe, so
+    # a later change in that state (artifacts appearing or vanishing) is
+    # silently missed.
+    always_run: bool = False
 
 
 @dataclass
@@ -156,6 +164,7 @@ def load(path: str | Path) -> Pipeline:
         fp_inputs = [str(x) for x in fp_inputs_raw]
 
         cw_logs = bool(raw.get("cloudwatch_logs", default_cw_logs))
+        always_run = bool(raw.get("always_run", False))
 
         tasks.append(
             Task(
@@ -167,6 +176,7 @@ def load(path: str | Path) -> Pipeline:
                 needs=needs,
                 fingerprint_inputs=fp_inputs,
                 cloudwatch_logs=cw_logs,
+                always_run=always_run,
             )
         )
 

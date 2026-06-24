@@ -40,6 +40,11 @@ tasks:
     needs: [00-precheck]
     timeout: 30s
     script: scripts/10-skip-if-cached.sh
+    # Probes EFS for the compiled artifacts every run and (re)creates the
+    # .precompile_skipped marker the later steps gate on. Must not be served
+    # from the fingerprint cache, or a stale "missing" verdict would pin the
+    # whole pipeline to a full recompile even after the artifacts reappear.
+    always_run: true
 
   - id: 20-fetch-source
     needs: [10-skip-if-cached]
