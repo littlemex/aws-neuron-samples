@@ -8,6 +8,12 @@ vars:
   SERVE_DIR: "/opt/voice-image-edit/whisper-nxd-server"
   SERVE_USER: "ubuntu"
   PORT: "8765"
+  # Health-check parameters (consumed by 60-health-check.sh). HEALTH_BUDGET_SECONDS
+  # is the worst-case cold-load time for this model; the health check waits up to
+  # this long for /health=200 (tolerating http=000 as "still loading") while
+  # fast-failing on a crashed/looping unit. Keep the step `timeout:` above it.
+  HEALTH_UNIT: "whisper-server-nxd.service"
+  HEALTH_BUDGET_SECONDS: "600"
   PATH_PREFIX: "/whisper-neuron"
   MODEL_DIR: "/models/whisper-large-v3-neuron-nxd"
   HF_HOME: "/models/hf-cache"
@@ -65,7 +71,11 @@ tasks:
 
   - id: 60-health-check
     needs: [50-enable-start]
-    timeout: 15m
-    retries: 2
-    retry_delay: 30s
+    # timeout (runner watchdog) must exceed HEALTH_BUDGET_SECONDS (600s) so the
+    # script's own budget is what bounds the wait, not the runner. retries kept
+    # low: the wait now lives inside one invocation, so retries only cover an
+    # SSM delivery hiccup, not model load time.
+    timeout: 12m
+    retries: 1
+    retry_delay: 15s
     script: scripts/60-health-check.sh

@@ -9,6 +9,14 @@ vars:
   SERVE_DIR: /opt/voice-image-edit/xttsv2-server
   SERVE_USER: ubuntu
   PORT: "8770"
+  # Health-check parameters (consumed by 60-health-check.sh). Budget 600s covers
+  # the ~3GB NEFF warm-up. DOCKER_NAME is set because this server runs inside a
+  # container, so the failure dump also captures `docker logs`. The check
+  # tolerates http=000 as "still loading" up to the budget while fast-failing on
+  # a crashed/looping unit. Keep the step `timeout:` above the budget.
+  HEALTH_UNIT: "xttsv2-server.service"
+  HEALTH_BUDGET_SECONDS: "600"
+  DOCKER_NAME: "xttsv2-server"
   COMPILED_MODEL_PATH: /models/xttsv2-neuron-nxd
   XTTS_MODEL_DIR: /models/XTTS-v2
   XTTSV2_VOICES_DIR: /models/xttsv2-voices
@@ -90,7 +98,12 @@ tasks:
 
   - id: 60-health-check
     needs: [50-enable-start]
-    timeout: 10m
-    retries: 120
-    retry_delay: 5s
+    # timeout (runner watchdog) must exceed HEALTH_BUDGET_SECONDS (600s) so the
+    # script's own budget bounds the wait. Previously this step did a single
+    # curl per invocation and relied on 120 runner retries (~600s) to span the
+    # warm-up; the single-invocation wait below replaces that. retries only
+    # cover an SSM delivery hiccup, not model load time.
+    timeout: 12m
+    retries: 1
+    retry_delay: 15s
     script: scripts/60-health-check.sh

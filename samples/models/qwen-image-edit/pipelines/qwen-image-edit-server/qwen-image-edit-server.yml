@@ -9,6 +9,13 @@ vars:
   SERVE_DIR: /opt/voice-image-edit/qwen-image-edit-server
   SERVE_USER: ubuntu
   PORT: "8081"
+  # Health-check parameters (consumed by 60-health-check.sh). Budget 1500s covers
+  # the 62GB compiled model load from EFS (the case that previously false-failed:
+  # http=000 throughout the multi-minute load was treated as a hard error). The
+  # check now tolerates http=000 as "still loading" up to this budget while
+  # fast-failing on a crashed/looping unit. Keep the step `timeout:` above it.
+  HEALTH_UNIT: "qwen-image-edit.service"
+  HEALTH_BUDGET_SECONDS: "1500"
   HOST: 0.0.0.0
   COMPILED_MODELS_DIR: /mnt/local/compiled_models_tp16
   HEIGHT: "1024"
@@ -67,7 +74,12 @@ tasks:
 
   - id: 60-health-check
     needs: [50-enable-start]
+    # timeout (runner watchdog) must exceed HEALTH_BUDGET_SECONDS (1500s) so the
+    # script's own budget bounds the wait. Previously this step did a single
+    # curl per invocation and relied on 150 runner retries (~25 min) to span the
+    # load; the single-invocation wait below replaces that. retries only cover
+    # an SSM delivery hiccup, not model load time.
     timeout: 30m
-    retries: 150
-    retry_delay: 10s
+    retries: 1
+    retry_delay: 15s
     script: scripts/60-health-check.sh
