@@ -1682,7 +1682,9 @@ if [[ "$RECOVER" == true ]]; then
     # *_EXPLICIT guards inside).
     if [[ "$STACK_STATUS" == CREATE_COMPLETE || "$STACK_STATUS" == UPDATE_COMPLETE \
        || "$STACK_STATUS" == UPDATE_ROLLBACK_COMPLETE || "$STACK_STATUS" == IMPORT_COMPLETE ]]; then
-        recover_seed_shape_from_launch_template "$STACK_NAME" "$REGION"
+        recover_seed_shape_from_launch_template "$STACK_NAME" "$REGION" || {
+            echo -e "${YELLOW}  [WARN] seed shape recovery from LaunchTemplate failed (continuing with CLI flags)${NC}"
+        }
     fi
 
     if [[ "$STACK_STATUS" == CREATE_COMPLETE || "$STACK_STATUS" == UPDATE_COMPLETE \
@@ -1740,9 +1742,29 @@ if [[ "$RECOVER" == true ]]; then
         # through to FORCE_RECREATE. Guard every dereference with `?` /
         # `// []` so a vanished instance degrades to STATE="unknown"
         # (handled below) instead of crashing the script.
-        INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --output json 2>/dev/null)
-        STATE=$(echo "$INSTANCE_INFO" | jq -r '.Reservations[0].Instances[0].State.Name // "unknown"' 2>/dev/null || echo "unknown")
-        CURRENT_SGS=$(echo "$INSTANCE_INFO" | jq -r '(.Reservations[0].Instances[0].SecurityGroups // [])[].GroupId // empty' 2>/dev/null | sort | tr '\n' ' ')
+        _errf=$(mktemp)
+        _rc=0
+        INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --output json 2>"$_errf") || _rc=$?
+        _ec2_err=$(cat "$_errf" 2>/dev/null)
+        rm -f "$_errf"
+        if (( _rc != 0 )); then
+            if [[ "$_ec2_err" == *"InvalidInstanceID.NotFound"* ]]; then
+                STATE="terminated"
+                echo -e "  ${YELLOW}(instance deregistered from EC2 — treating as terminated)${NC}"
+            else
+                echo -e "  ${RED}[NG] describe-instances failed (rc=$_rc):${NC}" >&2
+                [[ -n "$_ec2_err" ]] && echo "       $_ec2_err" >&2
+                echo -e "  ${RED}     Cannot determine instance state — aborting to avoid accidental recreate${NC}" >&2
+                exit 1
+            fi
+        else
+            STATE=$(echo "$INSTANCE_INFO" | jq -r '.Reservations[0].Instances[0].State.Name // "unknown"' 2>/dev/null || echo "unknown")
+            [[ -z "$STATE" ]] && STATE="unknown"
+        fi
+        CURRENT_SGS=""
+        if [[ -n "$INSTANCE_INFO" && "$STATE" != "terminated" ]]; then
+            CURRENT_SGS=$(echo "$INSTANCE_INFO" | jq -r '(.Reservations[0].Instances[0].SecurityGroups // [])[].GroupId // empty' 2>/dev/null | sort | tr '\n' ' ' || true)
+        fi
 
         echo "  State:        ${STATE:-unknown}"
         echo "  Current SG:   ${CURRENT_SGS:-(none)}"
@@ -1760,8 +1782,15 @@ if [[ "$RECOVER" == true ]]; then
             echo "  State (resolved): $STATE"
         fi
 
+        # Step: unknown state -> abort (API succeeded but returned unexpected data).
+        if [[ "$STATE" == "unknown" ]]; then
+            echo -e "${RED}[NG] describe-instances succeeded but State is unparseable — aborting${NC}" >&2
+            echo "       Raw INSTANCE_INFO (first 200 chars): ${INSTANCE_INFO:0:200}" >&2
+            exit 1
+        fi
+
         # Step: terminated instance -> rerun cdk deploy to replace.
-        if [[ "$STATE" == "terminated" ]] || [[ "$STATE" == "shutting-down" ]] || [[ "$STATE" == "unknown" ]]; then
+        if [[ "$STATE" == "terminated" ]] || [[ "$STATE" == "shutting-down" ]]; then
             echo -e "${YELLOW}[RECOVER] Instance is $STATE — falling through to cdk deploy to replace${NC}"
             FORCE_RECREATE=true
             # The rest of deploy.sh will run cdk deploy with current flags.
@@ -1795,19 +1824,24 @@ if [[ "$RECOVER" == true ]]; then
                 for i in 1 2 3 4 5 6 7 8 9 10; do
                     sleep 10
                     S=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
-                        --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null)
+                        --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || echo "unknown")
                     echo "    wait $i: state=$S"
                     [[ "$S" == "running" ]] && break
                 done
             fi
 
             # Step: SG drift -> re-attach the CDK SG.
-            if [[ -n "$CDK_SG_ID" ]] && [[ "$CDK_SG_ID" != "None" ]] && \
-               [[ "$CURRENT_SGS" != *"$CDK_SG_ID"* ]]; then
+            if [[ -z "$CURRENT_SGS" ]]; then
+                echo -e "    ${YELLOW}[WARN] Could not determine current SGs — skipping SG drift check${NC}"
+            elif [[ -n "$CDK_SG_ID" ]] && [[ "$CDK_SG_ID" != "None" ]] && \
+               [[ " $CURRENT_SGS " != *" $CDK_SG_ID "* ]]; then
                 echo -e "${YELLOW}[RECOVER] SG drifted (mitigation policy?) — re-attaching $CDK_SG_ID${NC}"
-                aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --region "$REGION" \
-                    --groups "$CDK_SG_ID"
-                echo "    [OK] SG re-attached"
+                if aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" --region "$REGION" \
+                    --groups "$CDK_SG_ID" 2>/dev/null; then
+                    echo "    [OK] SG re-attached"
+                else
+                    echo -e "    ${YELLOW}[WARN] SG drift fix failed (continuing)${NC}"
+                fi
             fi
 
             # Step: EIP allocate / reuse / reallocate.
@@ -1818,18 +1852,19 @@ if [[ "$RECOVER" == true ]]; then
                 echo -e "${BLUE}[RECOVER] Releasing existing EIP ($ASSOCIATED_EIP)${NC}"
                 OLD_ALLOC=$(aws ec2 describe-addresses --region "$REGION" \
                     --filters "Name=instance-id,Values=$INSTANCE_ID" \
-                    --query 'Addresses[0].AllocationId' --output text)
+                    --query 'Addresses[0].AllocationId' --output text 2>/dev/null || true)
                 OLD_ASSOC=$(aws ec2 describe-addresses --region "$REGION" \
                     --filters "Name=instance-id,Values=$INSTANCE_ID" \
-                    --query 'Addresses[0].AssociationId' --output text)
-                [[ "$OLD_ASSOC" != "None" ]] && \
-                    aws ec2 disassociate-address --region "$REGION" --association-id "$OLD_ASSOC" >/dev/null
-                aws ec2 release-address --region "$REGION" --allocation-id "$OLD_ALLOC" >/dev/null
+                    --query 'Addresses[0].AssociationId' --output text 2>/dev/null || true)
+                [[ -n "$OLD_ASSOC" && "$OLD_ASSOC" != "None" ]] && \
+                    aws ec2 disassociate-address --region "$REGION" --association-id "$OLD_ASSOC" >/dev/null 2>&1 || true
+                [[ -n "$OLD_ALLOC" && "$OLD_ALLOC" != "None" ]] && \
+                    aws ec2 release-address --region "$REGION" --allocation-id "$OLD_ALLOC" >/dev/null 2>&1 || true
                 ASSOCIATED_EIP="None"
             fi
             if [[ "$ASSOCIATED_EIP" == "None" ]] || [[ "$ASSOCIATED_EIP" == "null" ]]; then
                 FREE_EIP=$(aws ec2 describe-addresses --region "$REGION" \
-                    --query 'Addresses[?AssociationId==null] | [0].[AllocationId,PublicIp]' --output text 2>/dev/null)
+                    --query 'Addresses[?AssociationId==null] | [0].[AllocationId,PublicIp]' --output text 2>/dev/null || true)
                 FREE_ALLOC=$(echo "$FREE_EIP" | awk '{print $1}')
                 FREE_IP=$(echo "$FREE_EIP" | awk '{print $2}')
                 if [[ -n "$FREE_ALLOC" ]] && [[ "$FREE_ALLOC" != "None" ]]; then
@@ -1838,14 +1873,18 @@ if [[ "$RECOVER" == true ]]; then
                 else
                     echo -e "${BLUE}[RECOVER] Allocating new EIP${NC}"
                     ALLOC_ID=$(aws ec2 allocate-address --region "$REGION" --domain vpc \
-                        --query 'AllocationId' --output text)
+                        --query 'AllocationId' --output text 2>/dev/null || true)
                 fi
-                aws ec2 associate-address --region "$REGION" --instance-id "$INSTANCE_ID" \
-                    --allocation-id "$ALLOC_ID" >/dev/null
-                sleep 3
+                if [[ -z "$ALLOC_ID" || "$ALLOC_ID" == "None" ]]; then
+                    echo -e "    ${YELLOW}[WARN] EIP allocation failed — instance will have no stable public IP${NC}"
+                else
+                    aws ec2 associate-address --region "$REGION" --instance-id "$INSTANCE_ID" \
+                        --allocation-id "$ALLOC_ID" >/dev/null 2>&1 || true
+                    sleep 3
+                fi
                 ASSOCIATED_EIP=$(aws ec2 describe-addresses --region "$REGION" \
                     --filters "Name=instance-id,Values=$INSTANCE_ID" \
-                    --query 'Addresses[0].PublicIp' --output text)
+                    --query 'Addresses[0].PublicIp' --output text 2>/dev/null || echo "None")
                 echo "    [OK] EIP associated: $ASSOCIATED_EIP"
             else
                 echo "  EIP:          $ASSOCIATED_EIP (kept)"
@@ -1859,7 +1898,7 @@ if [[ "$RECOVER" == true ]]; then
                 sleep 15
                 P=$(aws ssm describe-instance-information --region "$REGION" \
                     --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
-                    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null)
+                    --query 'InstanceInformationList[0].PingStatus' --output text 2>/dev/null || echo "")
                 echo "    wait $i: SSM=${P:-not-registered}"
                 if [[ "$P" == "Online" ]]; then
                     SSM_READY=true
@@ -1909,7 +1948,10 @@ if [[ "$RECOVER" == true ]]; then
                     --instance-ids "$INSTANCE_ID" \
                     --document-name AWS-RunShellScript \
                     --parameters "commands=[\"bash -c 'set -o pipefail; echo ${PERSIST_B64} | base64 -d > /tmp/setup-persistence.sh && chmod +x /tmp/setup-persistence.sh && EFS_ID=${STACK_EFS_ID} EFS_SUBPATH=${EFS_SUBPATH_VALUE} AWS_REGION=${REGION} bash /tmp/setup-persistence.sh 2>&1 | tail -40'\"]" \
-                    --query 'Command.CommandId' --output text 2>/dev/null)
+                    --query 'Command.CommandId' --output text 2>/dev/null || true)
+                if [[ -z "$PERSIST_CMD_ID" ]]; then
+                    echo -e "    ${YELLOW}[WARN] setup-persistence.sh: send-command failed — EFS state unverified${NC}"
+                fi
                 if [[ -n "$PERSIST_CMD_ID" ]]; then
                     # [B-10/setup-persistence-ssm-wait-too-short] Extended to 600s to survive
                     # cold apt-get under package-mirror congestion.
@@ -1917,12 +1959,12 @@ if [[ "$RECOVER" == true ]]; then
                         sleep 10
                         PS=$(aws ssm get-command-invocation --region "$REGION" \
                             --command-id "$PERSIST_CMD_ID" --instance-id "$INSTANCE_ID" \
-                            --query 'Status' --output text 2>/dev/null)
-                        [[ "$PS" == "Success" || "$PS" == "Failed" ]] && break
+                            --query 'Status' --output text 2>/dev/null || echo "Pending")
+                        [[ "$PS" == "Success" || "$PS" == "Failed" || "$PS" == "Cancelled" || "$PS" == "TimedOut" || "$PS" == "DeliveryTimedOut" ]] && break
                     done
                     PO=$(aws ssm get-command-invocation --region "$REGION" \
                         --command-id "$PERSIST_CMD_ID" --instance-id "$INSTANCE_ID" \
-                        --query 'StandardOutputContent' --output text 2>/dev/null)
+                        --query 'StandardOutputContent' --output text 2>/dev/null || true)
                     if [[ "$PS" == "Success" ]]; then
                         echo -e "    ${GREEN}[OK] setup-persistence.sh completed${NC}"
                         echo "$PO" | grep -E "WRITE OK|DONE" | sed 's/^/    /' || true
@@ -2063,15 +2105,17 @@ maybe_heal_stack
 EXISTING_SHAPE=""
 if [[ "$(get_stack_status "$STACK_NAME" "$REGION")" =~ ^(CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE|IMPORT_COMPLETE)$ ]]; then
     EXISTING_INSTANCE=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region "$REGION" \
-        --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text 2>/dev/null)
+        --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue' --output text 2>/dev/null || true)
     if [[ -n "$EXISTING_INSTANCE" ]] && [[ "$EXISTING_INSTANCE" != "None" ]]; then
-        EX_INFO=$(aws ec2 describe-instances --instance-ids "$EXISTING_INSTANCE" --region "$REGION" --output json 2>/dev/null)
-        EX_TYPE=$(echo "$EX_INFO" | jq -r '.Reservations[0].Instances[0].InstanceType // "unknown"')
+        EX_INFO=$(aws ec2 describe-instances --instance-ids "$EXISTING_INSTANCE" --region "$REGION" --output json 2>/dev/null || true)
+        EX_TYPE=$(echo "$EX_INFO" | jq -r '.Reservations[0].Instances[0].InstanceType // "unknown"' 2>/dev/null || echo "unknown")
+        [[ -z "$EX_TYPE" ]] && EX_TYPE="unknown"
         EX_MARKET=$(echo "$EX_INFO" | jq -r '
             .Reservations[0].Instances[0] |
             if .SpotInstanceRequestId then "spot"
             elif (.CapacityReservationSpecification.CapacityReservationTarget.CapacityReservationId // "") != "" then "capacity-block"
-            else "on-demand" end' 2>/dev/null)
+            else "on-demand" end' 2>/dev/null || echo "unknown")
+        [[ -z "$EX_MARKET" ]] && EX_MARKET="unknown"
         WANTED_MARKET="on-demand"
         [[ "$USE_CAPACITY_BLOCK" == true ]] && WANTED_MARKET="capacity-block"
         [[ "$USE_SPOT" == true ]] && WANTED_MARKET="spot"
@@ -2113,7 +2157,7 @@ if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
             --name "$CB_RES_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
-            --output text 2>/dev/null)
+            --output text 2>/dev/null || true)
 
         # For non-default slots, silently fall back to the legacy flat
         # key as a convenience only if nothing was found AND the slot
@@ -2244,7 +2288,7 @@ if [[ "$USE_CAPACITY_BLOCK" == true ]]; then
             --name "$CB_SUB_PATH" \
             --region "$REGION" \
             --query 'Parameter.Value' \
-            --output text 2>/dev/null)
+            --output text 2>/dev/null || true)
 
         if [[ -n "$SUBNET_ID" ]] && [[ "$SUBNET_ID" != "None" ]]; then
             echo "  Found: $SUBNET_ID"
@@ -2306,6 +2350,34 @@ if [[ "$FORCE_RECREATE" == true ]]; then
     FORCE_RECREATE_TOKEN="$(date -u +%Y%m%dT%H%M%SZ)"
     CDK_PARAMS+=("-c" "forceRecreateToken=$FORCE_RECREATE_TOKEN")
     echo -e "${YELLOW}[FORCE-RECREATE] Bumping LT versionDescription to $FORCE_RECREATE_TOKEN${NC}"
+
+    # [BUG-17] Wait for CB capacity to become available before CDK deploy.
+    # When the old instance is shutting-down, the CR's AvailableInstanceCount
+    # stays 0 until AWS finishes reclaiming the host. CDK/CFn does NOT retry
+    # RunInstances on capacity errors — it immediately rolls back.
+    if [[ "$USE_CAPACITY_BLOCK" == true && -n "$CAPACITY_RESERVATION_ID" ]]; then
+        echo -e "${BLUE}[FORCE-RECREATE] Waiting for CB capacity (AvailableInstanceCount >= 1)...${NC}"
+        _cb_ready=false
+        for _cb_i in $(seq 1 30); do
+            _avail=$(aws ec2 describe-capacity-reservations \
+                --capacity-reservation-ids "$CAPACITY_RESERVATION_ID" \
+                --region "$REGION" \
+                --query 'CapacityReservations[0].AvailableInstanceCount' \
+                --output text 2>/dev/null || echo "0")
+            [[ "$_avail" == "None" ]] && _avail="0"
+            if (( _avail >= 1 )); then
+                echo -e "  ${GREEN}[OK] AvailableInstanceCount=$_avail${NC}"
+                _cb_ready=true
+                break
+            fi
+            echo "    wait $_cb_i: AvailableInstanceCount=$_avail"
+            sleep 10
+        done
+        if [[ "$_cb_ready" != true ]]; then
+            echo -e "${RED}[NG] CB capacity not available after 5 min — aborting to prevent CFn rollback${NC}" >&2
+            exit 1
+        fi
+    fi
 fi
 
 echo -e "${BLUE}[BUILD] Compiling CDK app...${NC}"
