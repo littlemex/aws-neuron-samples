@@ -12,7 +12,7 @@ link were confirmed on live hardware.
 
 | Feature | Result | Evidence |
 |---|:---:|---|
-| Environment (DLAMI venv) | PASS | pip Option A pulls torch 2.11 (vLLM pin) while general `torch-neuronx` is torch-2.9-based; the DLAMI venv carries the aligned set. See SUSPECTED-BUGS.md #2. |
+| Environment (DLAMI venv) | PASS | pip Option A installs vLLM (torch 2.11) + the plugin but no Neuron runtime (`nki`), so model loading fails with `ModuleNotFoundError: nki`; the DLAMI venv carries the aligned set. See SUSPECTED-BUGS.md #2. |
 | CPU mode | PASS | `VLLM_NEURON_CPU_MODE=1`; compile backend `vllm_neuron`, dist `gloo`. |
 | NKI CPU simulator | PASS | `verify/cpu_nki_simulator.py`: add / exp*mul kernels match a NumPy reference within 0.00 error. |
 | CPU compilation | PASS | `VLLM_NEURON_CPU_COMPILE=1` produced 6 NEFF (93 MB) with no NeuronCore. `neuronx-cc` must be on PATH ([backend.py L391](https://github.com/vllm-project/vllm-neuron/blob/ae6c10eff6ec748e958045241aaca0288e8ddaa8/vllm_neuron/compile/backend.py#L391)). |

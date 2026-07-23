@@ -31,24 +31,33 @@ in the default path and is lost on container/instance recreation, with no warnin
 Fix: correct the three docs to `VLLM_CACHE_ROOT`, or make the code honor
 `NEURON_COMPILED_ARTIFACTS` as a fallback.
 
-## 2. Option A (`pip install -e .`) does not pull a torch-2.11-compatible Neuron runtime
+## 2. Option A (`pip install -e .`) installs no Neuron runtime (`nki` etc.), so model loading fails
 
 - Confidence: high (packaging gap)
 - Severity: Medium as a bug, High as an onboarding blocker; workaround exists (DLAMI venv)
 
-[setup-guide.md](https://github.com/vllm-project/vllm-neuron/blob/ae6c10eff6ec748e958045241aaca0288e8ddaa8/docs/getting-started/setup-guide.md)
+[setup-guide.md L47](https://github.com/vllm-project/vllm-neuron/blob/ae6c10eff6ec748e958045241aaca0288e8ddaa8/docs/getting-started/setup-guide.md#L47)
 Option A states `pip install -e .` "installs the vLLM Neuron plugin along with
-vLLM and all required Neuron SDK packages." But
-[requirements/core.txt](https://github.com/vllm-project/vllm-neuron/blob/ae6c10eff6ec748e958045241aaca0288e8ddaa8/requirements/core.txt)
-declares no Neuron runtime dependency (`torch-neuronx` / `libtorch-neuronx-lite`).
-vLLM `0.21.0` pins torch `2.11.0`, while the general `torch-neuronx` is
-torch-2.9-based and pulls torch back to 2.9. Confirmed on hardware: Option A did
-not run; a `neuron` device-type `RuntimeError` occurred, and only the DLAMI venv
-(with `libtorch-neuronx-lite 2.11`) worked.
+vLLM and all required Neuron SDK packages." In practice it installs vLLM
+(torch 2.11.0) and the plugin, but **no Neuron runtime** (`nki`, `torch-neuronx`,
+or `libtorch-neuronx-lite`); [requirements/core.txt](https://github.com/vllm-project/vllm-neuron/blob/ae6c10eff6ec748e958045241aaca0288e8ddaa8/requirements/core.txt)
+declares none. Platform registration succeeds and `current_platform.device_name`
+returns `neuron`, so it looks fine, but the first import of model code fails with
+`ModuleNotFoundError: No module named 'nki'` — `nki` is imported unconditionally
+on the model path, e.g.
+[vllm_neuron/functional/argsort_unstable.py L4](https://github.com/vllm-project/vllm-neuron/blob/ae6c10eff6ec748e958045241aaca0288e8ddaa8/vllm_neuron/functional/argsort_unstable.py#L4).
 
-Fix: declare a torch-2.11-compatible Neuron runtime in `core.txt`, or annotate
-Option A that a Neuron runtime is separately required and recommend the DLAMI venv
-during Beta.
+Confirmed on hardware (trn2.3xlarge, Python 3.12): after Option A, torch stays at
+2.11.0; `pip list` shows only `vllm-neuron` among Neuron packages;
+`from vllm_neuron.model.registry import get_models` raises
+`ModuleNotFoundError: No module named 'nki'`. The DLAMI venv (Option B) ships
+`nki` / `libtorch-neuronx-lite 2.11` and works. (An earlier draft of this note
+wrongly attributed the failure to a torch 2.9 downgrade; the real cause is the
+missing `nki` runtime.)
+
+Fix: declare the Neuron runtime (whatever provides `nki` / a torch-2.11
+`libtorch-neuronx-lite`) in `core.txt`, or annotate Option A that a Neuron runtime
+is separately required and recommend the DLAMI venv during Beta.
 
 ## 3. Stale TODO comment contradicts the implemented prefix-caching guard
 
