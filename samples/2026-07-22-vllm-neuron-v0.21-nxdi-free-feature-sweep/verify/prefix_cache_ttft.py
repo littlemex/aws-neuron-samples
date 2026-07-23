@@ -43,7 +43,10 @@ def main():
 
     unit = ("The system operates under the following detailed policy guidelines "
             "and constraints that must be strictly followed at all times. ")
-    shared = unit * 60  # long enough to span 2 prefill segments at 4096 bucket
+    # Must exceed one prefill bucket (4096) so a cache hit removes a whole segment
+    # pass. On Neuron the TTFT benefit is quantized to segment/bucket boundaries:
+    # a prompt that fits in a single bucket shows no TTFT change even on a hit.
+    shared = unit * 240  # ~5k tokens -> 2 segment passes at the 4096 bucket
     n = toklen(args.base, args.model, shared + "prime")
     print(f"shared-prefix tokens: {n}")
 
@@ -66,7 +69,10 @@ def main():
     print(f"WARM (shared prefix cached): TTFT median = {warm:.3f}s")
     print(f"COLD (unique prefix each):   TTFT median = {cold:.3f}s")
     print(f"speedup (cold/warm): {cold / warm:.2f}x")
-
+    # The functional proof of prefix caching is the hit counter below. The TTFT
+    # speedup is quantized to segment/bucket boundaries and is sensitive to how
+    # many segment passes the warm remainder still needs, so it can read ~1.0x
+    # unless the cache hit removes a whole prefill pass. The metric always moves.
     m = requests.get(f"{args.base}/metrics").text
     for line in m.splitlines():
         if ("prefix_cache_hits_total" in line or "prompt_tokens_cached_total" in line) and not line.startswith("#"):
