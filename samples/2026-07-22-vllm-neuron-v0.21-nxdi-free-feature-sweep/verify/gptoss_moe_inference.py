@@ -28,11 +28,16 @@ def main():
                             "max_tokens": 8, "temperature": 0}, timeout=120)
     print("completions ->", repr(r.json()["choices"][0]["text"]) if r.status_code == 200 else r.text[:200])
 
+    # GPT-OSS interleaves harmony-style reasoning before the final answer, so it
+    # needs enough tokens to reach it; 512 is comfortable. The final answer lands
+    # in message.content, but some builds surface it in reasoning_content, so we
+    # check both and guard against either being None.
     r2 = requests.post(f"{args.base}/v1/chat/completions",
                        json={"model": args.model,
                              "messages": [{"role": "user", "content": "What is 17 times 23?"}],
-                             "max_tokens": 60, "temperature": 0}, timeout=120)
-    ans = r2.json()["choices"][0]["message"]["content"] if r2.status_code == 200 else ""
+                             "max_tokens": 512, "temperature": 0}, timeout=180)
+    msg = r2.json()["choices"][0]["message"] if r2.status_code == 200 else {}
+    ans = " ".join(str(msg.get(k) or "") for k in ("content", "reasoning_content"))
     print("chat ->", repr(ans)[:150])
     print("RESULT:", "PASS" if (r.status_code == 200 and "391" in ans) else "CHECK")
 
