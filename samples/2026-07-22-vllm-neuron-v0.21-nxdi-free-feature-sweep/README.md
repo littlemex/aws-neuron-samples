@@ -60,54 +60,85 @@ Why the DLAMI venv rather than `pip install -e .`: the pip path pulls torch 2.11
 (vLLM's pin) while the general `torch-neuronx` is torch-2.9-based, so it does not
 run as-is. Details in `docs/SUSPECTED-BUGS.md` #2.
 
-## Quick start
+## How to run
 
-The CPU-only checks need no NeuronCore and run anywhere the venv is installed:
+Every check follows the same shape: **launch a server in the background, wait
+until it is ready, then run a `verify/*.py` script that hits it.** `launch/serve.sh`
+kills any server already holding the NeuronCores before it starts, so you never
+have to hunt for stray processes when switching features.
+
+### 1. Set environment variables once per session
 
 ```bash
-source /opt/aws_neuronx_venv_pytorch_inference_vllm_0_21_0_1_0_0/bin/activate
+export HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx     # gated models (Llama-3.1-8B, etc.)
+export VLLM_NEURON_VENV=/opt/aws_neuronx_venv_pytorch_inference_vllm_0_21_0_1_0_0
+export PATH="/opt/aws/neuron/bin:${VLLM_NEURON_VENV}/bin:${PATH}"
+source "${VLLM_NEURON_VENV}/bin/activate"
+export TP=4 MAX_LEN=8192 MAX_BT=4096 MAX_SEQS=4 PORT=8000
+export CACHE_DIR=/work/neuron_cache        # where NEFF compile cache is kept
+```
+
+### 2. CPU-only checks (no NeuronCore)
+
+CPU mode, the NKI CPU simulator, and out-of-tree onboarding run without a
+NeuronCore. Use them as a first sanity check that the plugin registers and the
+model contract works.
+
+```bash
 ./run_feature_sweep.sh cpu
 ```
 
-The server-based checks launch a server first, then hit it. For example, prefix
-caching and structured outputs on Llama-3.1-8B:
+Expect NKI kernels to match a NumPy reference and the synthetic model's
+`generate()` to print `RESULT: PASS`.
+
+### 3. Server-based checks
+
+Example: Llama-3.1-8B covering segmented prefill, structured outputs + tool
+calling, and prefix caching in one launch. Structured outputs require async
+scheduling off plus the enable flag.
 
 ```bash
-export HF_TOKEN=...   # gated model
-# structured outputs needs async scheduling off + the enable flag
-./launch/serve.sh --cache-root /work/so_cache --log /tmp/so.log -- \
-  --model meta-llama/Llama-3.1-8B-Instruct --tensor-parallel-size 4 \
-  --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 4 \
+./launch/serve.sh --cache-root "${CACHE_DIR}/llama" --log /tmp/llama.log -- \
+  --model meta-llama/Llama-3.1-8B-Instruct --tensor-parallel-size $TP \
+  --max-model-len $MAX_LEN --max-num-batched-tokens $MAX_BT --max-num-seqs $MAX_SEQS \
   --no-async-scheduling --enable-auto-tool-choice --tool-call-parser llama3_json \
   --additional-config '{"neuron_config": {"enable_structured_outputs": true}}'
-./launch/wait_ready.sh /tmp/so.log 8000
-python3 verify/structured_outputs.py
+./launch/wait_ready.sh /tmp/llama.log $PORT          # first boot compiles; takes minutes
+
 python3 verify/segmented_prefill.py
+python3 verify/structured_outputs.py
 python3 verify/prefix_cache_ttft.py
 ```
 
-GPT-OSS 20B (MoE) in BF16 on Trn2, optionally with expert parallelism:
+Restarting with the same `--cache-root` reuses the compile cache and boots much
+faster (measured 205 s warm vs 361 s cold for Llama-3.1-8B; `wait_ready.sh`
+reports the cache-hit count).
+
+GPT-OSS 20B (MoE) in BF16 on Trn2, optionally with expert parallelism. Its first
+compilation can exceed 15 minutes, so give `wait_ready.sh` a longer timeout (the
+3rd argument, in seconds):
 
 ```bash
-./launch/serve.sh --cache-root /work/gptoss_cache --log /tmp/gptoss.log -- \
-  --model openai/gpt-oss-20b --tensor-parallel-size 4 --enable-expert-parallel \
-  --max-model-len 8192 --max-num-batched-tokens 4096 --max-num-seqs 4 \
+./launch/serve.sh --cache-root "${CACHE_DIR}/gptoss" --log /tmp/gptoss.log -- \
+  --model openai/gpt-oss-20b --tensor-parallel-size $TP --enable-expert-parallel \
+  --max-model-len $MAX_LEN --max-num-batched-tokens $MAX_BT --max-num-seqs $MAX_SEQS \
   --hf-overrides '{"quantization_config": {}}' \
   --additional-config '{"neuron_config": {"quantization": "bf16", "ep_degree": 2, \
      "num_batched_tokens_buckets": [4096], "num_seqs_buckets": [4]}}'
-./launch/wait_ready.sh /tmp/gptoss.log 8000
+./launch/wait_ready.sh /tmp/gptoss.log $PORT 1800
 python3 verify/gptoss_moe_inference.py
 ```
 
-EAGLE3 and multimodal recipes are documented at the top of
-`verify/eagle3_metrics.py` and `verify/multimodal_qwenvl.py`.
+The EAGLE3 and multimodal (Qwen3-VL 4B) launch recipes are documented at the top
+of `verify/eagle3_metrics.py` and `verify/multimodal_qwenvl.py`. To stop
+everything and free the cores when you are done: `pkill -9 -f "VLLM::" ; sleep 45`.
 
 ## Notes on reproducibility
 
 - First boot compiles NEFFs during warmup and takes minutes; a warm restart with
-  the same `--cache-root` reuses them and is much faster (measured 249 s vs 140 s
-  for Llama-3.1-8B). The cache knob is `VLLM_CACHE_ROOT`, wired through
-  `launch/serve.sh`.
+  the same `--cache-root` reuses them and is much faster (measured 205 s warm vs
+  361 s cold for Llama-3.1-8B, ~43% faster). The cache knob is `VLLM_CACHE_ROOT`,
+  wired through `launch/serve.sh`.
 - `launch/serve.sh` waits for NeuronCores to be released before starting, because
   they free ~30-45 s after a vLLM process exits and the workers are named
   `VLLM::Worker_TP*` (see `docs/FINDINGS.md`).
