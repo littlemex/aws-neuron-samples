@@ -1,0 +1,9 @@
+apiVersion: v2
+name: vllm-neuron-serving
+description: >-
+  Serve a vLLM model on AWS Trainium (Neuron) NeuronCores on an existing EKS cluster
+  provisioned by distributed-ai/infra/eks. Rendered with `helm template ... | kubectl apply -f -`
+  (no release object), which is how up.sh drives it.
+type: application
+version: 0.1.0
+appVersion: "0.21"

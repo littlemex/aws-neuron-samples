@@ -1,0 +1,9 @@
+# Meta Llama 3.1 8B Instruct — dense text model, supported by the stock vLLM-Neuron plugin (llama3).
+# Gated on Hugging Face: create a Secret first and pass its name.
+#   kubectl -n <ns> create secret generic hf-token --from-literal=token=hf_xxx
+model: meta-llama/Llama-3.1-8B-Instruct
+tpSize: 4                    # trn2.3xlarge = 4 logical NeuronCores
+maxModelLen: 8192
+maxNumSeqs: 4
+dtype: bfloat16
+hfTokenSecret: hf-token

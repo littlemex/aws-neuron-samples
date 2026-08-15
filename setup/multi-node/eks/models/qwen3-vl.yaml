@@ -1,0 +1,10 @@
+# Qwen3-VL — vision-language model, supported by the stock vLLM-Neuron plugin (qwen3_vl).
+# Multimodal: the OpenAI server accepts image content parts; the text backbone runs tensor-parallel.
+# Set `model` to the exact checkpoint you want (this default is a common instruct build).
+model: Qwen/Qwen3-VL-8B-Instruct
+servedModelName: qwen3-vl
+tpSize: 4
+maxModelLen: 8192
+maxNumSeqs: 4
+dtype: bfloat16
+# Qwen3-VL is public; no HF token needed. If you point at a gated mirror, set hfTokenSecret.

@@ -1,0 +1,103 @@
+{{- if eq .Values.topology "multinode" }}
+# EXPERIMENTAL — Neuron multi-node serving over EFA is NOT verified (see DESIGN.md).
+# Shape mirrors the infra's GPU vllm-ray.yaml: one head pod + (nodes-1) worker pods joined by a
+# Ray cluster over a headless Service; vLLM runs on the head and uses Ray as the distributed
+# executor. tensor-parallel-size (.Values.tpSize) must equal nodes x per-chip cores.
+#
+# Headless Service with publishNotReadyAddresses so the head/worker DNS resolves before readiness
+# (breaks the ray-head / ray-worker chicken-and-egg).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "svc.name" . }}-ray
+  namespace: {{ .Values.namespace }}
+  labels: { app: {{ include "svc.name" . }} }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: {{ include "svc.name" . }} }
+  ports:
+  - { port: 6379, name: ray-gcs }
+  - { port: 8000, targetPort: {{ .Values.port }}, name: http }
+---
+# Client-facing Service (head only).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "svc.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels: { app: {{ include "svc.name" . }} }
+spec:
+  selector: { app: {{ include "svc.name" . }}, role: head }
+  ports:
+  - { port: 8000, targetPort: {{ .Values.port }}, name: http }
+{{- $rayHead := printf "%s-ray.%s.svc.cluster.local" (include "svc.name" .) .Values.namespace }}
+{{- range $i := until (int .Values.nodes) }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "svc.name" $ }}-{{ if eq $i 0 }}head{{ else }}worker-{{ $i }}{{ end }}
+  namespace: {{ $.Values.namespace }}
+  labels: { app: {{ include "svc.name" $ }} }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: {{ include "svc.name" $ }}, role: {{ if eq $i 0 }}head{{ else }}worker{{ end }}, idx: "{{ $i }}" }
+  template:
+    metadata:
+      labels: { app: {{ include "svc.name" $ }}, role: {{ if eq $i 0 }}head{{ else }}worker{{ end }}, idx: "{{ $i }}" }
+    spec:
+      nodeSelector:
+        node-role: {{ $.Values.pool }}
+      affinity:
+        podAntiAffinity:                 # one pod per node (each needs a whole chip)
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector: { matchLabels: { app: {{ include "svc.name" $ }} } }
+            topologyKey: kubernetes.io/hostname
+      tolerations:
+        {{- include "svc.tolerations" $ | nindent 8 }}
+      containers:
+      - name: server
+        image: {{ $.Values.image }}
+        securityContext:
+          capabilities: { add: ["IPC_LOCK"] }
+        command: ["/bin/bash", "-lc"]
+        args:
+        {{- if eq $i 0 }}
+        - |
+          ray start --head --port=6379 --num-cpus=0 --disable-usage-stats
+          exec python -m vllm.entrypoints.openai.api_server \
+          {{- include "svc.vllmArgs" $ | nindent 12 }} \
+            --distributed-executor-backend=ray
+        {{- else }}
+        - |
+          until ray start --address={{ $rayHead }}:6379 --block; do sleep 5; done
+        {{- end }}
+        env:
+          {{- include "svc.env" $ | nindent 8 }}
+        {{- if eq $i 0 }}
+        ports:
+        - { containerPort: {{ $.Values.port }}, name: http }
+        readinessProbe:
+          httpGet: { path: /health, port: {{ $.Values.port }} }
+          initialDelaySeconds: 300
+          periodSeconds: 15
+          failureThreshold: 120
+        {{- end }}
+        resources:
+          {{- include "svc.resources" $ | nindent 10 }}
+        volumeMounts:
+        - { name: shm, mountPath: /dev/shm }
+        {{- if $.Values.cache.enabled }}
+        - { name: cache, mountPath: {{ $.Values.cache.mountPath }} }
+        {{- end }}
+      volumes:
+      - name: shm
+        emptyDir: { medium: Memory, sizeLimit: 8Gi }
+      {{- if $.Values.cache.enabled }}
+      - name: cache
+        persistentVolumeClaim: { claimName: {{ include "svc.cachePvc" $ }} }
+      {{- end }}
+{{- end }}
+{{- end }}

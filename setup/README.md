@@ -9,6 +9,7 @@ and is independently usable.
 | Shape | Status | Description |
 |---|---|---|
 | [`single-node/`](single-node/) | **Available** | A single EC2 Neuron DLAMI instance fronted by code-server, with persistent storage on EFS and SSM-only network access. Best for interactive development, kernel work, and small fine-tuning jobs. |
+| [`multi-node/eks/`](multi-node/eks/) | **Available** | vLLM serving on Trainium NeuronCores on an existing EKS cluster (provisioned by `distributed-ai/infra/eks`). One `up.sh <model>` per model; add a model by dropping a preset. Single-node tensor-parallel is verified; multi-node over EFA is experimental. |
 | `parallelcluster/` | Planned | AWS ParallelCluster-based multi-node setup for distributed training on Trn1/Trn2. |
 | `hyperpod/` | Planned | SageMaker HyperPod-based cluster for resilient long-running training jobs. |
 

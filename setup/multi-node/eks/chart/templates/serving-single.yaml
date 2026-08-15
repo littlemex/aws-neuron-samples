@@ -1,0 +1,65 @@
+{{- if eq .Values.topology "single" }}
+# Single-node tensor-parallel serving: one whole trn2 chip, all NeuronCores over on-chip
+# NeuronLink (EFA is for INTER-node traffic). Verified path.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "svc.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels: { app: {{ include "svc.name" . }} }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: {{ include "svc.name" . }} }
+  template:
+    metadata:
+      labels: { app: {{ include "svc.name" . }} }
+    spec:
+      nodeSelector:
+        node-role: {{ .Values.pool }}
+      tolerations:
+        {{- include "svc.tolerations" . | nindent 8 }}
+      containers:
+      - name: server
+        image: {{ .Values.image }}
+        securityContext:
+          capabilities: { add: ["IPC_LOCK"] }
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          {{- include "svc.startCmd" . | nindent 10 }}
+        env:
+          {{- include "svc.env" . | nindent 8 }}
+        ports:
+        - { containerPort: {{ .Values.port }}, name: http }
+        resources:
+          {{- include "svc.resources" . | nindent 10 }}
+        readinessProbe:
+          httpGet: { path: /health, port: {{ .Values.port }} }
+          initialDelaySeconds: 300     # first boot compiles the model (many minutes)
+          periodSeconds: 15
+          failureThreshold: 120
+        volumeMounts:
+        - { name: shm, mountPath: /dev/shm }
+        {{- if .Values.cache.enabled }}
+        - { name: cache, mountPath: {{ .Values.cache.mountPath }} }
+        {{- end }}
+      volumes:
+      - name: shm
+        emptyDir: { medium: Memory, sizeLimit: 8Gi }
+      {{- if .Values.cache.enabled }}
+      - name: cache
+        persistentVolumeClaim: { claimName: {{ include "svc.cachePvc" . }} }
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "svc.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels: { app: {{ include "svc.name" . }} }
+spec:
+  selector: { app: {{ include "svc.name" . }} }
+  ports:
+  - { port: 8000, targetPort: {{ .Values.port }}, name: http }
+{{- end }}

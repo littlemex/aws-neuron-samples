@@ -1,0 +1,26 @@
+# Nemotron-3-Nano-Omni-30B-A3B text backbone (NemotronH: hybrid Mamba2 / MoE / Attention).
+#
+# NemotronH is not in the stock vLLM-Neuron image yet — it ships via the PR
+# https://github.com/littlemex/vllm-neuron (branch feat/nemotron-h). This preset installs it into
+# the plugin at pod startup (plugin.install below), so it runs on the stock image. For production,
+# build an image with the plugin baked in and set `image:` instead of installing at startup.
+#
+# Constraints baked into this preset (see the model's README):
+#   - batch=1 (max_num_seqs=1): the Mamba2 recurrent state is a single per-layer buffer.
+#   - short prefill (max_model_len small): the vectorized SSD scan is O(l^2).
+#   - 30B-A3B (~60 GB bf16) needs TP=4 to fit one trn2.3xlarge chip.
+model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+servedModelName: nemotron-h
+tpSize: 4
+maxModelLen: 32
+maxNumSeqs: 1
+dtype: bfloat16
+trustRemoteCode: true
+serialTraceWorkers: true       # 52-layer cold NEFF compile is RAM-heavy on the 128 GB trn2.3xlarge
+
+plugin:
+  install: true
+  repo: littlemex/vllm-neuron
+  ref: feat/nemotron-h
+  modelDir: nemotron_h
+  registerClass: NemotronHForCausalLM

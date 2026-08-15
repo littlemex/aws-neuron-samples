@@ -1,0 +1,25 @@
+{{- if and .Values.cache.enabled .Values.cache.create }}
+# NEFF + weights cache (RWX). Two modes:
+#   STATIC  — set cache.volumeName to an infra static PV (openzfs-shared / fsx-training). A static
+#             PV binds to exactly one PVC (1:1), so it is single-tenant; many *pods* can still share
+#             that one PVC concurrently (RWX), optionally under per-model subPaths.
+#   DYNAMIC — leave cache.volumeName empty and set cache.storageClassName to a dynamic class such as
+#             an EFS access-point class (provisioningMode=efs-ap). Each PVC then provisions its own
+#             isolated access point on one shared filesystem, so every namespace/tenant/model gets
+#             its own volume with no 1:1 static-PV limit. This is the multi-tenant path.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "svc.cachePvc" . }}
+  namespace: {{ .Values.namespace }}
+  labels: { app: {{ include "svc.name" . }} }
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: {{ .Values.cache.storageClassName | quote }}
+  {{- if .Values.cache.volumeName }}
+  volumeName: {{ .Values.cache.volumeName }}   # static binding; omit for dynamic provisioning
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.cache.size }}
+{{- end }}

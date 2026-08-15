@@ -1,0 +1,71 @@
+# Defaults for the vllm-neuron-serving chart. A model preset under ../models/<name>.yaml
+# overrides the model-specific keys; up.sh passes the rest as --set flags.
+
+# ── Naming / placement ────────────────────────────────────────────────────────
+name: ""                      # release/workload name; up.sh sets it from the model preset
+namespace: default
+# node-role label of the target Karpenter Neuron pool (an accelerator_pools key in infra/eks).
+# NOT "<pool>-serving"; the module labels nodes with the bare pool key.
+pool: trn2
+
+# ── Topology ──────────────────────────────────────────────────────────────────
+# "single"  = one chip, tensor-parallel across its NeuronCores (verified).
+# "multinode" = N pods + headless Service + Ray rendezvous over EFA (EXPERIMENTAL, see DESIGN.md).
+topology: single
+nodes: 1                      # multinode only: number of pods (one chip each)
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model: ""                     # HF id or /mnt path, e.g. Qwen/Qwen3-VL-... ; required
+servedModelName: ""           # optional OpenAI "model" name; defaults to `model`
+tpSize: 4                     # tensor-parallel degree. trn2.3xlarge = 4 logical cores (LNC=2 x 2)
+maxModelLen: 4096
+maxNumSeqs: 1                 # some models (recurrent-state) require 1; see the preset
+dtype: bfloat16
+trustRemoteCode: false
+extraArgs: []                 # extra vLLM CLI args, e.g. ["--kv-cache-dtype=fp8"]
+
+# ── Hardware requests ─────────────────────────────────────────────────────────
+neuronDevices: 1              # whole-chip granularity; 1 = one trn2.3xlarge chip
+efaCount: 1                   # trn2.3xlarge has 1 EFA card. Set 0 only if the pool has no EFA.
+cpu: "8"
+# Size memory for the COLD-COMPILE peak, not steady-state inference (NEFF tracing is RAM-heavy).
+memory: 96Gi
+
+# ── Image / env ───────────────────────────────────────────────────────────────
+image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.21.0.1.0.0-neuronx-py313-sdk2.31.0-ubuntu24.04
+port: 8000
+env: {}                       # extra env vars as key: value
+# Skip the Neuron EFA-affinity probe on single-EFA-card instances (trn2.3xlarge). Harmless on
+# multi-card instances too, but you may unset it there to keep the CPU-locality optimization.
+skipEfaAffinity: true
+# Trade compile speed for peak RAM on small-RAM instances (serialises NEFF tracing workers).
+serialTraceWorkers: false
+hfTokenSecret: ""             # name of a Secret with key `token`; empty = public model
+
+# ── Optional: install a not-yet-released model into the plugin at pod startup ──
+# For models that are not in the stock vLLM-Neuron image yet (e.g. NemotronH, which ships via a
+# PR branch). The pod fetches the model package from a GitHub branch tarball, copies it into the
+# installed vllm_neuron plugin, and registers the class in the model registry before starting the
+# server. Prefer a prebuilt image (set .Values.image) for production; this is for trying a PR.
+plugin:
+  install: false
+  repo: littlemex/vllm-neuron   # GitHub owner/repo of the fork carrying the model
+  ref: feat/nemotron-h          # branch (or tag) to fetch
+  modelDir: nemotron_h          # directory under vllm_neuron/model/ to install
+  registerClass: NemotronHForCausalLM
+
+# ── NEFF / weights cache (RWX, survives node swap / CB expiry) ─────────────────
+cache:
+  enabled: true
+  create: true                # render the PVC in this release's namespace
+  pvcName: ""                 # defaults to "<name>-cache"
+  # STATIC (default): bind to an infra static PV by name. A static PV is 1:1 with a PVC, so it is
+  #   single-tenant (many pods can still share that one PVC via RWX). Set storageClassName: "".
+  # DYNAMIC (multi-tenant): leave volumeName empty and set storageClassName to a dynamic class,
+  #   e.g. an EFS access-point class (provisioningMode=efs-ap). Each namespace/tenant/model then
+  #   provisions its own isolated access point on one shared filesystem — no 1:1 limit.
+  #   Verified: two PVCs in two namespaces via an efs-sc each got their own EFS access point.
+  volumeName: openzfs-shared  # infra static PV (openzfs-shared | fsx-training | efs-neuron-workspace); "" for dynamic
+  storageClassName: ""        # "" + volumeName = static; e.g. "efs-sc" + empty volumeName = dynamic
+  size: 256Gi
+  mountPath: /mnt/neuron-cache
