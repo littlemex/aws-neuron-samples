@@ -7,12 +7,12 @@
 #
 # Constraints baked into this preset (see the model's README):
 #   - batch=1 (max_num_seqs=1): the Mamba2 recurrent state is a single per-layer buffer.
-#   - short prefill (max_model_len small): the vectorized SSD scan is O(l^2).
+#   - prefill is the chunked SSD scan (O(l*C)); long seq fits. Raise maxModelLen as needed.
 #   - 30B-A3B (~60 GB bf16) needs TP=4 to fit one trn2.3xlarge chip.
 model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
 servedModelName: nemotron-h
 tpSize: 4
-maxModelLen: 32
+maxModelLen: 512   # chunked SSD (default) handles long seq; raise as needed (compile time grows with buckets)
 maxNumSeqs: 1
 dtype: bfloat16
 trustRemoteCode: true
