@@ -1,0 +1,907 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NemotronH on vLLM Neuron: accuracy investigation, from symptom to culprit</title>
+<style>
+:root{
+  --g1:#0b3d2e; --g2:#12805c; --g3:#1faa79; --g4:#7ed7b6; --g5:#e7f7f0;
+  --ink:#12241d; --mut:#5a6b64; --line:#cfe6db; --warn:#b5651d; --bad:#b23b3b; --ok:#12805c;
+}
+*{box-sizing:border-box}
+body{font-family:-apple-system,"Hiragino Kaku Gothic ProN",Meiryo,Helvetica,Arial,sans-serif;color:var(--ink);
+  line-height:1.75;margin:0;background:#f6faf8}
+.wrap{max-width:1080px;margin:0 auto;padding:0 22px 90px}
+header{background:linear-gradient(135deg,var(--g1),var(--g2));color:#fff;padding:36px 22px 26px;position:relative}
+header .inner{max-width:1080px;margin:0 auto}
+header h1{font-size:1.55rem;margin:.2em 0;line-height:1.4}
+header p{color:var(--g4);margin:.35em 0;font-size:.98rem}
+.langbar{position:absolute;top:20px;right:22px;display:flex;gap:6px}
+.langbar button{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.5);color:#fff;
+  padding:6px 14px;border-radius:999px;font-size:.85rem;cursor:pointer;font-weight:600}
+.langbar button.active{background:#fff;color:var(--g1)}
+h2{color:var(--g1);border-bottom:3px solid var(--g3);padding-bottom:.3em;margin-top:2.5em;font-size:1.32rem}
+h3{color:var(--g2);margin-top:1.6em;font-size:1.08rem}
+p{margin:.7em 0}
+code{background:#eaf5ef;color:#0d2b22;padding:.08em .38em;border-radius:4px;font-size:.9em;
+  font-family:"SF Mono",Consolas,monospace}
+.mut{color:var(--mut)}
+.card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:18px 0;
+  box-shadow:0 1px 3px rgba(18,128,92,.06)}
+.callout{border-left:5px solid var(--g3);background:var(--g5);padding:12px 18px;border-radius:0 10px 10px 0;margin:16px 0}
+.callout.warn{border-color:var(--warn);background:#fdf4ea}
+.callout.key{border-color:var(--g1);background:#eafaf2}
+.callout b{color:var(--g1)}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:.92rem;background:#fff}
+th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+th{background:var(--g5);color:var(--g1)}
+.ok{color:var(--ok);font-weight:700}
+.bad{color:var(--bad);font-weight:700}
+.pill{display:inline-block;background:var(--g5);color:var(--g1);border:1px solid var(--g4);
+  border-radius:999px;padding:2px 12px;font-size:.8rem;margin:2px 4px 2px 0;font-weight:600}
+.diagram-wrap{background:#fff;border:1px solid var(--line);border-radius:14px;padding:10px;margin:18px 0;overflow-x:auto}
+.diagram-wrap svg{width:100%;height:auto;display:block;min-width:640px}
+.confidence{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0}
+.confidence span{font-size:.82rem;padding:4px 10px;border-radius:8px;border:1.5px solid var(--line)}
+.small{font-size:.85rem}
+hr{border:0;border-top:1px dashed var(--line);margin:34px 0}
+footer{margin-top:50px;padding-top:18px;border-top:1px solid var(--line);color:var(--mut);font-size:.85rem}
+body.lang-en .ja{display:none}
+body.lang-ja .en{display:none}
+ul{margin:.5em 0}
+li{margin:.3em 0}
+</style>
+</head>
+<body class="lang-en">
+<header><div class="inner">
+<div class="langbar">
+  <button id="btn-en" class="active">EN</button>
+  <button id="btn-ja">日本語</button>
+</div>
+<span class="pill" style="background:#12805c;color:#fff;border-color:#7ed7b6">technical investigation report</span>
+<h1 class="en">NemotronH on vLLM Neuron: from symptom to culprit</h1>
+<h1 class="ja">NemotronH on vLLM Neuron: 症状から犯人特定まで</h1>
+<p class="en">A reproducible, component-by-component investigation of an on-device reasoning failure -- what it ruled out, what it could not yet isolate, and the decisive experiments left to run.</p>
+<p class="ja">on-device での推論崩壊について、部品単位で再現可能な調査を行った記録 -- 何を排除できたか、何がまだ単離できていないか、そして残された決定実験。</p>
+<p class="small en">Model: <code>nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16</code> &middot; Plugin: <code>vllm-project/vllm-neuron</code> &middot; Neuron SDK 2.31.0 / 2.32.0 &middot; Hardware: <code>trn2.3xlarge</code></p>
+<p class="small ja">対象モデル: <code>nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16</code> &middot; Plugin: <code>vllm-project/vllm-neuron</code> &middot; Neuron SDK 2.31.0 / 2.32.0 &middot; ハード: <code>trn2.3xlarge</code></p>
+</div></header>
+
+<div class="wrap">
+
+<div class="callout key">
+<p class="en"><b>One-line summary.</b> A hybrid Mamba2/MoE/Attention decoder answers correctly on CPU and on a CUDA GPU, but produces a deterministic (byte-identical) wrong output on multi-step arithmetic reasoning when served through the vLLM Neuron plugin on Trainium, while short factual completions and long-range recall stay correct. Nine independent experiments rule out the model, bf16 precision, single-operator precision, the Trainium hardware, the neuronx-cc compiler version, the plugin&#x27;s own compiler flags, and each individual kernel tested standalone (Mamba2 scan, MoE router) — but every one of those experiments also changed at least one other variable versus the real failure, so none of them validly isolates a single culprit. What is established is that the fault sits in a shared code path above kernel selection; <b>which component in that path is still an open question</b> — see the Established / Open summary below.</p>
+<p class="ja"><b>一言まとめ。</b> Mamba2/MoE/Attention のハイブリッドデコーダは CPU と CUDA GPU では正答するが、Trainium 上で vLLM Neuron plugin を経由すると多段の算数推論で決定的 (byte 単位で同一) な誤出力を返す。短い事実応答や長距離 recall は健全なまま。9 個の独立した実験で、モデル・bf16 精度・単一演算の精度・Trainium ハード・neuronx-cc の版・plugin 独自のコンパイラフラグ・単体で検証した各カーネル (Mamba2 scan・MoE router) を無罪にしたが、これらの実験はいずれも実際の失敗構成に対し他の変数も同時に変えており、単一の犯人を妥当に単離してはいない。確定しているのは故障がカーネル選択より上流の共有コードパスにあることだけで、<b>そのパスのどの部品かは依然未解決</b> -- 下記の Established / Open のまとめを参照。</p>
+</div>
+
+<div class="card" style="border:1.5px solid var(--g2)">
+<h3 class="en" style="margin-top:0">Established vs. open -- read this first</h3>
+<h3 class="ja" style="margin-top:0">確定していること / 未解決のこと -- まず読むべき箇所</h3>
+<div class="en">
+<p><b>Established (confirmed by direct experiment):</b></p>
+<ul>
+<li>The plugin path produces a <b>deterministic, byte-identical</b> wrong output; the identical graph is correct on CPU and on GPU.</li>
+<li>The failure is <b>task-selective</b>: multi-step, order-dependent, and arithmetic reasoning collapse; short factual completions and long-range verbatim recall survive.</li>
+<li>Byte-identical output across two different scan algorithms and two different attention-kernel prefill paths localizes the fault to a <b>shared code path above kernel selection</b> and rules out non-deterministic numerical drift.</li>
+<li>An FP8 sibling model still answers correctly on GPU, independently ruling out mechanisms that are sensitive to small numerical perturbations.</li>
+<li>On the failing prompts, the <b>first generated token is already wrong</b> -- the defect is visible at prefill/logit time, not only after several decode steps.</li>
+</ul>
+<p><b>Open (not established):</b></p>
+<ul>
+<li><b>Which component</b> inside that shared path is at fault. Every exonerating experiment below changed two or more variables versus the real failing configuration (plugin frontend, 52 layers, MoE, autoregressive decode) at once, so no single stage -- including full-graph compilation -- has been validly eliminated or convicted. See Section 2 for the variable-confound detail, Section 2b for the ranked live candidates, and Section 4 for the next decisive experiments.</li>
+</ul>
+</div>
+<div class="ja">
+<p><b>確定していること (直接実験で確認済み):</b></p>
+<ul>
+<li>plugin 経路は<b>決定的 (byte 単位で同一)</b> な誤出力を返す。同一グラフは CPU・GPU では正しい。</li>
+<li>故障は<b>タスク選択的</b>: 多段・順序依存・算数推論は崩壊するが、短い事実応答や長距離の逐語 recall は健全。</li>
+<li>2 種類の scan アルゴリズムと 2 種類の attention カーネル prefill 経路を跨いで出力が byte 単位で一致する -- 故障を<b>カーネル選択より上流の共有コードパス</b>に局在させ、非決定的な数値ドリフトを排除する。</li>
+<li>FP8 の姉妹モデルは GPU で正答する -- 微小な数値摂動に敏感な機構を独立に排除する。</li>
+<li>失敗するプロンプトでは<b>最初の生成トークンが既に誤っている</b> -- 故障は数ステップの decode を経てからでなく、prefill/logit の時点で既に見えている。</li>
+</ul>
+<p><b>未解決 (確定していないこと):</b></p>
+<ul>
+<li>その共有パスの<b>どの部品か</b>。以下の各無罪実験は、実際の失敗構成 (plugin frontend・52 層・MoE・自己回帰 decode) に対して 2 つ以上の変数を同時に変えている。そのため full-graph コンパイルを含め、どの段も妥当に「排除」も「有罪」もできていない。交絡の詳細は 2 節、有効な候補ランキングは 2b 節、次の決定実験は 4 節を参照。</li>
+</ul>
+</div>
+</div>
+
+<h2 class="en">1. The system: what runs where</h2>
+<h2 class="ja">1. 全体像 -- 何がどこで動くか</h2>
+<p class="en">NemotronH interleaves three layer types across 52 layers and carries positional information only through the Mamba2 recurrence (NoPE — no explicit positional encoding such as RoPE). The diagram below is the key piece of evidence in this whole investigation: the same model, same weights, and same input are pushed through four execution paths. Two of those paths run on the exact same hardware and the exact same neuronx-cc compiler version — yet only one of them breaks.</p>
+<p class="ja">NemotronH は 52 層にわたって 3 種類の層を交互に配置し、位置情報は Mamba2 の再帰計算だけが運ぶ（NoPE = RoPE 等の明示的な位置エンコーディングを持たない）。下の図はこの調査全体で最も重要な証拠。同じモデル・同じ重み・同じ入力を 4 つの実行経路に通した。うち 2 つは全く同じハードウェア・全く同じ neuronx-cc の版で動くのに、片方だけが崩壊する。</p>
+
+<div class="diagram-wrap en"><svg viewBox="0 0 1000 460" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Helvetica,Arial,sans-serif">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1a8f66"/>
+  </marker>
+  <marker id="arrowred" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#b23b3b"/>
+  </marker>
+</defs>
+<rect x="0" y="0" width="1000" height="460" rx="0" ry="0" fill="#f4faf7" stroke="none" stroke-width="1.5"/>
+<text x="500.0" y="28.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="19" font-weight="800" fill="#0b3d2e">
+<tspan x="500.0" dy="0">NemotronH -- 52-layer hybrid decoder</tspan>
+</text>
+<text x="500.0" y="50.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#1a8f66">
+<tspan x="500.0" dy="0">23 Mamba2 (M)  +  23 MoE (E)  +  6 Attention (*)   --   NoPE (no positional encoding)</tspan>
+</text>
+<text x="500.0" y="68.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#5a6b64">
+<tspan x="500.0" dy="0">same weights  *  same input  *  same greedy decoding, everywhere below</tspan>
+</text>
+<rect x="15" y="90" width="205" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="117.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="117.5" dy="0">CPU reference</tspan>
+</text>
+<rect x="15" y="134" width="205" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="117.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="117.5" dy="0">Pure PyTorch</tspan>
+<tspan x="117.5" dy="14">no custom kernels</tspan>
+</text>
+<line x1="117.5" y1="178" x2="117.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="15" y="200" width="205" height="62" rx="8" ry="8" fill="#eafaf2" stroke="#12805c" stroke-width="2.2"/>
+<text x="117.5" y="217.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#0b3d2e">
+<tspan x="117.5" dy="0">CORRECT</tspan>
+</text>
+<text x="117.5" y="231.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="117.5" dy="0">matches the HF reference;</tspan>
+<tspan x="117.5" dy="13">answers arithmetic correctly</tspan>
+</text>
+<rect x="250" y="90" width="225" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="362.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="362.5" dy="0">GPU (CUDA, vLLM)</tspan>
+</text>
+<rect x="250" y="134" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="362.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="362.5" dy="0">bf16</tspan>
+<tspan x="362.5" dy="14">same weights</tspan>
+</text>
+<line x1="362.5" y1="178" x2="362.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="250" y="200" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="362.5" y="215.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="362.5" dy="0">FP8</tspan>
+<tspan x="362.5" dy="14">lower precision, sibling model</tspan>
+</text>
+<line x1="362.5" y1="244" x2="362.5" y2="266" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="250" y="266" width="225" height="62" rx="8" ry="8" fill="#eafaf2" stroke="#12805c" stroke-width="2.2"/>
+<text x="362.5" y="283.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#0b3d2e">
+<tspan x="362.5" dy="0">CORRECT</tspan>
+</text>
+<text x="362.5" y="297.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="362.5" dy="0">GSM8K 0.875 (bf16)</tspan>
+<tspan x="362.5" dy="13">GSM8K 0.70 (FP8)</tspan>
+</text>
+<rect x="500" y="90" width="225" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="612.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="612.5" dy="0">Trainium -- standard compile</tspan>
+</text>
+<rect x="500" y="134" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="612.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="612.5" dy="0">torch_neuronx.trace</tspan>
+<tspan x="612.5" dy="14">standard AOT frontend (jit trace -&gt; HLO)</tspan>
+</text>
+<line x1="612.5" y1="178" x2="612.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="500" y="200" width="225" height="40" rx="8" ry="8" fill="#fdf4ea" stroke="#b5651d" stroke-width="1.5"/>
+<text x="612.5" y="213.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#7a3d0f">
+<tspan x="612.5" dy="0">neuronx-cc 2.31</tspan>
+<tspan x="612.5" dy="14">(production)</tspan>
+</text>
+<line x1="612.5" y1="240" x2="612.5" y2="262" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="500" y="262" width="225" height="62" rx="8" ry="8" fill="#eafaf2" stroke="#12805c" stroke-width="2.2"/>
+<text x="612.5" y="279.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#0b3d2e">
+<tspan x="612.5" dy="0">CORRECT</tspan>
+</text>
+<text x="612.5" y="293.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="612.5" dy="0">cosine 0.9999 vs CPU</tspan>
+<tspan x="612.5" dy="13">same top token</tspan>
+</text>
+<rect x="760" y="90" width="225" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="872.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="872.5" dy="0">Trainium -- vLLM Neuron plugin</tspan>
+</text>
+<rect x="760" y="134" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="872.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="872.5" dy="0">torch.compile</tspan>
+<tspan x="872.5" dy="14">backend = vllm_neuron</tspan>
+</text>
+<line x1="872.5" y1="178" x2="872.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="760" y="200" width="225" height="40" rx="8" ry="8" fill="#fdf4ea" stroke="#b5651d" stroke-width="1.5"/>
+<text x="872.5" y="213.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#7a3d0f">
+<tspan x="872.5" dy="0">neuronx-cc 2.31 / 2.32</tspan>
+<tspan x="872.5" dy="14">same binary, plugin&#x27;s own flags</tspan>
+</text>
+<line x1="872.5" y1="240" x2="872.5" y2="262" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="760" y="262" width="225" height="62" rx="8" ry="8" fill="#fdeceb" stroke="#b23b3b" stroke-width="2.2"/>
+<text x="872.5" y="279.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#7a1f1f">
+<tspan x="872.5" dy="0">BROKEN</tspan>
+</text>
+<text x="872.5" y="293.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#7a1f1f">
+<tspan x="872.5" dy="0">GSM8K 0.000</tspan>
+<tspan x="872.5" dy="13">multi-step reasoning fails</tspan>
+</text>
+<line x1="729" y1="220.0" x2="756" y2="220.0" stroke="#b5651d" stroke-width="1.6" stroke-dasharray="4,4"/>
+<text x="742.5" y="210.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#b5651d">
+<tspan x="742.5" dy="0">identical compiler binary</tspan>
+</text>
+<text x="500.0" y="375.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="600" fill="#0b3d2e">
+<tspan x="500.0" dy="0">Lanes 1-2 show the model itself is not numerically fragile, at bf16 or even lower (FP8) precision.</tspan>
+<tspan x="500.0" dy="15">Lanes 3-4 share the identical compiler binary and hardware, yet only lane 4 breaks -- pointing at the</tspan>
+<tspan x="500.0" dy="15">plugin&#x27;s own path (frontend / compile / runtime state), not the compiler binary or the hardware.</tspan>
+</text>
+<text x="500.0" y="422.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="600" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">Note: lane 3 was measured on a layer-truncated, dense (no-MoE) sibling model, not the full 52-layer MoE</tspan>
+<tspan x="500.0" dy="13">model -- see Section 2 for exactly which variables differ between every test and the real failure.</tspan>
+</text>
+</svg>
+</div>
+<div class="diagram-wrap ja"><svg viewBox="0 0 1000 460" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Helvetica,Arial,sans-serif">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1a8f66"/>
+  </marker>
+  <marker id="arrowred" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#b23b3b"/>
+  </marker>
+</defs>
+<rect x="0" y="0" width="1000" height="460" rx="0" ry="0" fill="#f4faf7" stroke="none" stroke-width="1.5"/>
+<text x="500.0" y="28.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="19" font-weight="800" fill="#0b3d2e">
+<tspan x="500.0" dy="0">NemotronH -- 52層ハイブリッドデコーダ</tspan>
+</text>
+<text x="500.0" y="50.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="12.5" font-weight="600" fill="#1a8f66">
+<tspan x="500.0" dy="0">Mamba2 23層 (M)  +  MoE 23層 (E)  +  Attention 6層 (*)   --   NoPE(位置エンコーディング無し)</tspan>
+</text>
+<text x="500.0" y="68.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#5a6b64">
+<tspan x="500.0" dy="0">以下すべて同じ重み・同じ入力・同じ greedy decoding</tspan>
+</text>
+<rect x="15" y="90" width="205" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="117.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="117.5" dy="0">CPU 参照</tspan>
+</text>
+<rect x="15" y="134" width="205" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="117.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="117.5" dy="0">純粋な PyTorch</tspan>
+<tspan x="117.5" dy="14">カスタムカーネル無し</tspan>
+</text>
+<line x1="117.5" y1="178" x2="117.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="15" y="200" width="205" height="62" rx="8" ry="8" fill="#eafaf2" stroke="#12805c" stroke-width="2.2"/>
+<text x="117.5" y="217.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#0b3d2e">
+<tspan x="117.5" dy="0">正しい</tspan>
+</text>
+<text x="117.5" y="231.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="117.5" dy="0">HF リファレンスと一致し</tspan>
+<tspan x="117.5" dy="13">算数も正答</tspan>
+</text>
+<rect x="250" y="90" width="225" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="362.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="362.5" dy="0">GPU (CUDA, vLLM)</tspan>
+</text>
+<rect x="250" y="134" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="362.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="362.5" dy="0">bf16</tspan>
+<tspan x="362.5" dy="14">同一重み</tspan>
+</text>
+<line x1="362.5" y1="178" x2="362.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="250" y="200" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="362.5" y="215.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="362.5" dy="0">FP8</tspan>
+<tspan x="362.5" dy="14">低精度・姉妹モデル</tspan>
+</text>
+<line x1="362.5" y1="244" x2="362.5" y2="266" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="250" y="266" width="225" height="62" rx="8" ry="8" fill="#eafaf2" stroke="#12805c" stroke-width="2.2"/>
+<text x="362.5" y="283.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#0b3d2e">
+<tspan x="362.5" dy="0">正しい</tspan>
+</text>
+<text x="362.5" y="297.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="362.5" dy="0">GSM8K 0.875 (bf16)</tspan>
+<tspan x="362.5" dy="13">GSM8K 0.70 (FP8)</tspan>
+</text>
+<rect x="500" y="90" width="225" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="612.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="612.5" dy="0">Trainium -- 標準コンパイル経路</tspan>
+</text>
+<rect x="500" y="134" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="612.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="612.5" dy="0">torch_neuronx.trace</tspan>
+<tspan x="612.5" dy="14">標準 AOT フロントエンド (jit trace→HLO)</tspan>
+</text>
+<line x1="612.5" y1="178" x2="612.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="500" y="200" width="225" height="40" rx="8" ry="8" fill="#fdf4ea" stroke="#b5651d" stroke-width="1.5"/>
+<text x="612.5" y="213.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#7a3d0f">
+<tspan x="612.5" dy="0">neuronx-cc 2.31</tspan>
+<tspan x="612.5" dy="14">(production)</tspan>
+</text>
+<line x1="612.5" y1="240" x2="612.5" y2="262" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="500" y="262" width="225" height="62" rx="8" ry="8" fill="#eafaf2" stroke="#12805c" stroke-width="2.2"/>
+<text x="612.5" y="279.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#0b3d2e">
+<tspan x="612.5" dy="0">正しい</tspan>
+</text>
+<text x="612.5" y="293.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="612.5" dy="0">CPU と cosine 0.9999</tspan>
+<tspan x="612.5" dy="13">top token 一致</tspan>
+</text>
+<rect x="760" y="90" width="225" height="30" rx="6" ry="6" fill="#0b3d2e" stroke="none" stroke-width="1.5"/>
+<text x="872.5" y="105.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="700" fill="#ffffff">
+<tspan x="872.5" dy="0">Trainium -- vLLM Neuron plugin</tspan>
+</text>
+<rect x="760" y="134" width="225" height="44" rx="8" ry="8" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.5"/>
+<text x="872.5" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#123a5c">
+<tspan x="872.5" dy="0">torch.compile</tspan>
+<tspan x="872.5" dy="14">backend = vllm_neuron</tspan>
+</text>
+<line x1="872.5" y1="178" x2="872.5" y2="200" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="760" y="200" width="225" height="40" rx="8" ry="8" fill="#fdf4ea" stroke="#b5651d" stroke-width="1.5"/>
+<text x="872.5" y="213.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11" font-weight="700" fill="#7a3d0f">
+<tspan x="872.5" dy="0">neuronx-cc 2.31 / 2.32</tspan>
+<tspan x="872.5" dy="14">同一バイナリ・plugin 独自フラグ</tspan>
+</text>
+<line x1="872.5" y1="240" x2="872.5" y2="262" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="760" y="262" width="225" height="62" rx="8" ry="8" fill="#fdeceb" stroke="#b23b3b" stroke-width="2.2"/>
+<text x="872.5" y="279.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="14" font-weight="800" fill="#7a1f1f">
+<tspan x="872.5" dy="0">崩壊</tspan>
+</text>
+<text x="872.5" y="293.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#7a1f1f">
+<tspan x="872.5" dy="0">GSM8K 0.000</tspan>
+<tspan x="872.5" dy="13">多段推論が失敗</tspan>
+</text>
+<line x1="729" y1="220.0" x2="756" y2="220.0" stroke="#b5651d" stroke-width="1.6" stroke-dasharray="4,4"/>
+<text x="742.5" y="210.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#b5651d">
+<tspan x="742.5" dy="0">同一コンパイラバイナリ</tspan>
+</text>
+<text x="500.0" y="375.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="11.5" font-weight="600" fill="#0b3d2e">
+<tspan x="500.0" dy="0">レーン 1-2 は、モデル自体が bf16 でもより低精度な FP8 でも数値的に脆弱でないことを示す。</tspan>
+<tspan x="500.0" dy="15">レーン 3-4 は同一コンパイラバイナリ・同一ハードで動くのに、レーン4だけが崩壊する --</tspan>
+<tspan x="500.0" dy="15">差分はコンパイラバイナリでもハードでもなく、plugin 自身の経路 (frontend/compile/runtime state) を指す。</tspan>
+</text>
+<text x="500.0" y="422.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="600" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">注: レーン3は 52層 MoE フルモデルでなく、層を truncate した dense (MoE無し) sibling で測定した --</tspan>
+<tspan x="500.0" dy="13">各テストと実際の失敗構成の間で何が違うかは 2 節を参照。</tspan>
+</text>
+</svg>
+</div>
+
+<h3 class="en">Symptom profile — what breaks and what does not</h3>
+<h3 class="ja">症状プロファイル -- 何が壊れ、何が壊れないか</h3>
+<table>
+<tr>
+  <th><span class="en">Task</span><span class="ja">タスク</span></th>
+  <th><span class="en">On Trainium (via the plugin)</span><span class="ja">Trainium (plugin 経由)</span></th>
+</tr>
+<tr>
+  <td><span class="en">Short factual completion (e.g. "The capital of France is")</span><span class="ja">短い事実応答 (例: "The capital of France is")</span></td>
+  <td><span class="ok en">correct</span><span class="ok ja">正しい</span></td>
+</tr>
+<tr>
+  <td><span class="en">Long-range verbatim recall (~400 tokens back)</span><span class="ja">長距離の逐語 recall (~400 トークン前方)</span></td>
+  <td><span class="ok en">correct</span><span class="ok ja">正しい</span></td>
+</tr>
+<tr>
+  <td><span class="en">Transitive comparison ("A &gt; B, B &gt; C, heaviest is...")</span><span class="ja">推移比較 ("A&gt;B, B&gt;C, 最も重いのは...")</span></td>
+  <td><span class="en">wrong on SDK 2.31, <span class="ok">correct</span> on 2.32</span><span class="ja">2.31 で誤り、2.32 で <span class="ok">正しい</span></span></td>
+</tr>
+<tr>
+  <td><span class="en">Factual question with a neutral preamble</span><span class="ja">中立な前置き付きの事実質問</span></td>
+  <td><span class="en">intermittent on 2.31, <span class="ok">correct at all lengths</span> on 2.32</span><span class="ja">2.31 で間欠的に失敗、2.32 で<span class="ok">全長で正しい</span></span></td>
+</tr>
+<tr>
+  <td><span class="en">2-hop arithmetic ("Bob has 3 apples, Alice has twice as many...")</span><span class="ja">2-hop 算数 ("Bob has 3 apples, Alice has twice as many...")</span></td>
+  <td><span class="bad en">wrong on both 2.31 and 2.32</span><span class="bad ja">2.31・2.32 とも誤り</span></td>
+</tr>
+<tr>
+  <td><span class="en">GSM8K 5-shot (matched config: 5-shot, greedy, limit 40)</span><span class="ja">GSM8K 5-shot (同一構成: 5-shot・greedy・limit 40)</span></td>
+  <td><span class="bad en">0.000 on 2.31 -- vs GPU (same weights, same config) 0.875</span><span class="bad ja">2.31 で 0.000 -- 同一構成の GPU (同一重み) は 0.875</span></td>
+</tr>
+</table>
+<p class="small mut en">Pattern: fluent generation, healthy recall and factual answers, but a selective loss of multi-step / order-dependent reasoning. This is not "the model got dumber" in a generic sense -- specific capabilities disappear while others stay intact.</p>
+<p class="small mut ja">傾向: 生成は流暢で recall や事実応答は健全なまま、多段・順序依存の推論だけが選択的に失われる。全般的に「モデルが劣化した」のではなく、特定の能力だけが消える不自然な壊れ方。</p>
+
+<hr>
+
+<h2 class="en">2. The elimination path</h2>
+<h2 class="ja">2. 犯人特定までの消去法</h2>
+<p class="en">Every plausible suspect was tested directly, one at a time. Each individual test came back clean -- but, as the annotations below make explicit, every one of those tests also changed at least one other variable versus the real failing configuration (the plugin&#x27;s own frontend, 52 layers, MoE, autoregressive decode). That means the chain below is <b>not</b> a valid elimination proof for any single stage; what it validly establishes is only the two terminal boxes (fault above kernel selection; component still open). See &sect;2b for how the remaining candidates rank against all the evidence, and &sect;2c for a mechanism this investigation proposed and then rejected using its own data.</p>
+<p class="ja">考えられる容疑者を一つずつ直接実験にかけた。個々のテストはいずれも「無罪」で返ってきたが、下の各注記が示す通り、そのテストはいずれも実際の失敗構成 (plugin 自身の frontend・52層・MoE・自己回帰 decode) に対して他の変数も同時に変えている。つまり以下のチェーンは、どの単一段に対しても<b>妥当な消去法の証明ではない</b>。妥当に確定しているのは終端の 2 つのボックス (故障はカーネル選択より上流／部品は未解決) のみ。残る候補の証拠との整合度は 2b 節、提案してから自ら却下した機構は 2c 節を参照。</p>
+
+<div class="diagram-wrap en"><svg viewBox="0 0 1000 1426.5" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Helvetica,Arial,sans-serif">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1a8f66"/>
+  </marker>
+  <marker id="arrowred" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#b23b3b"/>
+  </marker>
+</defs>
+<rect x="0" y="0" width="1000" height="1426.5" rx="0" ry="0" fill="#f4faf7" stroke="none" stroke-width="1.5"/>
+<text x="500.0" y="26.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="19" font-weight="800" fill="#0b3d2e">
+<tspan x="500.0" dy="0">Elimination path -- and where it stops</tspan></text>
+<text x="500.0" y="48.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#5a6b64">
+<tspan x="500.0" dy="0">solid border = confirmed by a direct experiment</tspan></text>
+<text x="500.0" y="62.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#5a6b64">
+<tspan x="500.0" dy="0">dashed border = strong inference (supported, not fully isolated)</tspan></text>
+<text x="500.0" y="76.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#5a6b64">
+<tspan x="500.0" dy="0">dotted border = open question (not yet answered)</tspan></text>
+<rect x="140" y="130.0" width="720" height="72.0" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="139.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="146.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">Model implementation / weights</tspan></text>
+<text x="500.0" y="163.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">CPU execution (pure PyTorch) matches the HF reference;</tspan>
+<tspan x="500.0" dy="13.5">the same code answers the arithmetic prompt correctly on CPU.</tspan>
+</text>
+<line x1="500.0" y1="202.0" x2="500.0" y2="226.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="226.0" width="720" height="72.0" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="235.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="245.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="242.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">bf16 numeric precision itself</tspan></text>
+<text x="500.0" y="259.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">Same bf16 weights score GSM8K 0.875 on GPU; a LOWER-precision</tspan>
+<tspan x="500.0" dy="13.5">FP8 variant also answers correctly (0.70) on GPU.</tspan>
+</text>
+<line x1="500.0" y1="298.0" x2="500.0" y2="322.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="322.0" width="720" height="85.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="331.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="341.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="338.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">A single operator's precision</tspan></text>
+<text x="500.0" y="355.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">7 independent fp32-upcast workarounds (MoE combine, SSD scan,</tspan>
+<tspan x="500.0" dy="13.5">relu², Mamba pre-scan, attention, int64 downcast) left the</tspan>
+<tspan x="500.0" dy="13.5">broken output byte-identical.</tspan>
+</text>
+<line x1="500.0" y1="407.5" x2="500.0" y2="431.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="431.5" width="720" height="85.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="440.5" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="450.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="447.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">Trainium hardware itself</tspan></text>
+<text x="500.0" y="464.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">Same hardware/compiler serves pure-Transformer models correctly;</tspan>
+<tspan x="500.0" dy="13.5">a software-only SDK upgrade (2.31→2.32) fixed most symptoms</tspan>
+<tspan x="500.0" dy="13.5">with zero hardware change.</tspan>
+</text>
+<line x1="500.0" y1="517.0" x2="500.0" y2="541.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="541.0" width="720" height="103.0" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="550.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="560.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="557.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">neuronx-cc compiler version (2.31)</tspan></text>
+<text x="500.0" y="574.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">Recompiling the same hybrid graph through a different, standard</tspan>
+<tspan x="500.0" dy="13.5">AOT frontend (torch_neuronx.trace) on the IDENTICAL neuronx-cc</tspan>
+<tspan x="500.0" dy="13.5">2.31 matches CPU almost exactly (cosine 0.999896).</tspan>
+</text>
+<text x="500.0" y="620.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">Confound: tested via a different frontend, on a 16-layer, dense (no-MoE) sibling, single forward pass -- not the plugin's own frontend, not 52 layers, not MoE, not decode.</tspan></text>
+<line x1="500.0" y1="644.0" x2="500.0" y2="668.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="668.0" width="720" height="89.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="677.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="687.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="684.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">The plugin's custom compiler flags</tspan></text>
+<text x="500.0" y="701.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">Re-tracing with the plugin's exact flags changed nothing --</tspan>
+<tspan x="500.0" dy="13.5">cosine 0.999896, identical to the default-flags control.</tspan>
+</text>
+<text x="500.0" y="734.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">Confound: same as above -- still the standard trace frontend, the truncated dense sibling, a single forward pass.</tspan></text>
+<line x1="500.0" y1="757.5" x2="500.0" y2="781.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="781.5" width="720" height="103.0" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="790.5" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="800.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="797.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">Mamba2 chunked-scan kernel</tspan></text>
+<text x="500.0" y="814.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">Standalone compiled test with a proper noise-floor comparison:</tspan>
+<tspan x="500.0" dy="13.5">on-device error is AT OR BELOW inherent bf16 rounding noise</tspan>
+<tspan x="500.0" dy="13.5">(ratio ~0.8).</tspan>
+</text>
+<text x="500.0" y="861.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">Confound: the kernel alone, outside the full model graph, one invocation -- not integrated, not decode.</tspan></text>
+<line x1="500.0" y1="884.5" x2="500.0" y2="908.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="908.5" width="720" height="89.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="917.5" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="927.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="924.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">MoE router (single layer)</tspan></text>
+<text x="500.0" y="941.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">Standalone compiled test: picks the IDENTICAL top-6 experts as</tspan>
+<tspan x="500.0" dy="13.5">CPU for all 256 tokens tested (0 mismatches).</tspan>
+</text>
+<text x="500.0" y="974.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">Confound: the router alone, outside dispatch/combine and outside the full model -- never tested as a complete MoE layer.</tspan></text>
+<line x1="500.0" y1="998.0" x2="500.0" y2="1022.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="1022.0" width="720" height="89.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="1031.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="1041.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="1038.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">Attention kernel</tspan></text>
+<text x="500.0" y="1055.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">Swapped for a plain fp32 reference implementation inside the</tspan>
+<tspan x="500.0" dy="13.5">actual plugin path; the broken output did not change.</tspan>
+</text>
+<text x="500.0" y="1088.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">Caveat: shows attention is not the SOLE cause -- it does not prove the attention lowering itself is faithful.</tspan></text>
+<line x1="500.0" y1="1111.5" x2="500.0" y2="1135.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="1135.5" width="720" height="118.5" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="2.2" stroke-dasharray="6,4"/>
+<text x="500.0" y="1156.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13.5" font-weight="800" fill="#0b3d2e">
+<tspan x="500.0" dy="0">STRONG INFERENCE: the fault sits above kernel selection</tspan></text>
+<text x="500.0" y="1175.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="500.0" dy="0">The wrong output is byte-identical across two different SSM-scan algorithms and</tspan>
+<tspan x="500.0" dy="13.5">two different attention-kernel prefill paths -- ruling out non-deterministic drift</tspan>
+<tspan x="500.0" dy="13.5">and pointing above kernel selection (plugin frontend / compiler passes / runtime</tspan>
+<tspan x="500.0" dy="13.5">state management / weight staging). The FP8-on-GPU result independently rules</tspan>
+<tspan x="500.0" dy="13.5">out small-perturbation mechanisms (such as expert-selection flips).</tspan>
+</text>
+<rect x="712.4" y="1144.5" width="129.6" height="18" rx="9" ry="9" fill="#fdf0e0" stroke="#b5651d" stroke-width="1.2"/>
+<text x="777.1999999999999" y="1153.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9" font-weight="800" fill="#7a3d0f">
+<tspan x="777.1999999999999" dy="0">STRONG INFERENCE</tspan></text>
+<line x1="500.0" y1="1254.0" x2="500.0" y2="1278.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="1278.0" width="720" height="118.5" rx="10" ry="10" fill="#fff8ec" stroke="#b5651d" stroke-width="2.2" stroke-dasharray="3,4"/>
+<text x="500.0" y="1299.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13.5" font-weight="800" fill="#7a3d0f">
+<tspan x="500.0" dy="0">OPEN: which component in that shared path -- not yet isolated</tspan></text>
+<text x="500.0" y="1318.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#7a3d0f">
+<tspan x="500.0" dy="0">Every exonerating experiment above changed two or more variables at once versus</tspan>
+<tspan x="500.0" dy="13.5">the real failure (plugin frontend, 52 layers, MoE, autoregressive decode). No single</tspan>
+<tspan x="500.0" dy="13.5">stage -- including full-graph compilation -- has therefore been validly eliminated</tspan>
+<tspan x="500.0" dy="13.5">or convicted. See §2b for the ranked live candidates and §2c for the rejected</tspan>
+<tspan x="500.0" dy="13.5">mechanism, and §4 for the next decisive experiments.</tspan>
+</text>
+<rect x="791.6" y="1287.0" width="50.4" height="18" rx="9" ry="9" fill="#fdf0e0" stroke="#b5651d" stroke-width="1.2"/>
+<text x="816.8000000000001" y="1296.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9" font-weight="800" fill="#7a3d0f">
+<tspan x="816.8000000000001" dy="0">OPEN</tspan></text>
+</svg></div>
+<div class="diagram-wrap ja"><svg viewBox="0 0 1000 1399.5" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Helvetica,Arial,sans-serif">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1a8f66"/>
+  </marker>
+  <marker id="arrowred" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#b23b3b"/>
+  </marker>
+</defs>
+<rect x="0" y="0" width="1000" height="1399.5" rx="0" ry="0" fill="#f4faf7" stroke="none" stroke-width="1.5"/>
+<text x="500.0" y="26.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="19" font-weight="800" fill="#0b3d2e">
+<tspan x="500.0" dy="0">犯人特定の消去法 -- そしてどこで止まったか</tspan></text>
+<text x="500.0" y="48.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#5a6b64">
+<tspan x="500.0" dy="0">実線 = 直接実験で確認済み</tspan></text>
+<text x="500.0" y="62.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#5a6b64">
+<tspan x="500.0" dy="0">破線 = 強い推論 (根拠はあるが完全には単離できていない)</tspan></text>
+<text x="500.0" y="76.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#5a6b64">
+<tspan x="500.0" dy="0">点線 = 未解決の問い (まだ答えが出ていない)</tspan></text>
+<rect x="140" y="130.0" width="720" height="72.0" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="139.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="149.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="146.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">モデル実装 / 重み</tspan></text>
+<text x="500.0" y="163.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">CPU 実行 (純粋な PyTorch) は HF リファレンスと一致し、</tspan>
+<tspan x="500.0" dy="13.5">同じコードが CPU 上で算数プロンプトに正答する。</tspan>
+</text>
+<line x1="500.0" y1="202.0" x2="500.0" y2="226.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="226.0" width="720" height="72.0" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="235.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="245.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="242.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">bf16 数値精度そのもの</tspan></text>
+<text x="500.0" y="259.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">同じ bf16 重みが GPU で GSM8K 0.875。より低精度な</tspan>
+<tspan x="500.0" dy="13.5">FP8 版も GPU で正答 (0.70)。</tspan>
+</text>
+<line x1="500.0" y1="298.0" x2="500.0" y2="322.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="322.0" width="720" height="85.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="331.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="341.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="338.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">単一演算の精度</tspan></text>
+<text x="500.0" y="355.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">7 通りの独立した fp32 化 (MoE combine・SSD scan・relu²・</tspan>
+<tspan x="500.0" dy="13.5">Mamba 前処理・attention・int64 downcast) を試しても、</tspan>
+<tspan x="500.0" dy="13.5">崩れた出力は byte 単位で不変。</tspan>
+</text>
+<line x1="500.0" y1="407.5" x2="500.0" y2="431.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="431.5" width="720" height="85.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="440.5" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="450.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="447.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">Trainium ハードそのもの</tspan></text>
+<text x="500.0" y="464.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">同一ハード/コンパイラが純粋 Transformer 系モデルは正しく動かす。</tspan>
+<tspan x="500.0" dy="13.5">ソフトのみの SDK 更新 (2.31→2.32) がハード変更ゼロで</tspan>
+<tspan x="500.0" dy="13.5">大半の症状を改善した。</tspan>
+</text>
+<line x1="500.0" y1="517.0" x2="500.0" y2="541.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="541.0" width="720" height="103.0" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="550.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="560.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="557.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">neuronx-cc コンパイラの版 (2.31)</tspan></text>
+<text x="500.0" y="574.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">同一の hybrid グラフを、別の標準 AOT フロントエンド</tspan>
+<tspan x="500.0" dy="13.5">(torch_neuronx.trace) で、同一の neuronx-cc 2.31 に通すと</tspan>
+<tspan x="500.0" dy="13.5">CPU とほぼ完全一致 (cosine 0.999896)。</tspan>
+</text>
+<text x="500.0" y="620.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">交絡: 別フロントエンド・16層・dense (MoE無し)・単一 forward で測定 -- plugin 自身のフロントエンドでも52層でもMoE有りでもdecodeでもない。</tspan></text>
+<line x1="500.0" y1="644.0" x2="500.0" y2="668.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="668.0" width="720" height="89.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="677.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="687.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="684.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">plugin 独自のコンパイラフラグ</tspan></text>
+<text x="500.0" y="701.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">plugin と同じフラグで再 trace しても変化なし --</tspan>
+<tspan x="500.0" dy="13.5">cosine 0.999896、デフォルトフラグの対照と同一。</tspan>
+</text>
+<text x="500.0" y="734.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">交絡: 上記と同じ -- 依然として標準 trace フロントエンド・truncate した dense sibling・単一 forward。</tspan></text>
+<line x1="500.0" y1="757.5" x2="500.0" y2="781.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="781.5" width="720" height="89.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="790.5" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="800.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="797.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">Mamba2 chunked-scan カーネル</tspan></text>
+<text x="500.0" y="814.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">カーネル単体をコンパイルし、適正なノイズフロア比較で検証:</tspan>
+<tspan x="500.0" dy="13.5">device 誤差は固有の bf16 丸め誤差以下 (ratio ~0.8)。</tspan>
+</text>
+<text x="500.0" y="847.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">交絡: full モデルグラフの外でカーネル単体・1回の呼び出し -- 統合されておらず decode でもない。</tspan></text>
+<line x1="500.0" y1="871.0" x2="500.0" y2="895.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="895.0" width="720" height="89.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="904.0" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="914.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="911.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">MoE router (単層)</tspan></text>
+<text x="500.0" y="928.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">単体コンパイルテスト: 検証した 256 トークン全てで</tspan>
+<tspan x="500.0" dy="13.5">CPU と同一の top-6 experts を選択 (不一致 0)。</tspan>
+</text>
+<text x="500.0" y="961.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">交絡: router 単体のみで dispatch/combine の外・full モデルの外 -- 完全な MoE 層としては未検証。</tspan></text>
+<line x1="500.0" y1="984.5" x2="500.0" y2="1008.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="1008.5" width="720" height="89.5" rx="9" ry="9" fill="#eaf3fb" stroke="#2b8ac6" stroke-width="1.6"/>
+<rect x="742" y="1017.5" width="100" height="20" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="1.3"/>
+<text x="792.0" y="1027.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="800" fill="#0b3d2e">
+<tspan x="792.0" dy="0">INNOCENT</tspan></text>
+<text x="500.0" y="1024.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13" font-weight="800" fill="#123a5c">
+<tspan x="500.0" dy="0">Attention カーネル</tspan></text>
+<text x="500.0" y="1041.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10.5" font-weight="500" fill="#33544a">
+<tspan x="500.0" dy="0">実際の plugin 経路の中で、素の fp32 参照実装に置換しても</tspan>
+<tspan x="500.0" dy="13.5">崩れた出力は変化しなかった。</tspan>
+</text>
+<text x="500.0" y="1074.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9.5" font-weight="700" fill="#a85a1a" font-style="italic">
+<tspan x="500.0" dy="0">留保: attention が唯一の原因でないことは示すが、attention の lowering 自体が忠実である証明にはならない。</tspan></text>
+<line x1="500.0" y1="1098.0" x2="500.0" y2="1122.0" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="1122.0" width="720" height="118.5" rx="10" ry="10" fill="#eafaf2" stroke="#12805c" stroke-width="2.2" stroke-dasharray="6,4"/>
+<text x="500.0" y="1143.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13.5" font-weight="800" fill="#0b3d2e">
+<tspan x="500.0" dy="0">強い推論: 故障はカーネル選択より上流の共有コードパスにある</tspan></text>
+<text x="500.0" y="1162.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#0b3d2e">
+<tspan x="500.0" dy="0">誤出力は 2 種類の SSM-scan アルゴリズムと 2 種類の attention カーネルの prefill 経路</tspan>
+<tspan x="500.0" dy="13.5">を跨いで byte 単位で一致する -- 非決定的なドリフトを排除し、カーネル選択より上流</tspan>
+<tspan x="500.0" dy="13.5">(plugin frontend / compiler passes / runtime state 管理 / weight staging) を指す。</tspan>
+<tspan x="500.0" dy="13.5">FP8-on-GPU の結果は、微小摂動に敏感な機構 (expert 選択の flip 等) を</tspan>
+<tspan x="500.0" dy="13.5">独立に排除する。</tspan>
+</text>
+<rect x="791.6" y="1131.0" width="50.4" height="18" rx="9" ry="9" fill="#fdf0e0" stroke="#b5651d" stroke-width="1.2"/>
+<text x="816.8000000000001" y="1140.0" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9" font-weight="800" fill="#7a3d0f">
+<tspan x="816.8000000000001" dy="0">強い推論</tspan></text>
+<line x1="500.0" y1="1240.5" x2="500.0" y2="1264.5" stroke="#1a8f66" stroke-width="2" marker-end="url(#arrow)"/>
+<rect x="140" y="1264.5" width="720" height="105.0" rx="10" ry="10" fill="#fff8ec" stroke="#b5651d" stroke-width="2.2" stroke-dasharray="3,4"/>
+<text x="500.0" y="1285.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="13.5" font-weight="800" fill="#7a3d0f">
+<tspan x="500.0" dy="0">未解決: その共有パスの中のどの部品か -- まだ単離できていない</tspan></text>
+<text x="500.0" y="1304.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="10" font-weight="600" fill="#7a3d0f">
+<tspan x="500.0" dy="0">上記の無罪実験は全て、実際の失敗構成 (plugin frontend・52層・MoE・自己回帰 decode)</tspan>
+<tspan x="500.0" dy="13.5">に対して 2 つ以上の変数を同時に変えている。そのため full-graph コンパイルを含め、</tspan>
+<tspan x="500.0" dy="13.5">どの段も妥当に「排除」も「有罪」もできていない。有効な候補ランキングは §2b、</tspan>
+<tspan x="500.0" dy="13.5">却下した機構は §2c、次の決定実験は §4 を参照。</tspan>
+</text>
+<rect x="798.2" y="1273.5" width="43.8" height="18" rx="9" ry="9" fill="#fdf0e0" stroke="#b5651d" stroke-width="1.2"/>
+<text x="820.1" y="1282.5" text-anchor="middle" font-family="-apple-system,Helvetica,Arial,sans-serif" font-size="9" font-weight="800" fill="#7a3d0f">
+<tspan x="820.1" dy="0">未解決</tspan></text>
+</svg></div>
+
+<h3 class="en">2b. Ranked live candidates</h3>
+<h3 class="ja">2b. 有効な候補のランキング</h3>
+<p class="en">Evidence every candidate must explain: (i) byte-identical wrong output across two scan algorithms and two attention kernels, (ii) the FP8-on-GPU sibling still works, (iii) only multi-step/order-dependent reasoning fails, (iv) short completions and long-range recall survive, (v) the first generated token on a failing prompt is already wrong, (vi) an SDK upgrade partially fixed the symptom.</p>
+<p class="ja">各候補が説明すべき証拠: (i) 2 種類の scan アルゴリズムと 2 種類の attention カーネルを跨いで byte 単位で一致する誤出力、(ii) FP8 の姉妹モデルが GPU で正答する、(iii) 多段/順序依存の推論だけが失敗する、(iv) 短い応答と長距離 recall は健全、(v) 失敗するプロンプトでは最初の生成トークンが既に誤り、(vi) SDK 更新で症状が部分的に改善した。</p>
+<table>
+<tr>
+  <th>#</th>
+  <th><span class="en">Candidate</span><span class="ja">候補</span></th>
+  <th><span class="en">Explains</span><span class="ja">説明できる</span></th>
+  <th><span class="en">Fails to explain</span><span class="ja">説明できない</span></th>
+</tr>
+<tr><td>1</td><td><span class="en"><b>Prefill graph handling of the recurrent (Mamba2) state</b> -- the plugin's compiled prefill graph mishandles the SSM state it produces (wrong stride, wrong layer, dropped update)</span><span class="ja"><b>prefill グラフにおける再帰 (Mamba2) state の取り扱い</b> -- plugin のコンパイル済み prefill グラフが生成する SSM state を誤って扱う (stride 誤り・層違い・更新の欠落)</span></td><td><span class="en">(i), (ii), (v): deterministic, above kernel level, and wrong from the first token, since prefill is where NemotronH's only positional signal is produced</span><span class="ja">(i)(ii)(v): 決定的でカーネルより上流、かつ NemotronH の唯一の位置信号は prefill で生成されるため最初のトークンから誤る</span></td><td><span class="en">No positive evidence yet -- this is the untested gap, not a demonstrated cause</span><span class="ja">直接の証拠はまだ無い -- 未検証のギャップであり、実証された原因ではない</span></td></tr>
+<tr><td>2</td><td><span class="en"><b>Static-graph capture bakes wrong prefill semantics into the graph</b> -- shape/position specialization or scan-vs-step conflation at trace time</span><span class="ja"><b>静的グラフ capture が誤った prefill 意味をグラフに焼き込む</b> -- trace 時の shape/位置の specialization、または scan と step の混同</span></td><td><span class="en">Same profile as #1: deterministic, shared frontend path, consistent with (v) and (vi)</span><span class="ja">#1 と同じ症状プロファイル: 決定的・共有 frontend パス、(v)(vi) と整合</span></td><td><span class="en">Hard to distinguish from #1 without deeper plugin instrumentation; sibling hypothesis</span><span class="ja">plugin のより深い計測なしでは #1 と区別困難。兄弟仮説として扱う</span></td></tr>
+<tr><td>3</td><td><span class="en">Compiler miscompile in a shared lowering pass that touches the SSM state-update op</span><span class="ja">SSM state-update 演算に触れる共有 lowering pass の誤コンパイル</span></td><td><span class="en">(i), (ii), (vi)</span><span class="ja">(i)(ii)(vi)</span></td><td><span class="en">Byte-identical across two different scan algorithms is awkward for a lowering-level bug -- different scans should lower differently</span><span class="ja">2 種類の異なる scan アルゴリズムを跨いで byte 一致するのは lowering レベルのバグとしては不自然 -- scan が違えば lowering も違うはず</span></td></tr>
+<tr><td>4</td><td><span class="en">MoE dispatch/permute/combine index bug (never tested end-to-end, only the router's top-k in isolation)</span><span class="ja">MoE の dispatch/permute/combine の index バグ (router の top-k は単体で無罪だが、完全な MoE 層としては未検証)</span></td><td><span class="en">(i), (ii), (vi)</span><span class="ja">(i)(ii)(vi)</span></td><td><span class="en">(iii)/(iv): recall and short completions traverse the same MoE layers on the same device and survive</span><span class="ja">(iii)/(iv): recall と短文応答は同じ device 上の同じ MoE 層を通っており健全</span></td></tr>
+<tr><td>5</td><td><span class="en">Weight loading/layout defect at 52-layer scale (expert sharding, layout transposes)</span><span class="ja">52 層スケールでの weight loading/layout 不整合 (expert sharding、layout の転置)</span></td><td><span class="en">(i), (ii)</span><span class="ja">(i)(ii)</span></td><td><span class="en">(iv) badly -- corrupted weights should degrade recall and factual completions too</span><span class="ja">(iv) と強く矛盾 -- 重みが壊れていれば recall や事実応答も劣化するはず</span></td></tr>
+<tr><td>6</td><td><span class="en">KV-cache / attention decode bug</span><span class="ja">KV-cache / attention の decode バグ</span></td><td><span class="en">(i), (ii)</span><span class="ja">(i)(ii)</span></td><td><span class="en">(iv) fatally -- long-range verbatim recall requires working attention over the cache</span><span class="ja">(iv) と致命的に矛盾 -- 長距離の逐語 recall は cache 越しの attention が機能している必要がある</span></td></tr>
+</table>
+<p class="small mut en">Candidate #1 has the strongest prior (it maps structurally onto the symptom -- NemotronH is NoPE, so a corrupted prefill state loses exactly the order/position signal that only multi-step reasoning needs) but zero direct evidence: it is a hypothesis to test first, not a finding. It must also be a <i>partial</i> defect, since fully destroyed state would degrade recall too.</p>
+<p class="small mut ja">候補 #1 は事前確率が最も高い (症状に構造的に対応する -- NemotronH は NoPE なので、prefill state が壊れれば多段推論だけが必要とする順序/位置信号がまさに失われる) が、直接の証拠はゼロで、最初に検証すべき仮説であり結論ではない。また recall も壊れていない以上、state の破損は「部分的」でなければならない。</p>
+
+<h3 class="en">2c. Rejected hypothesis: compounding MoE router-selection flips</h3>
+<h3 class="ja">2c. 却下した仮説: MoE router 選択の複利的な flip</h3>
+<div class="callout warn">
+<p class="en">An earlier draft of this investigation proposed that tiny per-layer numeric differences compound across the model's 23 stacked MoE layers, flipping which experts get selected, and that this was the mechanism behind the break. <b>This mechanism is rejected</b> -- it is directly contradicted by two pieces of evidence already in this report:</p>
+<p class="ja">本調査の初期の草稿では、モデルの 23 段の MoE 層を跨いで層ごとの微小な数値差が複利的に増幅し、選ばれる expert が flip することが崩壊の機構だと結論していた。<b>この機構は却下する</b> -- 本レポート中の 2 つの証拠と直接矛盾するため。</p>
+<ul class="en">
+<li>The FP8-on-GPU sibling uses a perturbation orders of magnitude larger than bf16 rounding noise, and still answers correctly. If tiny flips in expert selection caused total failure, FP8 should be catastrophic on GPU. It is not.</li>
+<li>The wrong output is byte-identical across two scan algorithms and two attention-kernel prefill paths. Numerical noise compounding is exquisitely sensitive to summation order; changing kernels changes rounding patterns and should change the output bytes. Byte-identical failure indicates a deterministic bug in a shared path, not chaotic noise accumulation.</li>
+</ul>
+<ul class="ja">
+<li>FP8 の姉妹モデルは bf16 の丸め誤差より桁違いに大きい摂動を持つにもかかわらず GPU で正答する。微小な expert 選択の flip が全面的な崩壊を引き起こすなら、FP8 は GPU 上で破滅的になるはずだが、そうならない。</li>
+<li>誤出力は 2 種類の scan アルゴリズムと 2 種類の attention カーネル prefill 経路を跨いで byte 単位で一致する。数値ノイズの複利増幅は加算順序に極めて敏感で、カーネルを変えれば丸めパターンが変わり出力の byte も変わるはず。byte 一致の崩壊は、カオス的なノイズ蓄積ではなく共有パスの決定的バグを示す。</li>
+</ul>
+<p class="en">The supporting experiment for this mechanism -- feeding a synthetic 23-layer stack of the standalone router forward with an arbitrary coupling function and observing 8/256 token selections flip -- does not rescue it: the coupling has no relationship to the model's real inter-layer transfer function (expert MLPs, residuals, and norms typically damp perturbations rather than amplifying them arbitrarily); no CPU-vs-GPU baseline was run for the same synthetic stack, so it is unknown whether ordinary bf16 rounding differences would also flip a similar number of selections on hardware that works fine; and the experiment assumes the conclusion (that flips matter) in order to support it. It is kept here as a documented dead end, not as evidence for candidate #4 above.</p>
+<p class="ja">この機構を支持するために行った実験 -- router 単体を任意のカップリング関数で 23 段合成的にスタックし、256 トークン中 8 トークンの選択が flip するのを観測したもの -- もこれを救わない。カップリングはモデルの実際の層間伝達関数 (expert MLP・residual・norm は通常摂動を任意に増幅せず減衰させる) と無関係であり、同じ合成スタックで CPU-vs-GPU のベースラインが取られていないため通常の bf16 丸め誤差でも正常に動く GPU 上で似た数の flip が起きるかは不明であり、さらにこの実験は「flip が重要だ」という結論を前提として組まれている (循環論法)。ここでは上記候補 #4 の証拠としてではなく、記録済みの dead end として残す。</p>
+</div>
+
+<hr>
+
+<h2 class="en">3. Experiment summary</h2>
+<h2 class="ja">3. 実験サマリ</h2>
+<table>
+<tr>
+  <th><span class="en">Experiment</span><span class="ja">実験</span></th>
+  <th><span class="en">Goal</span><span class="ja">狙い</span></th>
+  <th><span class="en">Result</span><span class="ja">結果</span></th>
+  <th><span class="en">Verdict</span><span class="ja">判定</span></th>
+</tr>
+<tr>
+  <td><span class="en">CPU parity</span><span class="ja">CPU 一致検証</span></td>
+  <td><span class="en">Implementation bug, or compile/runtime bug?</span><span class="ja">実装バグか compile/runtime バグか</span></td>
+  <td><span class="en">Cosine 0.99-1.00 vs the HF reference; arithmetic answered correctly on CPU</span><span class="ja">HF リファレンスと cosine 0.99-1.00・算数も CPU で正答</span></td>
+  <td><span class="ok en">model code innocent</span><span class="ok ja">モデル実装は無罪</span></td>
+</tr>
+<tr>
+  <td><span class="en">7 independent op-level fp32 upcasts</span><span class="ja">7 通りの op 単位 fp32 化</span></td>
+  <td><span class="en">Is one operator accumulating bf16 rounding error?</span><span class="ja">特定の演算が bf16 誤差を蓄積しているか</span></td>
+  <td><span class="en">Broken output byte-identical across all 7</span><span class="ja">7 通り全てで崩れた出力が byte 単位で不変</span></td>
+  <td><span class="ok en">single-operator precision innocent</span><span class="ok ja">単一演算の精度は無罪</span></td>
+</tr>
+<tr>
+  <td><span class="en">Same-model GPU contrast</span><span class="ja">GPU 同一モデル対照</span></td>
+  <td><span class="en">Model-inherent fragility, or Trainium-specific?</span><span class="ja">モデル固有の脆弱性か Trainium 固有か</span></td>
+  <td><span class="en">GPU bf16 GSM8K 0.875, GPU FP8 (lower precision) 0.70, vs Trainium 0.000</span><span class="ja">GPU bf16 GSM8K 0.875、FP8(低精度) 0.70、対 Trainium 0.000</span></td>
+  <td><span class="bad en">decisive Trainium-specific evidence</span><span class="bad ja">Trainium 固有と決定づける証拠</span></td>
+</tr>
+<tr>
+  <td><span class="en">Operator-independence check</span><span class="ja">operator 非依存性の確認</span></td>
+  <td><span class="en">Rule out a single kernel implementation bug</span><span class="ja">単一カーネルの実装ミスを排除</span></td>
+  <td><span class="en">Two different Mamba2 scans and two different prefill paths give byte-identical wrong output</span><span class="ja">2 種類の Mamba2 scan・2 種類の prefill 経路が byte 単位で同一の誤り</span></td>
+  <td><span class="ok en">not a single-kernel bug</span><span class="ok ja">単一カーネルの問題ではない</span></td>
+</tr>
+<tr>
+  <td><span class="en">SDK upgrade 2.31 &rarr; 2.32</span><span class="ja">SDK 更新 2.31→2.32</span></td>
+  <td><span class="en">Is this fixable purely in software?</span><span class="ja">ソフト側だけで直せる問題か</span></td>
+  <td><span class="en">Probe suite 5/12 &rarr; 9/12; positional/order symptoms cleared, arithmetic still fails</span><span class="ja">probe suite 5/12→9/12。位置・順序系は解消、算数は残存</span></td>
+  <td><span class="en">software-fixable, partially fixed already</span><span class="ja">ソフトで修正可能・一部は既に改善</span></td>
+</tr>
+<tr>
+  <td><span class="en">Segmented-prefill compile time</span><span class="ja">segmented-prefill のコンパイル時間</span></td>
+  <td><span class="en">Characterize a separate regression noticed along the way</span><span class="ja">調査中に発見した別の退行を特定</span></td>
+  <td><span class="en">2.31 compiles at length 4096; 2.32 fails to come up even at length 1024 after 110+ minutes</span><span class="ja">2.31 は 4096 でコンパイル成功。2.32 は 1024 でも 110 分超 未完</span></td>
+  <td><span class="en">separate 2.32 regression, blocked a GSM8K run on 2.32</span><span class="ja">2.32 の別の退行。2.32 での GSM8K 計測をブロック</span></td>
+</tr>
+<tr>
+  <td><span class="en">GSM8K on Trainium, matched config</span><span class="ja">Trainium 上の GSM8K (同一構成)</span></td>
+  <td><span class="en">Quantify usability with a standard benchmark</span><span class="ja">標準ベンチマークで実用性を定量化</span></td>
+  <td><span class="en">0.000 strict/flexible (limit 40) vs GPU 0.875, same 5-shot config</span><span class="ja">0.000 (strict/flexible, limit 40)、対 GPU 0.875 (同一 5-shot 構成)</span></td>
+  <td><span class="bad en">confirms practical breakage</span><span class="bad ja">実用上の崩壊を確認</span></td>
+</tr>
+<tr>
+  <td><span class="en">Compiler-version isolation</span><span class="ja">コンパイラ版の単離</span></td>
+  <td><span class="en">Is the neuronx-cc VERSION the culprit?</span><span class="ja">neuronx-cc の版が犯人か</span></td>
+  <td><span class="en">Same graph, same neuronx-cc 2.31, a different standard AOT frontend: cosine 0.999896, same top token</span><span class="ja">同一グラフ・同一 neuronx-cc 2.31・別の標準 AOT フロントエンド: cosine 0.999896、top token 一致</span></td>
+  <td><span class="ok en">innocent for this tested config</span><span class="ok ja">この検証構成では無罪</span><span class="small mut en"><br>(different frontend, truncated dense sibling -- see &sect;2)</span><span class="small mut ja"><br>(別フロントエンド・truncate した dense sibling -- 2節参照)</span></td>
+</tr>
+<tr>
+  <td><span class="en">Plugin's custom compiler flags</span><span class="ja">plugin 独自のコンパイラフラグ</span></td>
+  <td><span class="en">Are the plugin's own neuronx-cc flags the culprit?</span><span class="ja">plugin 独自の neuronx-cc フラグが犯人か</span></td>
+  <td><span class="en">Identical to the default-flags result (cosine 0.999896)</span><span class="ja">デフォルトフラグの結果と同一 (cosine 0.999896)</span></td>
+  <td><span class="ok en">innocent for this tested config</span><span class="ok ja">この検証構成では無罪</span><span class="small mut en"><br>(same confound as above)</span><span class="small mut ja"><br>(上記と同じ交絡)</span></td>
+</tr>
+<tr>
+  <td><span class="en">Mamba2 chunked-scan kernel, standalone</span><span class="ja">Mamba2 chunked-scan カーネル単体</span></td>
+  <td><span class="en">Is the SSM scan's compilation the culprit?</span><span class="ja">SSM scan のコンパイルが犯人か</span></td>
+  <td><span class="en">3-way noise-floor ratio ~0.8 (device error at or below inherent bf16 noise)</span><span class="ja">3-way ノイズフロア比 ~0.8 (device 誤差は固有の bf16 ノイズ以下)</span></td>
+  <td><span class="ok en">kernel innocent</span><span class="ok ja">カーネルは無罪</span></td>
+</tr>
+<tr>
+  <td><span class="en">MoE router, standalone (single layer)</span><span class="ja">MoE router 単体 (単層)</span></td>
+  <td><span class="en">Does expert selection survive compilation?</span><span class="ja">コンパイル後も expert 選択は保たれるか</span></td>
+  <td><span class="en">Identical top-6 experts as CPU for 256/256 tokens tested</span><span class="ja">検証した 256 トークン全てで CPU と同一の top-6 experts</span></td>
+  <td><span class="ok en">single-layer router innocent</span><span class="ok ja">単層 router は無罪</span></td>
+</tr>
+<tr>
+  <td><span class="en">MoE router, synthetic 23-layer stack</span><span class="ja">MoE router 23 段合成スタック</span></td>
+  <td><span class="en">Does the mechanism compound at depth?</span><span class="ja">深さで機構が複利増幅するか</span></td>
+  <td><span class="en">8 of 256 tokens flip expert selection, purely from compounding tiny per-layer differences</span><span class="ja">微小差の複利増幅で 256 中 8 トークンの expert 選択が反転</span></td>
+  <td><span class="bad en">rejected -- contradicted by the FP8-on-GPU and byte-identical evidence above (see &sect;2c)</span><span class="bad ja">却下 -- 上記 FP8-on-GPU と byte 一致の証拠と矛盾 (2c 節参照)</span></td>
+</tr>
+</table>
+
+<hr>
+
+<h2 class="en">4. What could not be pinned down from outside the plugin -- and the next decisive experiments</h2>
+<h2 class="ja">4. plugin の外からは特定できなかったこと -- そして次の決定実験</h2>
+<p class="en">The investigation reached a hard limit on external tooling before it could point at a single line of code inside the plugin's compile path. Three attempts to look further were each blocked by an unrelated tooling constraint rather than by the underlying bug itself:</p>
+<p class="ja">plugin の compile 経路内の一行まで特定する前に、外部ツールの限界に達した。さらに深く見るための 3 つの試みは、いずれも本来のバグとは無関係なツール制約に阻まれた。</p>
+<ul>
+<li><span class="en">A layer-by-layer activation dump (the plugin's own accuracy-debugging facility) did not produce any output, because the model's serving-optimized forward pass (which returns only logits) does not route through the dump mechanism's expected output path.</span><span class="ja">層ごとの活性ダンプ (plugin 公式の精度デバッグ機構) は出力ゼロだった。serving 用に最適化した forward (logits のみ返す) がダンプ機構の想定する出力経路を通らないため。</span></li>
+<li><span class="en">Compiling the full, untruncated 52-layer graph through the standard AOT frontend produced a NEFF too large to load onto a single NeuronCore (an allocation failure unrelated to correctness).</span><span class="ja">52 層フルグラフを標準 AOT フロントエンドでそのままコンパイルすると、NEFF が単一 NeuronCore に載らない (正誤とは無関係な allocation failure)。</span></li>
+<li><span class="en">A minimal synthetic configuration built to isolate the hybrid pattern crashed the compiler frontend natively (a memory-corruption crash unrelated to correctness), forcing the investigation to use a truncated slice of the real model instead.</span><span class="ja">hybrid pattern を単離するための最小合成構成は、コンパイラフロントエンドで native crash (正誤とは無関係なメモリ破損) を起こし、実モデルの truncate 版で代替する必要があった。</span></li>
+</ul>
+<h3 class="en">The next decisive experiments (in order)</h3>
+<h3 class="ja">次の決定実験 (実施順)</h3>
+<div class="en">
+<p><b>B (run first, nearly free).</b> Greedy-decode a failing arithmetic prompt and diff the logits against CPU at every step, recording the first divergent step. This changes zero variables and splits the whole remaining hypothesis space in two: divergence already at the first generated token points at prefill/compile/weights (this investigation&#x27;s own data already shows this: the first token is wrong); divergence only at step &ge;2 would point at decode/state-handoff. Refinements: also run full-prefill vs. incremental-decode on-device only (no CPU needed) as a self-consistency check, and dump the recurrent state immediately after prefill if the plugin&#x27;s instrumentation allows it.</p>
+<p><b>A (choose the variant based on B).</b> Build a layer-truncated prefix of the real 30B model that includes at least one full MoE layer (router + dispatch + expert GEMMs + combine), compiled through the <b>plugin&#x27;s own</b> frontend (not the standard trace API), and compare against CPU. This is the first experiment that would cross the confounds documented in Section 2 -- plugin frontend, real MoE, at a traceable size.</p>
+<p><b>C (cheap, run in parallel).</b> Bisect the SDK 2.31&rarr;2.32 changelog against this reproduction. A partial fix means the vendor already touched the guilty code; the fix&#x27;s diff is a free localization signal.</p>
+</div>
+<div class="ja">
+<p><b>B (最優先・ほぼ無料)。</b> 失敗する算数プロンプトを greedy decode し、毎ステップの logits を CPU と差分して最初に発散するステップを記録する。変数を一切変えず、残る仮説空間全体を二分できる: 最初の生成トークンから既に発散していれば prefill/compile/weights 側を指す (本調査のデータは既にこれを示している -- 最初のトークンが誤り)。step&ge;2 でのみ発散するなら decode/state-handoff 側を指す。追加案: device 内だけで full-prefill vs 逐次 decode の self-consistency チェック (CPU 不要)、plugin の計測機構が許せば prefill 直後の再帰 state をダンプする。</p>
+<p><b>A (B の結果に基づいて選択)。</b> 実際の 30B モデルから、完全な MoE 層 (router + dispatch + expert GEMM + combine) を最低 1 つ含む layer-truncated prefix を構築し、標準の trace API でなく <b>plugin 自身</b>の frontend でコンパイルして CPU と比較する。2 節で記録した交絡 (plugin frontend・実 MoE) を trace 可能なサイズで初めて跨ぐ実験になる。</p>
+<p><b>C (安価・並行実施)。</b> SDK 2.31→2.32 の changelog を本 repro と突き合わせて bisect する。部分的に修正されたということは、vendor が既に該当コードに触れている可能性が高く、その修正差分は無料の局所化ヒントになる。</p>
+</div>
+
+<hr>
+
+<h2 class="en">5. Confidence levels</h2>
+<h2 class="ja">5. 確度の区分</h2>
+<div class="confidence">
+  <span style="border-style:solid;border-color:#2b8ac6"><b class="en">Confirmed</b><b class="ja">確定</b><span class="en"> -- reproduced by a direct experiment</span><span class="ja"> -- 実験で直接再現・確認</span></span>
+  <span style="border-style:dashed;border-color:#12805c"><b class="en">Strong inference</b><b class="ja">強い推論</b><span class="en"> -- directly supported by independent evidence, not a full elimination proof</span><span class="ja"> -- 独立した証拠に直接支持されるが、完全な消去法の証明ではない</span></span>
+  <span style="border-style:dotted;border-color:#b5651d"><b class="en">Open question</b><b class="ja">未解決</b><span class="en"> -- no candidate has positive evidence yet</span><span class="ja"> -- どの候補にもまだ直接の証拠が無い</span></span>
+  <span style="border-style:solid;border-color:#b23b3b"><b class="en">Rejected</b><b class="ja">却下</b><span class="en"> -- proposed, then contradicted by this investigation&#x27;s own evidence</span><span class="ja"> -- 提案したが本調査自身の証拠と矛盾したため却下</span></span>
+</div>
+<p class="en">The claim <b>"the fault is a deterministic bug in a shared code path above kernel selection"</b> is a <b>strong inference</b> supported directly by two independent facts: byte-identical wrong output across different scan and attention kernels, and a lower-precision (FP8) sibling that still works on GPU. It is not a full elimination proof, because none of the per-component isolation experiments held every other variable fixed (Section 2). The claim <b>"which specific component is responsible"</b> is an <b>open question</b>, not yet a hypothesis with supporting evidence -- Section 2b ranks the live candidates by how well each explains all the evidence, and none of them has positive evidence yet. One candidate mechanism this investigation proposed earlier (compounding MoE router-selection flips) was tested further and is now a <b>rejected hypothesis</b> (Section 2c): it is directly contradicted by the FP8-on-GPU and byte-identical evidence already used to support the strong inference above.</p>
+<p class="ja">「故障はカーネル選択より上流の共有コードパスにある決定的なバグである」という主張は、2 つの独立した事実 -- 異なる scan/attention カーネルを跨いで byte 単位で一致する誤出力、および GPU では動く低精度 (FP8) の姉妹モデル -- に直接支持される<b>強い推論</b>である。ただしこれは完全な消去法の証明ではない。部品単位の単離実験はいずれも他の変数を固定していないため (2 節)。「具体的にどの部品が原因か」という主張は、根拠のある仮説の段階にすら達していない<b>未解決の問い</b>である -- 2b 節で有効な候補を全証拠との整合度でランキングしているが、いずれもまだ直接の証拠は無い。本調査が以前に提案した機構の一つ (MoE router 選択の複利的な flip) はさらに検証した結果、現在は<b>却下した仮説</b>である (2c 節) -- 上記の強い推論を支持する FP8-on-GPU と byte 一致の証拠そのものと直接矛盾するため。</p>
+
+<hr>
+
+<h2 class="en">6. Where to go for reproduction</h2>
+<h2 class="ja">6. 再現手順の場所</h2>
+<p class="en">This page is a narrative summary. The reproducible scripts, exact commands, and version pins for every experiment above live alongside this document in the same sample package -- see <code>README.md</code> in the parent directory.</p>
+<p class="ja">このページは調査の物語的サマリ。上記すべての実験を再現できるスクリプト・正確なコマンド・バージョン指定は、この文書と同じ sample パッケージ内にある -- 親ディレクトリの <code>README.md</code> を参照。</p>
+
+<footer>
+<p class="en">Verification package: <code>samples/2026-08-21-nemotron-vllm-neuron-accuracy/</code> in this repository.</p>
+<p class="ja">検証パッケージ: このリポジトリ内 <code>samples/2026-08-21-nemotron-vllm-neuron-accuracy/</code>。</p>
+</footer>
+
+</div>
+<script>
+function setLang(l){
+  document.body.className = "lang-" + l;
+  document.getElementById("btn-en").classList.toggle("active", l==="en");
+  document.getElementById("btn-ja").classList.toggle("active", l==="ja");
+}
+document.getElementById("btn-en").addEventListener("click", function(){ setLang("en"); });
+document.getElementById("btn-ja").addEventListener("click", function(){ setLang("ja"); });
+</script>
+</body>
+</html>

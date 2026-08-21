@@ -1,0 +1,77 @@
+# Helm values template for serving a community-ported model on the vLLM
+# Neuron plugin, used throughout the NemotronH accuracy investigation.
+#
+# This assumes a chart where the container entrypoint, before starting the
+# vLLM OpenAI server, optionally fetches a model implementation from a git
+# ref and installs it into the plugin's model registry (see the
+# "plugin.install" block below, and ../README.md's "How to run", step 1
+# ("Serve the model on Trainium"), for the install-script structure this
+# maps to). Adapt the field names to whatever chart/manifest structure you actually use; the
+# important part is the set of values and the two example configurations
+# below, not this exact schema.
+
+# --- Public DLC image. Pick one depending on which SDK/plugin generation you
+# are reproducing against. Do not substitute a private/beta image URI here.
+# 2.31 stack (older, but the only stack in which segmented prefill at
+# max_model_len=4096 was observed to compile and serve for this model):
+#   image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.21.0.1.0.0-neuronx-py313-sdk2.31.0-ubuntu24.04
+# 2.32 stack (newer; fixes most of the reasoning-probe regression, but has a
+# severe segmented-prefill compile-time regression -- see ../README.md,
+# "Known limitations"):
+#   image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.24.0.1.1.0-neuronx-py313-sdk2.32.0-ubuntu24.04
+image: "REPLACE_WITH_DLC_IMAGE_TAG"
+
+model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+servedModelName: nemotron-h
+tpSize: 4
+dtype: bfloat16
+maxNumSeqs: 1
+trustRemoteCode: true
+
+# --- Example A: single-shot prefill build, small max_model_len.
+# Compiles in roughly 30-40 minutes on the 2.32 stack for this model.
+# Good for probe-level reasoning checks (see probes.py); too short for
+# most GSM8K few-shot prompts.
+# maxModelLen: 256
+
+# --- Example B: segmented (continuation) prefill build, large max_model_len.
+# Needed for few-shot benchmarks like GSM8K where the prompt plus generation
+# exceeds a few hundred tokens. On the 2.31 stack this compiles and serves.
+# On the 2.32 stack, treat this as a compile-time regression: even
+# maxModelLen=1024 was observed to exceed 110 minutes without completing a
+# second (decode-path) subgraph compile, and maxModelLen=4096 exceeds the
+# default 3600s tensor-parallel barrier outright. Raise the barrier timeout
+# if you attempt this on 2.32, and budget multiple hours, not minutes.
+maxModelLen: 4096
+
+# When segmented prefill is applicable, the runner auto-enables it and logs
+# something like:
+#   Segmented prefill auto-enabled with kv_segment_size_buckets=[512],
+#   num_batched_tokens_buckets=[512]
+# You do not need to force it explicitly; it follows from maxModelLen and
+# the batched-token bucket configuration below.
+extraArgs:
+  - "--max-num-batched-tokens=512"
+
+# Raise this well above the 3600s default when compiling a segmented build
+# on the 2.32 stack; even a "small" maxModelLen has been observed to take
+# well over an hour end to end.
+env:
+  VLLM_NEURON_BARRIER_TIMEOUT: "14400"
+
+# Serialize per-rank tracing during warmup; makes compile logs readable and
+# avoids interleaved output across tensor-parallel ranks when debugging.
+serialTraceWorkers: true
+
+# --- Community model port installation. The plugin's out-of-the-box model
+# registry does not include NemotronH; this section describes installing a
+# model implementation directory into the plugin's model/ package and
+# patching model/registry.py to add the import and the registry entry,
+# before the vLLM server process starts. See ../README.md, "How to run",
+# step 1, for the actual shell/python snippet this corresponds to.
+plugin:
+  install: true
+  repo: "REPLACE_WITH_YOUR_FORK_OWNER/REPLACE_WITH_YOUR_FORK_REPO"
+  ref: "REPLACE_WITH_BRANCH_OR_TAG"
+  modelDir: nemotron_h
+  registerClass: NemotronHForCausalLM
