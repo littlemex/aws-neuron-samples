@@ -69,9 +69,14 @@ serialTraceWorkers: true
 # patching model/registry.py to add the import and the registry entry,
 # before the vLLM server process starts. See ../README.md, "How to run",
 # step 1, for the actual shell/python snippet this corresponds to.
+#
+# The repo/ref below default to the community port used for this investigation.
+# The install step fetches this branch as a tarball and copies its
+# vllm_neuron/model/<modelDir> into the plugin. Override repo/ref to point at
+# your own fork if you maintain a different implementation of the port.
 plugin:
   install: true
-  repo: "REPLACE_WITH_YOUR_FORK_OWNER/REPLACE_WITH_YOUR_FORK_REPO"
-  ref: "REPLACE_WITH_BRANCH_OR_TAG"
+  repo: "littlemex/vllm-neuron"
+  ref: "feat/nemotron-h"
   modelDir: nemotron_h
   registerClass: NemotronHForCausalLM

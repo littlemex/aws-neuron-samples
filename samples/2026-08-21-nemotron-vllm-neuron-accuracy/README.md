@@ -33,8 +33,11 @@ experiment is** — not a verdict.
 Versions: vLLM Neuron plugin `0.21.0.1.0.0` (Neuron SDK `2.31.0`) and
 `0.24.0.1.1.0` (Neuron SDK `2.32.0`). Model: `NemotronHForCausalLM`, served
 through a community port of the model to the vLLM Neuron plugin (not part of
-the upstream plugin as of this writing). GPU reference: vLLM `0.20.0` on
-CUDA, same checkpoint. All numbers below are greedy (temperature 0).
+the upstream plugin as of this writing). The port used for this investigation
+is `littlemex/vllm-neuron` at branch `feat/nemotron-h`; the serving template
+defaults to it and it can be overridden with your own fork. GPU reference:
+vLLM `0.20.0` on CUDA, same checkpoint. All numbers below are greedy
+(temperature 0).
 
 ## What this shows
 
@@ -261,8 +264,10 @@ near-zero cost.
   support (`transformers==5.9.0` was used in this investigation).
 - A community port of `NemotronHForCausalLM` to the vLLM Neuron plugin (a
   `model/nemotron_h/` directory implementing the plugin's model interface).
-  This guide assumes you already have one; it is not part of the upstream
-  `vllm-neuron` plugin as of this writing.
+  It is not part of the upstream `vllm-neuron` plugin as of this writing. The
+  port used here is `littlemex/vllm-neuron` at branch `feat/nemotron-h`, which
+  `verify/deploy-values.template.yaml` installs by default; substitute your own
+  fork by overriding `plugin.repo` and `plugin.ref`.
 - Optionally, a CUDA GPU for the same-model reference (2x 24GB-class GPUs is
   enough for `--tensor-parallel-size 2` at bf16 for this 30B-class
   checkpoint).
